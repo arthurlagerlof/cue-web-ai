@@ -67,7 +67,7 @@ test('display protocol reassembles UTF-8 chunks, acknowledges and persists lates
   for (let i = 0; i < bytes.length; i += 10) chunks.push(bytes.slice(i, i + 10));
   const emit = data => watch.uartListeners.data[0](data);
   for (let i = chunks.length - 1; i >= 0; i--) emit(frame(2, 42, i, chunks.length, chunks[i]));
-  assert.equal(watch.stored['bangle-memory.txt'], 'A memória é importante e muito longa.');
+  assert.equal(watch.stored['cue-memory.txt'], 'A memória é importante e muito longa.');
   assert.equal(watch.writes.length, 1);
   assert.equal(watch.writes[0].charCodeAt(3), 3);
   assert.ok(watch.drawings.some(line => line.includes('memória')));

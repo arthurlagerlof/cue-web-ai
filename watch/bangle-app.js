@@ -2,7 +2,7 @@
 (function () {
   var BM_HEADER = 9, BM_BUFFER = [], BM_MESSAGES = {}, BM_SEEN = {}, BM_TIMERS = [], BM_MANUAL_ID = 0, BM_LAST_TRIGGER = 0, BM_DIAG = 'BLE idle';
   var BM_STORAGE = require('Storage');
-  var BM_TEXT = BM_STORAGE.read('bangle-memory.txt') || 'Waiting for a result', BM_PAGES = [BM_TEXT], BM_PAGE = 0;
+  var BM_TEXT = BM_STORAGE.read('cue-memory.txt') || 'Waiting for a result', BM_PAGES = [BM_TEXT], BM_PAGE = 0;
 
   function bmSchedule(callback, delay) {
     var timer = setTimeout(function () {
@@ -78,7 +78,7 @@
         var bytes = []; for (var chunk = 0; chunk < count; chunk++) bytes = bytes.concat(message.chunks[chunk]);
         var binary = String.fromCharCode.apply(null, bytes);
         try { BM_TEXT = decodeURIComponent(escape(binary)); } catch (e) { BM_TEXT = binary; }
-        BM_STORAGE.write('bangle-memory.txt', BM_TEXT);
+        BM_STORAGE.write('cue-memory.txt', BM_TEXT);
         bmLayout(BM_TEXT); bmLog('DISPLAY id' + id + ' ' + BM_TEXT.length + ' chars'); bmDraw();
         bmLog('ACK TX id' + id); bmFrame(3, id, 0, 1, [0]);
       }

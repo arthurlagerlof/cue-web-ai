@@ -1,6 +1,6 @@
 _Thanks to Jason Mayes for the watch._
 
-# Bangle.js Memory demo
+# Cue
 
 Existing React/Vite UI with browser-side multilingual embeddings and a local Python backend. Transcript processing has two independent modes: Anki semantic search and an OpenAI-compatible Chat Completions endpoint. Transcription remains optional; the main workflow accepts manually entered transcript text.
 

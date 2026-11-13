@@ -159,7 +159,7 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BangleMemory/1"
+    server_version = "Cue/1"
 
     def log_message(self, fmt, *args):
         print("backend:", fmt % args)
@@ -249,7 +249,7 @@ class Handler(BaseHTTPRequestHandler):
                 url = endpoint if endpoint.endswith("/chat/completions") else endpoint + "/chat/completions"
                 schema = {"type":"object","properties":{"version":{"type":"integer","const":1},"display_text":{"type":"string"}},"required":["version","display_text"],"additionalProperties":False}
                 messages = [{"role":"system","content": prompt or "Return concise useful information."},{"role":"user","content": transcript}]
-                payload = {"model": model, "messages": messages, "response_format":{"type":"json_schema","json_schema":{"name":"bangle_memory_result","strict":True,"schema":schema}}}
+                payload = {"model": model, "messages": messages, "response_format":{"type":"json_schema","json_schema":{"name":"cue_result","strict":True,"schema":schema}}}
                 request = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Authorization": "Bearer " + KEY, "Content-Type":"application/json"}, method="POST")
                 opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect(), PinnedHTTPHandler(pinned_address), PinnedHTTPSHandler(pinned_address))
                 try:

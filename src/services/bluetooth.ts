@@ -143,8 +143,8 @@ export class BangleConnection {
       await write('\x03\x10reset();\n');
       await prompt;
       const files = [
-        { name: 'bangle-memory.app.js', content: appSource },
-        { name: 'bangle-memory.info', content: JSON.stringify({ id: 'bangle-memory', name: 'Bangle Memory', type: 'app', src: 'bangle-memory.app.js', version: '0.1.0', files: 'bangle-memory.app.js,bangle-memory.info' }) },
+        { name: 'cue.app.js', content: appSource },
+        { name: 'cue.info', content: JSON.stringify({ id: 'cue-memory', name: 'Cue', type: 'app', src: 'cue.app.js', version: '0.1.0', files: 'cue.app.js,cue.info' }) },
       ];
       for (const file of files) {
         onProgress(`Uploading ${file.name}…`);
@@ -162,7 +162,7 @@ export class BangleConnection {
       onProgress('Launching app and waiting for its BLE READY signal…');
       output = '';
       const appReady = waitFor('BM_BLE_READY');
-      await write('\x10load("bangle-memory.app.js")\n');
+      await write('\x10load("cue.app.js")\n');
       await appReady;
       onProgress('App launched: BLE READY received. Confirm the watch displays BLE READY before sending TEST.');
     } finally {
