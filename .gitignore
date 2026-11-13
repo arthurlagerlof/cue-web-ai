@@ -5,3 +5,4 @@ dist/
 .env.*
 !.env.example
 __pycache__/
+semantic_mastery.db
