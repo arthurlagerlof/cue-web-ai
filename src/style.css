@@ -1,0 +1,11 @@
+body { margin: 0; background: #f4f5f7; color: #202124; font: 15px/1.5 system-ui, sans-serif; }
+main { max-width: 780px; margin: 24px auto; padding: 0 16px 40px; }
+section { background: white; border: 1px solid #ddd; border-radius: 6px; padding: 16px; margin: 16px 0; }
+h1, h2 { line-height: 1.2; } h2 { font-size: 1.1rem; }
+button { padding: 8px 12px; margin: 5px 5px 5px 0; cursor: pointer; }
+button:disabled { cursor: not-allowed; opacity: .55; }
+div:has(> dt) { display: grid; grid-template-columns: 190px 1fr; }
+dt { font-weight: 600; } dd { margin-left: 0; }
+label { display: block; font-weight: 600; margin-top: 12px; }
+textarea { display: block; box-sizing: border-box; width: 100%; min-height: 72px; margin-top: 5px; font: 13px/1.4 ui-monospace, monospace; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 220px; overflow: auto; }
