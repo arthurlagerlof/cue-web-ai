@@ -84,6 +84,12 @@ test('Cue Display Document fixtures satisfy the v1 contract', async () => {
   const schema = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'src', 'display', 'schema', 'cue-display-v1.schema.json'), 'utf8'));
   assert.equal(schema.$schema, 'https://json-schema.org/draft/2020-12/schema');
   for (const fixture of fixtures) assert.deepEqual(display.validateDisplayDocument(fixture), { valid: true, errors: [] });
+  assert.equal(display.validateDisplayDocument(display.createDisplayDocument({
+    id: 'clarification-test',
+    title: 'Clarification needed',
+    source: { app: 'cue', name: 'Cue' },
+    state: 'clarification_required',
+  })).valid, true);
 });
 
 test('display validator checks nested components, assets, action IDs, and registry arguments', async () => {

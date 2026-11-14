@@ -2,7 +2,7 @@ import { validateArguments } from '../intelligence/toolRegistry.js';
 
 const roles = new Set(['heading', 'body', 'caption', 'label']);
 const layouts = new Set(['column', 'row', 'grid']);
-const states = new Set(['loading', 'ready', 'success', 'empty', 'error', 'confirmation_required']);
+const states = new Set(['loading', 'ready', 'success', 'empty', 'error', 'confirmation_required', 'clarification_required']);
 const knownElements = new Set(['text', 'image', 'icon', 'container', 'list', 'divider', 'action']);
 
 function add(errors, path, message) { errors.push(`${path}: ${message}`); }

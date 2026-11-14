@@ -89,7 +89,9 @@ test('installer uploads and verifies the actual UTF-8 watch app using byte offse
   const checks = commands.filter(command => command.includes('BM_VERIFY_0_'));
   assert.ok(checks.length > 1);
   assert.ok(checks.some(command => command.includes("read(\"cue.app.js\",512,512)")));
-  assert.ok(commands.some(command => command.includes('\\xe2\\x80\\xa6')));
+  for (const byte of ['\\xe2', '\\x80', '\\xa6']) {
+    assert.ok(commands.some(command => command.includes(byte)), `installer should escape UTF-8 byte ${byte}`);
+  }
 });
 
 test('installer reports corrupted storage and does not launch', async () => {

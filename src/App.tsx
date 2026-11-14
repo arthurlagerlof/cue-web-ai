@@ -145,7 +145,7 @@ export default function App() {
             id: `cue-restored-${state.status}`,
             title: state.status === 'awaiting_confirmation' ? 'Confirmation required' : 'Clarification needed',
             source: { app: 'cue', name: 'Cue' },
-            state: state.status === 'awaiting_confirmation' ? 'confirmation_required' : 'ready',
+            state: state.status === 'awaiting_confirmation' ? 'confirmation_required' : 'clarification_required',
             message,
             elements: [{ type: 'text', text: message, role: 'body' }],
           })).catch(error => log(`Could not restore pending request display: ${error instanceof Error ? error.message : String(error)}`));
@@ -307,6 +307,7 @@ export default function App() {
       if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
       if (outcome.normalizationError) log(`Argument normalization failed: ${outcome.normalizationError}`);
       if (outcome.kind !== 'confirmation_required') updatePendingConfirmation(undefined);
+      setPendingClarification(outcome.kind === 'clarification' || ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(outcome.state?.status));
       if (outcome.retrieval) {
         log(`Retrieval ${outcome.retrieval.toolId}: ${outcome.retrieval.score.toFixed(3)} (description ${outcome.retrieval.bestDescriptionSimilarity?.toFixed(3) ?? '—'}, keyword ${outcome.retrieval.bestKeywordSimilarity?.toFixed(3) ?? '—'}, example ${outcome.retrieval.bestExampleSimilarity?.toFixed(3) ?? '—'}, margin ${outcome.retrieval.margin?.toFixed(3) ?? '—'})`);
         if (outcome.retrieval.providerEvidence) {
@@ -324,11 +325,21 @@ export default function App() {
       } else if (outcome.kind === 'document') {
         await showDocument(outcome.document);
         log('Local tool completed and returned a validated Cue Display Document');
+      } else if (outcome.kind === 'no_tool') {
+        const response = await postApi('/api/demo/respond', { prompt: clean });
+        if (typeof response.text !== 'string' || !response.text.trim()) throw new Error('OpenRouter returned an empty response.');
+        await showDocument(createDisplayDocument({
+          id: 'cue-openrouter-response',
+          title: 'Dots3 response',
+          source: { app: 'openrouter', name: 'Dots3' },
+          state: 'ready',
+          elements: [{ type: 'text', text: response.text, role: 'body' }],
+        }));
+        log('No local tool matched; displayed the direct OpenRouter Dots3 response');
       } else {
-        setPendingClarification(['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(outcome.state?.status));
         if (outcome.kind === 'clarification' && outcome.toolId) setTranscriptInput('');
         const message = outcome.kind === 'answer' ? outcome.text : outcome.kind === 'clarification' ? outcome.question : outcome.text;
-        const state = outcome.kind === 'no_tool' ? 'empty' : outcome.kind === 'partial_failure' ? 'error' : 'ready';
+        const state = outcome.kind === 'clarification' ? 'clarification_required' : outcome.kind === 'partial_failure' ? 'error' : 'ready';
         const title = outcome.kind === 'clarification' ? 'Clarification needed' : outcome.kind === 'no_tool' ? 'No matching tool' : outcome.kind === 'partial_failure' ? 'Operation partially failed' : 'Cue';
         const document = createDisplayDocument({ id: `cue-${outcome.kind}`, title, source: { app: 'cue', name: 'Cue' }, state, message, elements: [{ type: 'text', text: message ?? 'Please clarify your request.', role: 'body' }] });
         await showDocument(document);

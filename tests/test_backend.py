@@ -297,6 +297,12 @@ class BackendTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(json.loads(response.read())["text"], '{"status":"resolved"}')
                 generate.assert_called_once_with("synthetic prompt")
+            with patch("backend.generate_normalization", return_value="Direct answer.") as generate:
+                connection.request("POST", "/api/demo/respond", body=json.dumps({"prompt": "What is a comet?"}), headers=headers)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["text"], "Direct answer.")
+                generate.assert_called_once_with("What is a comet?")
             connection.request("POST", "/api/demo/normalize", body=json.dumps({"prompt": "synthetic prompt"}), headers={"Origin": "http://localhost:5173", "Cookie": cookie, "Content-Type": "application/json"})
             response = connection.getresponse()
             self.assertEqual(response.status, 403)

@@ -225,33 +225,42 @@ export class BangleConnection {
     const chunkSize = 10;
     const id = nextMessageId++ & 0xffff, count = Math.max(1, Math.ceil(bytes.length / chunkSize));
     this.onDiagnostic?.(`Sending ${bytes.length} UTF-8 bytes as ${count} frame(s), id=${id}`);
-    for (let attempt = 0; attempt < 3; attempt++) {
-      this.onDiagnostic?.(`Delivery attempt ${attempt + 1}/3, id=${id}`);
-      const acknowledged = new Promise<boolean>(resolve => {
-        const timer = window.setTimeout(() => {
-          this.pendingAcks.delete(id);
-          this.onDiagnostic?.(`ACK timeout for id=${id}`);
-          resolve(false);
-        }, 2500);
-        this.pendingAcks.set(id, received => {
-          window.clearTimeout(timer);
-          this.pendingAcks.delete(id);
-          resolve(received);
-        });
+    let ackStatus: boolean | undefined;
+    const acknowledged = new Promise<boolean>(resolve => {
+      this.pendingAcks.set(id, received => {
+        ackStatus = received;
+        resolve(received);
       });
-      for (let i = 0; i < count; i++) {
-        if (!this.characteristic) throw new Error('Watch disconnected before receiving the result.');
-        const payload = bytes.slice(i * chunkSize, (i + 1) * chunkSize);
-        const frame = new Uint8Array(HEADER_SIZE + payload.length);
-        frame.set([0x42, 0x4d, 1, 2, id & 255, id >> 8, i, count, payload.length]); frame.set(payload, HEADER_SIZE);
-        if (this.characteristic.writeValueWithoutResponse) await this.characteristic.writeValueWithoutResponse(frame);
-        else await this.characteristic.writeValue(frame);
-        this.onDiagnostic?.(`Wrote RX frame id=${id}, chunk=${i + 1}/${count}, bytes=${Array.from(frame, byte => byte.toString(16).padStart(2, '0')).join(' ')}`);
-        if (i + 1 < count) await new Promise(resolve => window.setTimeout(resolve, 20));
+    });
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        this.onDiagnostic?.(`Delivery attempt ${attempt + 1}/3, id=${id}`);
+        for (let i = 0; i < count && ackStatus === undefined; i++) {
+          if (!this.characteristic) throw new Error('Watch disconnected before receiving the result.');
+          const payload = bytes.slice(i * chunkSize, (i + 1) * chunkSize);
+          const frame = new Uint8Array(HEADER_SIZE + payload.length);
+          frame.set([0x42, 0x4d, 1, 2, id & 255, id >> 8, i, count, payload.length]); frame.set(payload, HEADER_SIZE);
+          if (this.characteristic.writeValueWithoutResponse) await this.characteristic.writeValueWithoutResponse(frame);
+          else await this.characteristic.writeValue(frame);
+          this.onDiagnostic?.(`Wrote RX frame id=${id}, chunk=${i + 1}/${count}, bytes=${Array.from(frame, byte => byte.toString(16).padStart(2, '0')).join(' ')}`);
+          if (i + 1 < count && ackStatus === undefined) await new Promise(resolve => window.setTimeout(resolve, 20));
+        }
+        let timer: number | undefined;
+        const received = await Promise.race([
+          acknowledged,
+          new Promise<undefined>(resolve => {
+            timer = window.setTimeout(() => resolve(undefined), 10000);
+          }),
+        ]);
+        if (timer !== undefined) window.clearTimeout(timer);
+        if (received === true) return;
+        if (received === false) throw new Error('Watch rejected the result.');
+        this.onDiagnostic?.(`ACK timeout for id=${id}`);
       }
-      if (await acknowledged) return;
+      throw new Error('Watch did not acknowledge the result after 3 delivery attempts.');
+    } finally {
+      this.pendingAcks.delete(id);
     }
-    throw new Error('Watch did not acknowledge the result after 3 delivery attempts.');
   }
 
   async send(message: string) {

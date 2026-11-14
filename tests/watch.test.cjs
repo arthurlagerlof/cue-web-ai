@@ -144,6 +144,28 @@ test('display protocol reassembles UTF-8 chunks, acknowledges and persists lates
   assert.equal(watch.writes[1].charCodeAt(3), 3);
 });
 
+test('slow transfers remain available while chunks are still arriving', () => {
+  const watch = loadWatch();
+  const emit = data => watch.uartListeners.data[0](data);
+  emit(frame(2, 44, 0, 3, [65]));
+  watch.advance(9000);
+  emit(frame(2, 44, 1, 3, [66]));
+  watch.advance(9000);
+  emit(frame(2, 44, 2, 3, [67]));
+  assert.equal(watch.stored['cue-memory.txt'], 'ABC');
+  assert.equal(watch.writes[0].charCodeAt(9), 0);
+});
+
+test('invalid UTF-8 is rejected on repeated delivery', () => {
+  const watch = loadWatch();
+  const invalid = frame(2, 45, 0, 1, [255]);
+  watch.uartListeners.data[0](invalid);
+  watch.uartListeners.data[0](invalid);
+  assert.equal(watch.writes.length, 2);
+  assert.equal(watch.writes[0].charCodeAt(9), 1);
+  assert.equal(watch.writes[1].charCodeAt(9), 1);
+});
+
 test('UTF-8 documents larger than the emulator apply argument limit decode without browser globals', () => {
   const watch = loadWatch();
   const text = '🦊'.repeat(600);
@@ -218,7 +240,7 @@ test('new display documents replace old results and actions', () => {
   }, 57);
 
   assert.ok(watch.drawings.includes('Newest results'));
-  assert.ok(watch.drawings.includes('Current result content.'));
+  assert.ok(watch.drawings.some(line => line.includes('Current result')));
   assert.ok(!watch.drawings.some(line => /Old results|Old page|Stale result|Open stale/.test(line)));
   assert.ok(!watch.drawings.includes('2 / 2'));
   watch.writes.length = 0;
@@ -286,4 +308,20 @@ test('empty, error, and success Display Document states have consistent screens'
     }, id++);
     assert.ok(watch.drawings.includes(label));
   }
+});
+
+test('clarification screen offers tap-to-answer using the recording trigger', () => {
+  const watch = loadWatch();
+  sendDocument(watch, {
+    schema: 'cue.display', version: 1, id: 'clarification-test', title: 'Clarification needed',
+    source: { app: 'cue', name: 'Cue' }, state: 'clarification_required',
+    pages: [{ id: 'clarification', elements: [{ type: 'text', text: 'Which card should I use?' }] }],
+    actions: [], assets: [],
+  }, 110);
+  assert.ok(watch.drawings.includes('Tap to answer'));
+  watch.writes.length = 0;
+  watch.listeners.touch[0](1, { x: 88, y: 80 });
+  assert.equal(watch.writes.length, 1);
+  assert.equal(watch.writes[0].charCodeAt(3), 1);
+  assert.equal(watch.writes[0].charCodeAt(9), 1);
 });

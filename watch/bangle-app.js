@@ -131,6 +131,7 @@
       }
       if (parsed.state === 'loading') BM_STATE = 'thinking';
       else if (parsed.state === 'confirmation_required') BM_STATE = 'confirmation';
+      else if (parsed.state === 'clarification_required') BM_STATE = 'clarification';
       else if (parsed.state === 'empty' || !parsed.pages.length) BM_STATE = 'empty';
       else if (parsed.state === 'error') BM_STATE = 'error';
       else if (parsed.state === 'success') BM_STATE = 'success';
@@ -355,7 +356,7 @@
   }
   function bmDrawRows() {
     var layout = BM_PAGE_LAYOUTS[BM_PAGE] || { rows: [], cursor: 0 };
-    var top = 34, bottom = BM_STATE === 'confirmation' ? 128 : 150;
+    var top = 34, bottom = BM_STATE === 'confirmation' ? 128 : BM_STATE === 'clarification' ? BM_SCREEN_HEIGHT - 34 : 150;
     var viewportHeight = bottom - top;
     var maxScroll = Math.max(0, layout.cursor - viewportHeight);
     BM_SCROLL = Math.max(0, Math.min(maxScroll, BM_SCROLL));
@@ -418,6 +419,12 @@
     else if (BM_STATE === 'recording') bmDrawRecording();
     else if (BM_STATE === 'thinking') bmDrawThinking();
     else if (BM_STATE === 'confirmation') bmDrawConfirmation();
+    else if (BM_STATE === 'clarification') {
+      bmDrawResult();
+      g.setFont('Vector', 9);
+      g.setFontAlign(0, -1);
+      g.drawString('Tap to answer', BM_SCREEN_WIDTH / 2, BM_SCREEN_HEIGHT - 25);
+    }
     else if (BM_STATE === 'empty') bmDrawState('NO RESULTS', BM_CONTEXT);
     else if (BM_STATE === 'error') bmDrawState('ERROR', BM_CONTEXT);
     else if (BM_STATE === 'success') bmDrawState('SUCCESS', BM_CONTEXT);
@@ -441,11 +448,12 @@
       var message = BM_MESSAGES[id];
       if (!message) {
         message = BM_MESSAGES[id] = { count: count, chunks: {}, received: 0, bytes: 0 };
-        (function (messageId) {
-          message.timeout = bmSchedule(function () { delete BM_MESSAGES[messageId]; }, 10000);
-        })(id);
       }
       if (message.count !== count || message.chunks[index]) continue;
+      bmCancel(message.timeout);
+      (function (messageId, currentMessage) {
+        currentMessage.timeout = bmSchedule(function () { delete BM_MESSAGES[messageId]; }, 10000);
+      })(id, message);
       message.bytes += payload.length;
       if (message.bytes > 2450) { bmCancel(message.timeout); delete BM_MESSAGES[id]; continue; }
       message.chunks[index] = payload;
@@ -453,8 +461,6 @@
       if (message.received === count) {
         bmCancel(message.timeout);
         delete BM_MESSAGES[id];
-        BM_SEEN[id] = true;
-        (function (seenId) { bmSchedule(function () { delete BM_SEEN[seenId]; }, 60000); })(id);
         var bytes = [];
         for (var chunk = 0; chunk < count; chunk++) bytes = bytes.concat(message.chunks[chunk]);
         var text;
@@ -462,12 +468,14 @@
         catch (error) { bmSetState('error', 'Received text could not be decoded.'); bmFrame(3, id, 0, 1, [1]); continue; }
         BM_STORAGE.write('cue-memory.txt', text);
         bmSetDocument(text);
+        BM_SEEN[id] = true;
+        (function (seenId) { bmSchedule(function () { delete BM_SEEN[seenId]; }, 60000); })(id);
         bmFrame(3, id, 0, 1, [0]);
       }
     }
   }
   function bmSwipe(direction) {
-    if (BM_STATE !== 'result' && BM_STATE !== 'confirmation') return;
+    if (BM_STATE !== 'result' && BM_STATE !== 'confirmation' && BM_STATE !== 'clarification') return;
     var next = direction > 0 ? BM_PAGE + 1 : BM_PAGE - 1;
     if (next < 0 || next >= BM_PAGE_LAYOUTS.length) return;
     BM_PAGE = next;
@@ -489,6 +497,10 @@
         if (xy.x < BM_SCREEN_WIDTH / 2) bmSendAction(BM_CANCEL_ACTION);
         else bmSendAction(BM_CONFIRM_ACTION);
       }
+      return;
+    }
+    if (BM_STATE === 'clarification') {
+      bmSendTrigger();
       return;
     }
     if (BM_STATE !== 'result') return;

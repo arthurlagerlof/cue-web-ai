@@ -119,6 +119,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise PermissionError("Demo session required")
             if self.path == "/api/demo/normalize":
                 return self.json_response({"text": generate_normalization(data.get("prompt"))})
+            if self.path == "/api/demo/respond":
+                return self.json_response({"text": generate_normalization(data.get("prompt"))})
             if self.path == "/api/demo/index-tools":
                 count = store_tool_embeddings(sid, data.get("entries"))
                 return self.json_response({"indexed_examples": count, "namespace": "tool"})

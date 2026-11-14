@@ -10,7 +10,7 @@
     "id": { "type": "string", "minLength": 1 },
     "title": { "type": "string" },
     "source": { "type": "object", "required": ["app", "name"], "properties": { "app": { "type": "string", "minLength": 1 }, "name": { "type": "string", "minLength": 1 } }, "additionalProperties": true },
-    "state": { "enum": ["loading", "ready", "success", "empty", "error", "confirmation_required"] },
+    "state": { "enum": ["loading", "ready", "success", "empty", "error", "confirmation_required", "clarification_required"] },
     "pages": { "type": "array", "items": { "$ref": "#/$defs/page" } },
     "actions": { "type": "array", "items": { "$ref": "#/$defs/action" } },
     "assets": { "type": "array", "items": { "$ref": "#/$defs/asset" } },
