@@ -14,6 +14,7 @@
   },
   "dependencies": {
     "@huggingface/transformers": "^4.4.0-next.0",
+    "@mediapipe/tasks-genai": "^0.10.30",
     "chrono-node": "^2.10.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

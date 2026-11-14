@@ -7,6 +7,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import backend
 import demo_database
@@ -41,6 +42,13 @@ class BackendTests(unittest.TestCase):
 
     def test_seed_is_synthetic_complete_and_idempotent(self):
         first = verify_database(self.seed, require_embeddings=False)
+        manifest = json.loads((Path(__file__).resolve().parents[1] / "data" / "seed" / "tool-manifests.json").read_text(encoding="utf-8"))
+        expected_sources = {
+            "description": len(manifest),
+            "keyword": sum(len(tool.get("keywords", [])) for tool in manifest),
+            "example": sum(len(tool["examples"]) for tool in manifest),
+        }
+        expected_embedding_rows = sum(expected_sources.values())
         def snapshot():
             connection = sqlite3.connect(self.seed)
             try:
@@ -60,16 +68,108 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertEqual(first["providers"], 6)
         self.assertEqual(first["tools"], 18)
-        self.assertEqual(first["tool_embedding_rows"], 172)
-        self.assertEqual(first["ready_tool_embeddings"], 69)
+        self.assertEqual(first["tool_embedding_rows"], expected_embedding_rows)
+        self.assertEqual(first["ready_tool_embeddings"], first["seeded_fixture_embeddings"])
         self.assertEqual(first["records"], {"anki": 12, "knowledge": 6, "web": 3, "calendar": 5, "notifications": 3, "alarm": 2})
         connection = sqlite3.connect(self.seed)
         try:
             sources = dict(connection.execute("SELECT source_type,COUNT(*) FROM tool_retrieval_records GROUP BY source_type"))
-            self.assertEqual(sources, {"description": 18, "example": 63, "keyword": 91})
-            self.assertEqual(connection.execute("SELECT COUNT(DISTINCT content_hash) FROM tool_retrieval_records").fetchone()[0], 172)
+            self.assertEqual(sources, expected_sources)
+            self.assertEqual(connection.execute("SELECT COUNT(DISTINCT content_hash) FROM tool_retrieval_records").fetchone()[0], expected_embedding_rows)
         finally:
             connection.close()
+
+    def test_persisted_conversation_state_is_session_scoped_and_expires(self):
+        state = {
+            "conversationId": "conversation-one",
+            "status": "awaiting_tool_choice",
+            "segments": ["Search my local knowledge base for bananas"],
+            "currentIndex": 0,
+            "expiresAt": "2099-01-01T00:00:00+00:00",
+        }
+        demo_database.save_conversation_state("visitor-one", state)
+        other = {**state, "conversationId": "conversation-two", "originalRequest": "other request"}
+        demo_database.save_conversation_state("visitor-two", other)
+        self.assertEqual(demo_database.load_conversation_state("visitor-one")["conversationId"], "conversation-one")
+        self.assertEqual(demo_database.load_conversation_state("visitor-two")["originalRequest"], "other request")
+        connection = sqlite3.connect(demo_database.session_database("visitor-one"))
+        try:
+            connection.execute("UPDATE conversation_state SET expires_at='2000-01-01T00:00:00+00:00'")
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertIsNone(demo_database.load_conversation_state("visitor-one"))
+
+    def test_provider_data_embeddings_are_persisted_fresh_and_session_scoped(self):
+        first_registry = demo_database.registry("provider-one")
+        pending = first_registry["pendingProviderDataIds"]
+        self.assertTrue(pending)
+        provider_id, record_type, record_id = pending[0].split(":", 2)
+        index_hash = self.query_one(
+            demo_database.session_database("provider-one"),
+            "SELECT content_hash FROM provider_data_index WHERE provider_id=? AND record_type=? AND record_id=?",
+            (provider_id, record_type, record_id),
+        )
+        index_entry = {
+            "providerId": provider_id,
+            "recordType": record_type,
+            "recordId": record_id,
+            "contentHash": index_hash,
+            "vector": [1.0] + [0.0] * (demo_database.DIMENSIONS - 1),
+        }
+        with self.assertRaisesRegex(ValueError, "changed while its embedding"):
+            demo_database.store_provider_data_embeddings("provider-one", [{**index_entry, "contentHash": "stale"}])
+        demo_database.store_provider_data_embeddings("provider-one", [index_entry])
+        first_registry = demo_database.registry("provider-one")
+        self.assertNotIn(pending[0], first_registry["pendingProviderDataIds"])
+        self.assertIn(pending[0], demo_database.registry("provider-two")["pendingProviderDataIds"])
+        results = demo_database.search_provider_data(
+            "provider-one", [1.0] + [0.0] * (demo_database.DIMENSIONS - 1), [provider_id], threshold=0.0,
+        )
+        self.assertEqual(results[provider_id]["namespace"], "provider-data")
+        self.assertEqual(results[provider_id]["hits"][0]["recordId"], record_id)
+        self.assertEqual(results[provider_id]["hits"][0]["indexedAt"] is not None, True)
+
+        session_path = demo_database.session_database("provider-one")
+        connection = sqlite3.connect(session_path)
+        try:
+            row = connection.execute(
+                "SELECT payload_json FROM records WHERE provider_id=? AND record_type=? AND record_id=?",
+                (provider_id, record_type, record_id),
+            ).fetchone()
+            payload = json.loads(row[0])
+            payload["front"] = "Updated synthetic question"
+            connection.execute(
+                "UPDATE records SET payload_json=? WHERE provider_id=? AND record_type=? AND record_id=?",
+                (json.dumps(payload), provider_id, record_type, record_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        self.assertIn(pending[0], demo_database.registry("provider-one")["pendingProviderDataIds"])
+        stale_search = demo_database.search_provider_data(
+            "provider-one", [1.0] + [0.0] * (demo_database.DIMENSIONS - 1), [provider_id], threshold=0.0,
+        )
+        self.assertEqual(stale_search[provider_id]["hits"], [])
+
+        connection = sqlite3.connect(session_path)
+        try:
+            connection.execute(
+                "DELETE FROM records WHERE provider_id=? AND record_type=? AND record_id=?",
+                (provider_id, record_type, record_id),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        demo_database.registry("provider-one")
+        self.assertEqual(self.query_one(
+            session_path, "SELECT COUNT(*) FROM provider_data_index WHERE provider_id=? AND record_type=? AND record_id=?",
+            (provider_id, record_type, record_id),
+        ), 0)
+
+        demo_database.execute_tool("provider-one", "anki.create_card", {"front": "New indexed question", "back": "New indexed answer", "tags": []})
+        refreshed = demo_database.registry("provider-one")
+        self.assertTrue(any(value.startswith("anki:cards:") for value in refreshed["pendingProviderDataIds"]))
 
     def test_baseline_is_read_only_and_independent_of_personal_databases(self):
         connection = demo_database.connect_readonly(self.seed)
@@ -118,6 +218,38 @@ class BackendTests(unittest.TestCase):
         with self.assertRaises(LookupError):
             demo_database.execute_tool(session, "untrusted.run", {})
 
+    def test_calendar_search_uses_half_open_ranges_and_filters_before_selecting_first_event(self):
+        session = "calendar-range-test"
+        demo_database.execute_tool(session, "calendar.create_event", {
+            "title": "Lunch break",
+            "start": "2026-11-15T08:00:00+02:00",
+            "end": "2026-11-15T08:30:00+02:00",
+        })
+        result = demo_database.execute_tool(session, "calendar.find_events", {
+            "start_datetime": "2026-11-15T00:00:00+02:00",
+            "end_datetime": "2026-11-16T00:00:00+02:00",
+            "event_type": "meeting",
+            "sort": "start_ascending",
+        })
+        self.assertEqual(result["data"]["events"][0]["id"], "event-3")
+        self.assertEqual(result["data"]["firstEvent"]["id"], "event-3")
+        empty_result = demo_database.execute_tool(session, "calendar.find_events", {
+            "start_datetime": "2026-11-16T00:00:00+02:00",
+            "end_datetime": "2026-11-17T00:00:00+02:00",
+        })
+        self.assertEqual(empty_result["state"], "empty")
+
+    def test_side_effect_operation_ids_prevent_duplicate_writes_and_argument_reuse(self):
+        session = "idempotency-test"
+        arguments = {"front": "Synthetic idempotency question", "back": "Synthetic idempotency answer", "tags": ["test"]}
+        first = demo_database.execute_tool(session, "anki.create_card", arguments, "conversation-one:0")
+        repeated = demo_database.execute_tool(session, "anki.create_card", arguments, "conversation-one:0")
+        self.assertEqual(first, repeated)
+        self.assertEqual(len(demo_database.registry(session)["data"]["anki"]["cards"]), 13)
+        with self.assertRaisesRegex(ValueError, "already used"):
+            demo_database.execute_tool(session, "anki.create_card", {**arguments, "front": "Different"}, "conversation-one:0")
+        self.assertEqual(len(demo_database.registry(session)["data"]["anki"]["cards"]), 13)
+
     def test_sqlite_tool_namespace_indexing_and_similarity_search(self):
         session = "embedding-test"
         vector = [0.0] * demo_database.DIMENSIONS
@@ -155,6 +287,20 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(registry["toolRetrievalConfig"]["scoring"], "weighted-max")
             self.assertEqual(registry["toolRetrievalConfig"]["maxOperations"], 4)
             self.assertEqual(len(registry["data"]["anki"]["cards"]), 12)
+            connection.request("GET", "/api/demo/conversation", headers={"Origin": "http://localhost:5173", "Cookie": cookie})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 200)
+            self.assertIsNone(json.loads(response.read())["state"])
+            with patch("backend.generate_normalization", return_value='{"status":"resolved"}') as generate:
+                connection.request("POST", "/api/demo/normalize", body=json.dumps({"prompt": "synthetic prompt"}), headers=headers)
+                response = connection.getresponse()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(response.read())["text"], '{"status":"resolved"}')
+                generate.assert_called_once_with("synthetic prompt")
+            connection.request("POST", "/api/demo/normalize", body=json.dumps({"prompt": "synthetic prompt"}), headers={"Origin": "http://localhost:5173", "Cookie": cookie, "Content-Type": "application/json"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 403)
+            response.read()
             body = {"toolId": "anki.create_card", "arguments": {"front": "Question", "back": "Answer"}}
             connection.request("POST", "/api/demo/execute", body=json.dumps(body), headers=headers)
             response = connection.getresponse()

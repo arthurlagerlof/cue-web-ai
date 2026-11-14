@@ -9,10 +9,66 @@ def execute(connection, provider_id, tool_id, arguments):
     events = records(connection, provider_id, "events")
     if tool_id == "calendar.find_events":
         date_query = arguments.get("date")
-        query = date_query or arguments.get("query", "")
-        found = [item for item in events if item.get("start", "").startswith(date_query)] if date_query else [item for item in events if matches(query, [item["title"], item.get("location", "")])]
+        query = arguments.get("query", "").strip()
+        start_bound = arguments.get("start_datetime")
+        end_bound = arguments.get("end_datetime")
+        legacy_date = bool(date_query and not start_bound and not end_bound)
+        if date_query:
+            start_bound = start_bound or (None if legacy_date else f"{date_query}T00:00:00")
+            end_bound = end_bound or (None if legacy_date else f"{date_query}T23:59:59.999999")
+        try:
+            start = datetime.fromisoformat(start_bound.replace("Z", "+00:00")) if start_bound else None
+            end = datetime.fromisoformat(end_bound.replace("Z", "+00:00")) if end_bound else None
+        except ValueError as exc:
+            raise ValueError("Calendar search bounds must use ISO-8601 date-times") from exc
+        if start is not None and end is not None and end <= start:
+            raise ValueError("Calendar search end must follow its start")
+        event_type = arguments.get("event_type")
+
+        def matches_type(item):
+            explicit = str(item.get("eventType", item.get("type", ""))).lower()
+            title = item.get("title", "").lower()
+            inferred = (
+                "meeting" if any(word in title for word in ("meeting", "sync", "review", "planning", "standup", "call"))
+                else "appointment" if "appointment" in title or "dentist" in title
+                else "lunch" if "lunch" in title
+                else "reminder" if "reminder" in title
+                else ""
+            )
+            return not event_type or event_type == explicit or event_type == inferred
+
+        def within_bounds(item):
+            if legacy_date:
+                return item.get("start", "").startswith(date_query)
+            try:
+                instant = datetime.fromisoformat(item["start"].replace("Z", "+00:00"))
+            except (KeyError, ValueError):
+                return False
+            if start is not None:
+                if instant.tzinfo is None and start.tzinfo is not None:
+                    instant = instant.replace(tzinfo=start.tzinfo)
+                elif instant.tzinfo is not None and start.tzinfo is None:
+                    return False
+                if instant < start:
+                    return False
+            if end is not None:
+                if instant.tzinfo is None and end.tzinfo is not None:
+                    instant = instant.replace(tzinfo=end.tzinfo)
+                elif instant.tzinfo is not None and end.tzinfo is None:
+                    return False
+                if instant >= end:
+                    return False
+            return True
+
+        found = [
+            item for item in events
+            if within_bounds(item)
+            and matches_type(item)
+            and (not query or matches(query, [item.get("title", ""), item.get("location", ""), item.get("description", ""), *item.get("attendees", [])]))
+        ]
         if not found: return empty(provider_id, NAME, "Calendar events", query)
-        found.sort(key=lambda item: item["start"])
+        descending = arguments.get("sort") == "start_descending"
+        found.sort(key=lambda item: item["start"], reverse=descending)
         actions, elements = [], []
         for item in found:
             action_id = f"open-{item['id']}"

@@ -33,7 +33,8 @@ export class ToolDispatcher {
   async dispatch(call, { confirmed = false } = {}) {
     const { tool, provider } = this.validateCall(call);
     if (tool.confirmation === 'required' && !confirmed) return { state: 'confirmation_required', toolId: tool.id, arguments: call.arguments };
-    const result = await provider.execute(tool.id, call.arguments, { confirmed });
+    const operationId = call.operationId ?? globalThis.crypto?.randomUUID?.() ?? `operation-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    const result = await provider.execute(tool.id, call.arguments, { confirmed, operationId });
     const outputDocument = result && result.document ? result.document : result;
     const document = assertDisplayDocument(outputDocument, { registry: this.registry });
     return { state: 'ready', document, data: result && result.document ? result.data : document };
@@ -65,7 +66,7 @@ export class ToolDispatcher {
           if (executedSideEffects.has(signature)) throw new Error(`Duplicate side effect rejected: ${tool.id}`);
           executedSideEffects.add(signature);
         }
-        const output = await provider.execute(tool.id, args, { confirmed });
+        const output = await provider.execute(tool.id, args, { confirmed, operationId: operation.id });
         const document = assertDisplayDocument(output && output.document ? output.document : output, { registry: this.registry });
         documents.set(operation.id, document);
         results.set(operation.id, output && output.document ? output.data : document);

@@ -21,7 +21,7 @@ export function aggregateToolRecords(records, { strategy = 'weighted-max', weigh
   return { ...best, score };
 }
 
-function cosineSimilarity(left, right) {
+export function cosineSimilarity(left, right) {
   if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length || !left.length) return -1;
   let dot = 0, leftNorm = 0, rightNorm = 0;
   for (let index = 0; index < left.length; index++) {

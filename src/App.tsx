@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { RollingAudio } from './services/audio';
 import { BangleConnection } from './services/bluetooth';
 import { ASR_MODELS, type ASRModelSize } from './services/asrModels';
+import { createGemmaService } from './services/gemmaService.js';
 import { createDisplayDocument, validateDisplayDocument } from './display/document.js';
 import { DisplayDocumentView } from './display/DisplayDocumentView';
 import { createDatabaseEnvironment } from './demo/databaseEnvironment.js';
@@ -55,6 +56,14 @@ function getSession(forceRenew = false): Promise<Session> {
   return sessionPromise;
 }
 
+async function getConversationState() {
+  const response = await fetch('/api/demo/conversation', { credentials: 'same-origin', cache: 'no-store' });
+  const result = await response.json();
+  if (response.status === 404) throw new Error('The backend does not support conversation state. Restart the Cue backend to load the current code.');
+  if (!response.ok) throw new Error(result.error ?? `Conversation state request failed (${response.status})`);
+  return result.state;
+}
+
 async function postApi(path: string, data: unknown) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const session = await getSession(attempt === 1);
@@ -80,6 +89,21 @@ export default function App() {
   const [asrModel, setAsrModel] = useState<ASRModelSize>('tiny');
   const asrModelRef = useRef<ASRModelSize>('tiny');
   const [status, setStatus] = useState<Record<Stage, string>>({ transcribe: 'Not started', embed: 'Not started' });
+  const [gemmaMode, setGemmaMode] = useState<'automatic' | 'enabled' | 'disabled'>(() => {
+    try {
+      const savedMode = window.localStorage.getItem('cue.gemma.mode');
+      if (savedMode === 'automatic' || savedMode === 'enabled' || savedMode === 'disabled') return savedMode;
+      const legacyPreference = window.localStorage.getItem('cue.gemma.enabled');
+      return legacyPreference === null ? 'automatic' : legacyPreference === 'true' ? 'enabled' : 'disabled';
+    } catch { return 'automatic'; }
+  });
+  const gemmaModeRef = useRef(gemmaMode);
+  const [weekStartsOn, setWeekStartsOn] = useState(() => {
+    try { return window.localStorage.getItem('cue.calendar.weekStartsOn') === '0' ? 0 : 1; }
+    catch { return 1; }
+  });
+  const [gemmaState, setGemmaState] = useState<{ status: string; progress?: { reason?: string; message?: string; generatedCharacters?: number } }>({ status: 'not_checked' });
+  const [gemmaService] = useState(() => createGemmaService({ onState: state => setGemmaState(state) }));
   const [transcription, setTranscription] = useState('');
   const [embedding, setEmbedding] = useState<any>();
   const [logs, setLogs] = useState<string[]>([]);
@@ -104,7 +128,24 @@ export default function App() {
   const log = (message: string) => setLogs(old => [`${new Date().toLocaleTimeString()} ${message}`, ...old].slice(0, 30));
   useEffect(() => {
     const unsubscribe = audio.subscribe(() => { setRecording(audio.active); setBuffer(audio.bufferedSeconds); });
-    void getSession().catch(error => log(`Backend session unavailable: ${error instanceof Error ? error.message : 'initialization failed'}`));
+    void getSession()
+      .then(() => getConversationState())
+      .then(state => {
+        if (state?.status === 'awaiting_confirmation' && state.pendingConfirmation?.call) setPendingConfirmation({ call: state.pendingConfirmation.call, fromWorkflow: true });
+        if (state && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(state.status)) setPendingClarification(true);
+        if (state && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice', 'awaiting_confirmation'].includes(state.status)) {
+          const message = state.pendingQuestion ?? 'Continue the pending local operation.';
+          void showDocument(createDisplayDocument({
+            id: `cue-restored-${state.status}`,
+            title: state.status === 'awaiting_confirmation' ? 'Confirmation required' : 'Clarification needed',
+            source: { app: 'cue', name: 'Cue' },
+            state: state.status === 'awaiting_confirmation' ? 'confirmation_required' : 'ready',
+            message,
+            elements: [{ type: 'text', text: message, role: 'body' }],
+          })).catch(error => log(`Could not restore pending request display: ${error instanceof Error ? error.message : String(error)}`));
+        }
+      })
+      .catch(error => log(`Backend session unavailable: ${error instanceof Error ? error.message : 'initialization failed'}`));
     watch.onTrigger = () => {
       log('Watch hold-to-trigger received');
       try {
@@ -120,8 +161,24 @@ export default function App() {
     };
     watch.onStatus = message => { setWatchName('Not connected'); log(message); };
     watch.onDiagnostic = message => log(`BLE: ${message}`);
-    return () => { unsubscribe(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); watch.disconnect(); audio.stop(); };
+    return () => { unsubscribe(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); gemmaService.dispose(); watch.disconnect(); audio.stop(); };
   }, []);
+
+  function setGemmaPreference(mode: 'automatic' | 'enabled' | 'disabled') {
+    gemmaModeRef.current = mode;
+    setGemmaMode(mode);
+    try { window.localStorage.setItem('cue.gemma.mode', mode); }
+    catch (error) { log(`Could not save local normalizer preference: ${error instanceof Error ? error.message : String(error)}`); }
+    if (mode === 'disabled') {
+      gemmaService.dispose();
+    }
+  }
+
+  function setCalendarWeekStart(value: number) {
+    setWeekStartsOn(value);
+    try { window.localStorage.setItem('cue.calendar.weekStartsOn', String(value)); }
+    catch (error) { log(`Could not save calendar week-start preference: ${error instanceof Error ? error.message : String(error)}`); }
+  }
 
   function runModel(stage: Stage, data: { text?: string; asrModel?: ASRModelSize; audio?: Float32Array; sampleRate?: number }): Promise<WorkerReply> {
     const id = ++sequence.current;
@@ -149,6 +206,7 @@ export default function App() {
 
   async function getEnvironment() {
     if (environment.current) return environment.current;
+    await getSession();
     const embed = async (text: string) => {
       const reply = await runModel('embed', { text });
       if (reply.status === 'error') throw new Error(reply.error);
@@ -158,7 +216,29 @@ export default function App() {
     const response = await fetch('/api/demo/registry', { credentials: 'same-origin', cache: 'no-store' });
     const registryData = await response.json();
     if (!response.ok) throw new Error(registryData.error ?? `Demo registry request failed (${response.status})`);
-    environment.current = await createDatabaseEnvironment({ registryData, embed, postApi });
+    const initialState = await getConversationState();
+    environment.current = await createDatabaseEnvironment({
+      registryData,
+      embed,
+      postApi,
+      argumentNormalizerEnabled: () => gemmaModeRef.current !== 'disabled',
+      normalizeArguments: async (prompt: string) => {
+        const result = await postApi('/api/demo/normalize', { prompt });
+        if (typeof result.text !== 'string' || !result.text.trim()) throw new Error('OpenRouter returned an empty response.');
+        return result.text;
+      },
+      onNormalizerFallback: (reason: string) => log(`OpenRouter normalizer unavailable or invalid: ${reason}. Trying local Gemma fallback.`),
+      fallbackNormalizeArguments: async (prompt: string) => {
+        const state = await gemmaService.preload();
+        if (state.status !== 'ready') {
+          throw new Error(state.progress?.message ?? state.progress?.reason ?? `Gemma is unavailable (${state.status}).`);
+        }
+        return gemmaService.generate(prompt);
+      },
+      initialState: initialState?.status === 'idle' ? undefined : initialState,
+    });
+    if (initialState?.status === 'awaiting_confirmation' && initialState.pendingConfirmation?.call) setPendingConfirmation({ call: initialState.pendingConfirmation.call, fromWorkflow: true });
+    if (initialState && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(initialState.status)) setPendingClarification(true);
     log(`Loaded ${registryData.tools.length} provider-owned tools from the SQLite demo registry`);
     return environment.current;
   }
@@ -188,24 +268,33 @@ export default function App() {
   async function processTranscript(text: string) {
     const clean = text.trim();
     if (!clean) throw new Error('Enter transcript text first.');
-    setTranscription(clean); setTranscriptInput(clean); setBusy(true); setPendingConfirmation(undefined); setPendingClarification(false);
+    setTranscription(clean); setTranscriptInput(clean); setBusy(true);
     try {
       await showDocument(createDisplayDocument({ id: 'cue-loading', title: 'Working', source: { app: 'cue', name: 'Cue' }, state: 'loading', message: 'Discovering provider tools and preparing a local response.', elements: [{ type: 'text', text: clean, role: 'body' }] }));
       const runtime = await getEnvironment();
-      const outcome = await runtime.intelligence.handle(clean, { context: { now: new Date(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language } });
-      if (outcome.retrieval) log(`Retrieval ${outcome.retrieval.toolId}: ${outcome.retrieval.score.toFixed(3)} (description ${outcome.retrieval.bestDescriptionSimilarity?.toFixed(3) ?? '—'}, keyword ${outcome.retrieval.bestKeywordSimilarity?.toFixed(3) ?? '—'}, example ${outcome.retrieval.bestExampleSimilarity?.toFixed(3) ?? '—'}, margin ${outcome.retrieval.margin?.toFixed(3) ?? '—'})`);
+      const outcome = await runtime.intelligence.handle(clean, { context: { now: new Date(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn } });
+      if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
+      if (outcome.normalizationError) log(`Argument normalization failed: ${outcome.normalizationError}`);
+      if (outcome.kind !== 'confirmation_required') setPendingConfirmation(undefined);
+      if (outcome.retrieval) {
+        log(`Retrieval ${outcome.retrieval.toolId}: ${outcome.retrieval.score.toFixed(3)} (description ${outcome.retrieval.bestDescriptionSimilarity?.toFixed(3) ?? '—'}, keyword ${outcome.retrieval.bestKeywordSimilarity?.toFixed(3) ?? '—'}, example ${outcome.retrieval.bestExampleSimilarity?.toFixed(3) ?? '—'}, margin ${outcome.retrieval.margin?.toFixed(3) ?? '—'})`);
+        if (outcome.retrieval.providerEvidence) {
+          log(`Provider data ${outcome.retrieval.providerEvidence.hits.length ? `matched ${outcome.retrieval.providerEvidence.hits.length} record(s)` : 'had no matching records'}; indexed ${outcome.retrieval.providerEvidence.indexedAt ?? 'not available'}`);
+        }
+      }
       if (outcome.kind === 'confirmation_required') {
-        setPendingConfirmation(outcome.pendingCall ? { call: outcome.pendingCall } : { plan: outcome.pendingPlan });
+        setPendingConfirmation(outcome.pendingCall ? { call: outcome.pendingCall, fromWorkflow: true } : { plan: outcome.pendingPlan, fromWorkflow: true });
         const targetIds = outcome.operations?.map((operation: any) => operation.toolId) ?? [outcome.toolId];
         const targets = targetIds.map((id: string) => runtime.registry.get(id)?.name ?? id).join(', ');
-        const confirmation = createDisplayDocument({ id: 'cue-confirmation-required', title: 'Confirmation required', source: { app: 'cue', name: 'Cue' }, state: 'confirmation_required', message: 'This mock action will not run until you confirm.', elements: [{ type: 'text', text: targets, role: 'body' }] });
+        const proposed = outcome.pendingCall?.arguments ? `\nProposed arguments: ${JSON.stringify(outcome.pendingCall.arguments)}` : '';
+        const confirmation = createDisplayDocument({ id: 'cue-confirmation-required', title: 'Confirmation required', source: { app: 'cue', name: 'Cue' }, state: 'confirmation_required', message: 'This mock action will not run until you confirm.', elements: [{ type: 'text', text: `${targets}${proposed}`, role: 'body' }] });
         await showDocument(confirmation);
         log(`Confirmation required: ${targets}`);
       } else if (outcome.kind === 'document') {
         await showDocument(outcome.document);
         log('Local tool completed and returned a validated Cue Display Document');
       } else {
-        setPendingClarification(outcome.kind === 'clarification' && Boolean(outcome.toolId));
+        setPendingClarification(['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(outcome.state?.status));
         if (outcome.kind === 'clarification' && outcome.toolId) setTranscriptInput('');
         const message = outcome.kind === 'answer' ? outcome.text : outcome.kind === 'clarification' ? outcome.question : outcome.text;
         const state = outcome.kind === 'no_tool' ? 'empty' : outcome.kind === 'partial_failure' ? 'error' : 'ready';
@@ -214,7 +303,23 @@ export default function App() {
         await showDocument(document);
         log(`Tool intelligence outcome: ${outcome.kind}`);
       }
-    } catch (error) { const message = error instanceof Error ? error.message : String(error); log(`Processing error: ${message}`); throw error; }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`Processing error: ${message}`);
+      try {
+        await showDocument(createDisplayDocument({
+          id: 'cue-processing-error',
+          title: 'Processing failed',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'error',
+          message,
+          elements: [{ type: 'text', text: message, role: 'body' }],
+        }));
+      } catch (displayError) {
+        log(`Could not display processing error: ${displayError instanceof Error ? displayError.message : String(displayError)}`);
+      }
+      throw error;
+    }
     finally { setBusy(false); }
   }
 
@@ -226,12 +331,25 @@ export default function App() {
     if (!window.confirm(`Run the following local mock action(s)? ${labels}`)) return;
     setBusy(true);
     try {
-      const result = pendingAction.call
-        ? await environment.current.dispatcher.dispatch(pendingAction.call, { confirmed: true })
-        : await environment.current.dispatcher.dispatchPlan(pendingAction.plan, { confirmed: true });
+      let document;
+      if (pendingAction.fromWorkflow) {
+        const outcome = await environment.current.intelligence.handle('yes', { confirmed: true, context: { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn } });
+        if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
+        if (outcome.kind === 'confirmation_required') {
+          setPendingConfirmation({ call: outcome.pendingCall, fromWorkflow: true });
+          return;
+        }
+        if (outcome.kind !== 'document') throw new Error(outcome.text ?? outcome.question ?? 'The confirmed workflow did not complete.');
+        document = outcome.document;
+      } else {
+        const result = pendingAction.call
+          ? await environment.current.dispatcher.dispatch(pendingAction.call, { confirmed: true })
+          : await environment.current.dispatcher.dispatchPlan(pendingAction.plan, { confirmed: true });
+        document = result.document;
+      }
       setPendingConfirmation(undefined);
       setPendingClarification(false);
-      await showDocument(result.document);
+      await showDocument(document);
       log(`Confirmed mock action completed: ${labels}`);
     } catch (error) { log(`Confirmed action failed: ${error instanceof Error ? error.message : String(error)}`); }
     finally { setBusy(false); }
@@ -239,7 +357,9 @@ export default function App() {
 
   function cancelPendingOperation() {
     environment.current?.intelligence.cancelPendingOperation();
+    setPendingConfirmation(undefined);
     setPendingClarification(false);
+    if (environment.current) void postApi('/api/demo/conversation', { state: environment.current.intelligence.getState() }).catch(error => log(`Could not persist cancellation: ${error instanceof Error ? error.message : String(error)}`));
     log('Pending operation cancelled');
   }
 
@@ -248,6 +368,7 @@ export default function App() {
     setBusy(true);
     try {
       await postApi('/api/demo/reset', {});
+      await postApi('/api/demo/conversation', { state: null });
       environment.current = undefined;
       displayDocumentRef.current = undefined;
       setDisplayDocument(undefined);
@@ -263,7 +384,7 @@ export default function App() {
     try {
       const result = await environment.current.dispatcher.dispatch({ toolId: action.toolId, arguments: action.arguments });
       if (result.state === 'confirmation_required') {
-        setPendingConfirmation({ call: { toolId: result.toolId, arguments: result.arguments } });
+        setPendingConfirmation({ call: { toolId: result.toolId, arguments: result.arguments }, fromWorkflow: false });
         return;
       }
       await showDocument(result.document);
@@ -376,7 +497,15 @@ export default function App() {
     <h1>Cue</h1>
     <p>Enter a request for local tool discovery, argument resolution, and mock-provider execution. AI inference runs in your browser.</p>
     <section><h2>Devices</h2><button onClick={() => watch.connected ? watch.disconnect() : void connectWatch()}>{watch.connected ? 'Disconnect watch' : 'Connect Bangle.js'}</button> <span>{watchName}</span> <button disabled={!watch.connected || testSending} onClick={() => void sendWatchTest()}>{testSending ? 'Sending raw test…' : 'Send raw TEST to watch'}</button><p><button disabled={installing} onClick={() => void installOnWatch()}>{installing ? 'Installing…' : 'Install on watch'}</button></p>{installStatus && <p role="status">{installStatus}</p>}<details><summary>Manual downloads</summary><p>These files can also be installed with the Espruino Web IDE.</p><button onClick={() => downloadWatchFile('cue.app.js', watchAppSource)}>Download watch display app</button> <a href="https://www.espruino.com/ide/" target="_blank" rel="noreferrer">Open Espruino Web IDE</a></details><br /><button onClick={() => void toggleMicrophone()}>{recording ? 'Stop microphone' : 'Start microphone'}</button><button disabled={!recording || buffer < 0.2} onClick={freezeBuffer}>Freeze rolling buffer</button> <strong style={{ color: recording ? '#16803c' : '#777' }}>{recording ? '● Recording' : 'Microphone off'}</strong><p>Rolling buffer: {buffer.toFixed(1)} / 10.0 seconds (sample rate {audio.sampleRate || '—'} Hz)</p></section>
-    <section><h2>Processing</h2><label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label><button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button><button disabled={busy || !recording || buffer < 0.2} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); void startHoldCapture(); }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()}>{holding ? 'Release to transcribe…' : 'Hold to transcribe (max 5 min)'}</button>{(['transcribe', 'embed'] as Stage[]).map(stage => <p key={stage}>{stage}: {status[stage]}{busy && <button onClick={() => stopStage(stage)}>Stop {stage}</button>}</p>)}<p>Tools and provider availability are loaded dynamically from the session's SQLite registry. MiniLM retrieval and deterministic argument resolution run in your browser.</p><label>Demo scenario<select value={scenario} onChange={event => { setScenario(event.target.value); setTranscriptInput(event.target.value); }}><option value="">Choose an example request</option>{DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}</select></label><label>{pendingClarification ? 'Clarification' : 'Transcript text'}<textarea value={transcriptInput} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder={pendingClarification ? 'Enter the missing details or a correction' : 'Enter sample transcript text'} /></label>{pendingClarification && <p role="status">Reply here to continue the pending request. Your message will go directly to that request.</p>}<button disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>{busy ? 'Processing…' : pendingClarification ? 'Send clarification' : 'Process transcript'}</button> <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button><label>Transcription (audio capture only)<textarea readOnly value={transcription} /></label><p>Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>{displayDocument && <><DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />{pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}{pendingClarification && <button disabled={busy} onClick={cancelPendingOperation}>Cancel pending operation</button>}</>}</section>
+    <section><h2>Processing</h2>
+      <fieldset disabled={busy}><legend>Argument normalizer</legend><div role="group" aria-label="Normalizer mode">
+        <button type="button" aria-pressed={gemmaMode === 'automatic'} onClick={() => setGemmaPreference('automatic')}>Automatic</button>
+        <button type="button" aria-pressed={gemmaMode === 'enabled'} onClick={() => setGemmaPreference('enabled')}>Enabled</button>
+        <button type="button" aria-pressed={gemmaMode === 'disabled'} onClick={() => setGemmaPreference('disabled')}>Disabled</button>
+      </div></fieldset>
+      <p>Automatic and Enabled use OpenRouter for suitable requests, falling back to local Gemma if needed. Disabled skips model normalization. Requests, conversation context and matching provider records may be sent to OpenRouter; do not enter sensitive information.</p>
+      <p role="status">Gemma fallback: {gemmaState.status}{gemmaState.progress?.reason ? ` — ${gemmaState.progress.reason}` : ''}{gemmaState.progress?.message ? ` — ${gemmaState.progress.message}` : ''}{gemmaState.progress?.generatedCharacters ? ` — ${gemmaState.progress.generatedCharacters} generated characters` : ''}</p>
+      <label>Calendar week starts<select value={weekStartsOn} onChange={event => setCalendarWeekStart(Number(event.target.value))}><option value={1}>Monday</option><option value={0}>Sunday</option></select></label><label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label><button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button><button disabled={busy || !recording || buffer < 0.2} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); void startHoldCapture(); }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()}>{holding ? 'Release to transcribe…' : 'Hold to transcribe (max 5 min)'}</button>{(['transcribe', 'embed'] as Stage[]).map(stage => <p key={stage}>{stage}: {status[stage]}{busy && <button onClick={() => stopStage(stage)}>Stop {stage}</button>}</p>)}<p>Tools and provider availability are loaded dynamically from the session's SQLite registry. MiniLM retrieval and deterministic argument resolution run in your browser.</p><label>Demo scenario<select value={scenario} onChange={event => { setScenario(event.target.value); setTranscriptInput(event.target.value); }}><option value="">Choose an example request</option>{DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}</select></label><label>{pendingClarification ? 'Clarification' : 'Transcript text'}<textarea value={transcriptInput} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder={pendingClarification ? 'Enter the missing details or a correction' : 'Enter sample transcript text'} /></label>{pendingClarification && <p role="status">Reply here to continue the pending request. Your message will go directly to that request.</p>}<button disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>{busy ? 'Processing…' : pendingClarification ? 'Send clarification' : 'Process transcript'}</button> <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button><label>Transcription (audio capture only)<textarea readOnly value={transcription} /></label><p>Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>{displayDocument && <><DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />{pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}{pendingClarification && <button disabled={busy} onClick={cancelPendingOperation}>Cancel pending operation</button>}</>}</section>
     <section><h2>Status log</h2><pre>{logs.join('\n')}</pre></section>
   </main>;
 }

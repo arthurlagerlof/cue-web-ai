@@ -43,6 +43,83 @@ function zonedIso(parts, timeZone) {
   return `${parts.year}-${String(parts.month).padStart(2, '0')}-${String(parts.day).padStart(2, '0')}T${String(parts.hour).padStart(2, '0')}:${String(parts.minute).padStart(2, '0')}:${String(parts.second ?? 0).padStart(2, '0')}${sign}${String(Math.floor(abs / 60)).padStart(2, '0')}:${String(abs % 60).padStart(2, '0')}`;
 }
 
+function addCalendarDays(parts, amount) {
+  const date = new Date(Date.UTC(parts.year, parts.month - 1, parts.day + amount));
+  return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
+}
+
+function calendarDateRange(text, { now, timeZone, role, weekStartsOn = 1 }) {
+  const lower = text.toLocaleLowerCase();
+  const localNow = zoneParts(now, timeZone);
+  const today = { year: localNow.year, month: localNow.month, day: localNow.day };
+  let start;
+  let end;
+  let originalText;
+  if (/\bnext week\b/i.test(lower)) {
+    const weekday = new Date(Date.UTC(today.year, today.month - 1, today.day)).getUTCDay();
+    start = addCalendarDays(today, ((weekStartsOn - weekday + 7) % 7) || 7);
+    end = addCalendarDays(start, 7);
+    originalText = text.match(/\bnext week\b/i)?.[0];
+  } else if (/\bthis week\b/i.test(lower)) {
+    const weekday = new Date(Date.UTC(today.year, today.month - 1, today.day)).getUTCDay();
+    start = addCalendarDays(today, -((weekday - weekStartsOn + 7) % 7));
+    end = addCalendarDays(start, 7);
+    originalText = text.match(/\bthis week\b/i)?.[0];
+  } else if (/\bnext month\b/i.test(lower)) {
+    start = { year: today.month === 12 ? today.year + 1 : today.year, month: today.month === 12 ? 1 : today.month + 1, day: 1 };
+    end = { year: start.month === 12 ? start.year + 1 : start.year, month: start.month === 12 ? 1 : start.month + 1, day: 1 };
+    originalText = text.match(/\bnext month\b/i)?.[0];
+  } else if (/\bthis month\b/i.test(lower)) {
+    start = { year: today.year, month: today.month, day: 1 };
+    end = { year: today.month === 12 ? today.year + 1 : today.year, month: today.month === 12 ? 1 : today.month + 1, day: 1 };
+    originalText = text.match(/\bthis month\b/i)?.[0];
+  } else if (/\btoday\b/i.test(lower) || /\btomorrow\b/i.test(lower)) {
+    const offset = /\btomorrow\b/i.test(lower) ? 1 : 0;
+    start = addCalendarDays(today, offset);
+    end = addCalendarDays(start, 1);
+    originalText = text.match(/\b(?:today|tomorrow)\b/i)?.[0];
+  }
+  if (!start) {
+    const matches = chrono.en.parse(text, now);
+    const match = matches[0];
+    if (match) {
+      start = { year: match.start.get('year'), month: match.start.get('month'), day: match.start.get('day') };
+      originalText = match.text;
+      end = addCalendarDays(
+        matches.length > 1
+          ? { year: matches.at(-1).start.get('year'), month: matches.at(-1).start.get('month'), day: matches.at(-1).start.get('day') }
+          : start,
+        1,
+      );
+    }
+  }
+  if (!start) return undefined;
+  if (!end) end = addCalendarDays(start, 1);
+  const date = role === 'interval_end' ? end : start;
+  const value = zonedIso({ ...date, hour: 0, minute: 0, second: 0 }, timeZone);
+  if (!value) return { status: 'ambiguous', text: originalText, reason: 'The date boundary is not a valid local time in this timezone.' };
+  return { value, text: originalText, originalText, method: 'calendar-date-range' };
+}
+
+function labeledField(text, requestedRole) {
+  const labelPattern = /(?:^|[\s])(?<label>front|question|q|back|answer|a|tags?)\s*[:=]\s*/gim;
+  const matches = [...text.matchAll(labelPattern)];
+  const wanted = requestedRole === 'question_text' ? new Set(['front', 'question', 'q'])
+    : requestedRole === 'answer_text' ? new Set(['back', 'answer', 'a'])
+      : new Set(['tag', 'tags']);
+  const found = matches.find((match, index) => {
+    if (!wanted.has(match.groups.label.toLowerCase())) return false;
+    const end = matches[index + 1]?.index ?? text.length;
+    return text.slice(match.index + match[0].length, end).trim().length > 0;
+  });
+  if (!found) return undefined;
+  const index = matches.indexOf(found);
+  const end = matches[index + 1]?.index ?? text.length;
+  const value = text.slice(found.index + found[0].length, end).trim();
+  if (requestedRole === 'tag_list') return { value: value.split(/[,;]/).map(item => item.trim()).filter(Boolean), originalText: text.slice(found.index, end).trim(), method: 'labeled-text-extraction' };
+  return { value, originalText: text.slice(found.index, end).trim(), method: 'labeled-text-extraction' };
+}
+
 function temporal(text, schema, { now, locale, timeZone, previousValue, currentValues }) {
   const engine = locale?.toLowerCase().startsWith('fi') ? chrono.fi : chrono.en;
   const matches = engine.parse(text, now);
@@ -84,14 +161,32 @@ function temporal(text, schema, { now, locale, timeZone, previousValue, currentV
   return { value: timeOnly ? normalized.slice(11, 19) : normalized, text: match.text, method: 'chrono-node' };
 }
 
-function queryText(text) {
+function queryText(text, toolId) {
   const cleaned = text.replace(/^[\s,.;:!?-]+|[\s,.;:!?-]+$/g, '');
-  const result = cleaned.replace(/^(?:(?:please\s+)?(?:search|find|look\s+up|show|open|retrieve|etsi|hae|näytä|nayta|etsiä)\b[^.!?]*?\b(?:for|about|from|for|of|on|for|koskeva|aiheesta|hakusanalla)\s+|(?:search|find|etsi|hae)\s+(?:my\s+)?(?:anki\s+)?(?:cards?|kortit|knowledge\s+base|the\s+web|webistä|tietopankki)\s+(?:about|for|aiheesta|hakusanalla)\s+)/i, '').trim();
-  return result || cleaned;
+  let result = cleaned
+    .replace(/^(?:(?:please\s+)?(?:search|find|look\s+up|show|open|retrieve|etsi|hae|näytä|nayta|etsiä)\b[^.!?]*?\b(?:for|about|from|of|on|koskeva|aiheesta|hakusanalla)\s+|(?:search|find|etsi|hae)\s+(?:my\s+)?(?:anki\s+)?(?:cards?|kortit|knowledge\s+base|the\s+web|webistä|tietopankki)\s+(?:about|for|aiheesta|hakusanalla)\s+)/i, '')
+    .replace(/^(?:what events do i have|what(?:'s| is) on my calendar|show me (?:my )?calendar events|find my (?:first|next))\s*/i, '')
+    .replace(/^(?:for|about|query(?:\s+is)?)\s+/i, '')
+    .replace(/\b(?:today|tomorrow|this week|next week|this month|next month|first|earliest|latest)\b/gi, '')
+    .trim();
+  if (toolId === 'calendar.find_events') {
+    for (const match of chrono.en.parse(text)) result = result.replace(match.text, '');
+    result = result.replace(/\b(?:calendar|events?|meetings?|appointments?|reminders?|lunch|on|from|between|to|through)\b/gi, '');
+  }
+  result = result.replace(/^[\s,.;:!?-]+|[\s,.;:!?-]+$/g, '').trim();
+  return toolId === 'calendar.find_events' ? result : result || cleaned;
 }
 
 function extractValue(name, rule, text, context) {
   const hint = rule['x-cue'] ?? {};
+  if ((hint.role === 'interval_start' || hint.role === 'interval_end') && context.toolId === 'calendar.find_events') {
+    const range = calendarDateRange(text, { ...context, role: hint.role });
+    if (range) return range;
+  }
+  if (hint.role === 'event_type') {
+    const type = rule.enum?.find(value => new RegExp(`\\b${value}\\b`, 'i').test(text));
+    if (type) return { value: type, originalText: type, method: 'event-type-extraction' };
+  }
   const parser = (rule.format && customParsers.get(rule.format)) ?? customParsers.get(rule.type);
   if (parser) {
     const parsed = parser({ name, rule, text, context });
@@ -115,7 +210,10 @@ function extractValue(name, rule, text, context) {
     }
   }
   if (typeof hint.role === 'string') {
-    if (hint.role === 'query') return { value: queryText(text), originalText: text, method: 'request-remainder' };
+    if (hint.role === 'query') {
+      const value = queryText(text, context.toolId);
+      return value ? { value, originalText: text, method: 'request-remainder' } : undefined;
+    }
     if (hint.role === 'title') {
       const match = text.match(/\b(?:called|titled|named)\s+(.+?)(?:\s+(?:on|at|from)\b|[.!?]|$)/i);
       if (match) return { value: match[1].trim(), originalText: match[0], method: 'explicit-pattern' };
@@ -123,13 +221,10 @@ function extractValue(name, rule, text, context) {
       if (eventTitle) return { value: eventTitle[0], originalText: eventTitle[0], method: 'intent-label-derivation' };
     }
     if (hint.role === 'question_text' || hint.role === 'answer_text') {
-      const label = hint.role === 'question_text' ? '(?:front|question|q)' : '(?:back|answer|a)';
-      const match = text.match(new RegExp(`\\b${label}\\s*[:=]\\s*(.+?)(?=\\s+\\b(?:front|question|q|back|answer|a|tags?)\\s*[:=]|$)`, 'i'));
-      if (match) return { value: match[1].trim().replace(/[.!?]+$/, ''), originalText: match[0], method: 'labeled-text-extraction' };
+      return labeledField(text, hint.role);
     }
     if (hint.role === 'tag_list') {
-      const match = text.match(/\btags?\s*[:=]\s*(.+?)(?:[.!?]|$)/i);
-      if (match) return { value: match[1].split(/[,;]/).map(value => value.trim()).filter(Boolean), originalText: match[0], method: 'tag-list-extraction' };
+      return labeledField(text, hint.role);
     }
   }
   if (rule.enum?.length) {
@@ -175,6 +270,20 @@ function extractValue(name, rule, text, context) {
     if (hint.role === 'known_entity') {
       const match = text.match(/\b[a-z][a-z0-9_-]*-\d+\b/i);
       if (match) return { value: match[0], originalText: match[0], method: 'entity-id-extraction' };
+      if (context.previousValue?.value && ['provider_lookup', 'tool_result'].includes(context.previousValue.source)) return undefined;
+      const hits = context.providerEvidence?.hits ?? [];
+      const confident = hits.filter(hit => hit.similarity >= 0.5);
+      if (confident.length > 1 && confident[0].similarity - confident[1].similarity < 0.08) {
+        return {
+          status: 'ambiguous',
+          reason: `Which ${name.replace(/Id$/, '').replace(/([A-Z])/g, ' $1').toLowerCase()} do you mean?`,
+          options: confident.slice(0, 3).map(hit => ({ id: hit.record.id, label: hit.record.title ?? hit.record.label ?? hit.record.name ?? hit.record.id })),
+        };
+      }
+      if (confident.length === 1 || (confident.length > 1 && confident[0].similarity - confident[1].similarity >= 0.08)) {
+        const record = confident[0].record;
+        if (typeof record.id === 'string') return { value: record.id, source: 'provider_lookup', originalText: text, method: 'semantic-record-match' };
+      }
     }
     const value = context.providerLookup?.(name, text, rule);
     if (value !== undefined) return { value, method: 'provider-lookup', source: 'provider_lookup' };
@@ -204,13 +313,13 @@ export function resolveArguments({ request, tool, previous = {}, context = {} })
   const invalid = [];
   for (const [name, rule] of Object.entries(schema.properties ?? {})) {
     const previousValue = previous[name];
-    const extracted = extractValue(name, rule, request, { ...context, now, locale, timeZone, previousValue: previousValue?.value ?? previousValue, currentValues: arguments_ });
+    const extracted = extractValue(name, rule, request, { ...context, toolId: tool.id, now, locale, timeZone, previousValue: previousValue?.value ?? previousValue, currentValues: arguments_ });
     const reusablePrevious = previousValue !== undefined && previousValue.status !== 'partial';
     const candidate = extracted?.value !== undefined ? { ...extracted, source: extracted.source ?? 'current_user_request' }
       : reusablePrevious ? { value: previousValue.value ?? previousValue, source: previousValue.source ?? 'previous_conversation', method: previousValue.method ?? 'prior-resolution', originalText: previousValue.originalText }
       : undefined;
     if (extracted?.status === 'ambiguous') {
-      ambiguous.push({ name, reason: extracted.reason, originalText: extracted.text });
+      ambiguous.push({ name, reason: extracted.reason, originalText: extracted.text, options: extracted.options });
       if (extracted.partialValue !== undefined) resolved[name] = { value: extracted.partialValue, status: 'partial', source: 'current_user_request', originalText: extracted.text, method: extracted.method ?? 'chrono-node' };
       continue;
     }

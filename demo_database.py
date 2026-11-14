@@ -6,6 +6,7 @@ import sqlite3
 import struct
 import tempfile
 import threading
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
@@ -162,11 +163,114 @@ def _copy_baseline(destination):
     os.replace(temp_path, destination)
 
 
+def _sync_session_manifests(connection):
+    manifests = json.loads((ROOT / "data" / "seed" / "tool-manifests.json").read_text(encoding="utf-8"))
+    providers = load_provider_manifests()
+    retrieval_config = json.loads(TOOL_RETRIEVAL_CONFIG_PATH.read_text(encoding="utf-8"))
+    tool_ids_by_provider = {}
+    for tool in manifests:
+        tool_ids_by_provider.setdefault(tool["providerId"], []).append(tool["id"])
+        existing = connection.execute("SELECT id FROM tools WHERE id=?", (tool["id"],)).fetchone()
+        if not existing:
+            continue
+        connection.execute(
+            "UPDATE tools SET name=?,description=?,keywords_json=?,parameters_json=?,examples_json=?,confirmation=?,version=?,status=?,result_schema_json=? WHERE id=?",
+            (
+                tool["name"], tool["description"], json.dumps(tool.get("keywords", []), ensure_ascii=False),
+                json.dumps(tool["parameters"], ensure_ascii=False, sort_keys=True), json.dumps(tool["examples"], ensure_ascii=False),
+                tool["confirmation"], tool.get("version", "1.0.0"), tool.get("status", "available"),
+                json.dumps(tool.get("resultSchema", {"$ref": "https://cue.local/schemas/cue-display-v1.schema.json"}), ensure_ascii=False, sort_keys=True),
+                tool["id"],
+            ),
+        )
+        connection.execute("DELETE FROM tool_examples WHERE tool_id=?", (tool["id"],))
+        examples = [item if isinstance(item, dict) else {"text": item} for item in tool["examples"]]
+        connection.executemany(
+            "INSERT INTO tool_examples VALUES(?,?,?,?)",
+            [(f"{tool['id']}:{ordinal}", tool["id"], item["text"], ordinal) for ordinal, item in enumerate(examples, 1)],
+        )
+        retrieval_records = [("description", tool["description"], None, f"{tool['id']}:0")]
+        retrieval_records.extend(("keyword", value, None, f"{tool['id']}:keyword:{index}") for index, value in enumerate(tool.get("keywords", [])))
+        retrieval_records.extend(("example", item["text"], item.get("locale"), f"{tool['id']}:{index}") for index, item in enumerate(examples, 1))
+        expected_ids = set()
+        for source_type, text, locale, record_id in retrieval_records:
+            expected_ids.add(record_id)
+            content_hash = hashlib.sha256(f"{source_type}\0{text}\0{locale or ''}".encode("utf-8")).hexdigest()
+            old = connection.execute("SELECT content_hash FROM tool_retrieval_records WHERE id=?", (record_id,)).fetchone()
+            connection.execute(
+                "INSERT INTO tool_retrieval_records VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET provider_id=excluded.provider_id,tool_id=excluded.tool_id,source_type=excluded.source_type,text=excluded.text,locale=excluded.locale,content_hash=excluded.content_hash",
+                (record_id, tool["providerId"], tool["id"], source_type, text, locale, content_hash),
+            )
+            embedding_id = f"embedding:{record_id}"
+            if old and old[0] == content_hash:
+                continue
+            embedding = connection.execute("SELECT id FROM embeddings WHERE namespace='tool' AND owner_type='tool_retrieval' AND owner_id=? AND model_id=? AND model_version=?", (record_id, MODEL_ID, MODEL_VERSION)).fetchone()
+            if embedding:
+                connection.execute("UPDATE embeddings SET vector=NULL,status='pending',tokenizer=?,preprocessing=?,dimensions=?,pooling='mean',normalized=1,similarity_metric='cosine' WHERE id=?", (TOKENIZER_ID, PREPROCESSING, DIMENSIONS, embedding[0]))
+            else:
+                connection.execute(
+                    "INSERT INTO embeddings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                    (embedding_id, "tool", "tool_retrieval", record_id, MODEL_ID, MODEL_VERSION, TOKENIZER_ID, PREPROCESSING, DIMENSIONS, "mean", 1, "cosine", "pending"),
+                )
+        stale = connection.execute("SELECT id FROM tool_retrieval_records WHERE tool_id=?", (tool["id"],)).fetchall()
+        for (record_id,) in stale:
+            if record_id not in expected_ids:
+                connection.execute("DELETE FROM embeddings WHERE owner_type='tool_retrieval' AND owner_id=?", (record_id,))
+                connection.execute("DELETE FROM tool_retrieval_records WHERE id=?", (record_id,))
+    for provider in providers:
+        if connection.execute("SELECT 1 FROM providers WHERE id=?", (provider["id"],)).fetchone():
+            manifest = {**provider, "toolIds": tool_ids_by_provider.get(provider["id"], [])}
+            connection.execute("UPDATE providers SET name=?,description=?,version=?,status=?,manifest_json=?,adapter_id=?,transport=?,demo=? WHERE id=?", (
+                provider["name"], provider["description"], provider["version"], provider["status"],
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True), provider["adapter"], provider["transport"],
+                int(provider["demo"]), provider["id"],
+            ))
+    connection.execute(
+        "INSERT INTO settings(key,value_json) VALUES('tool_retrieval',?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+        (json.dumps(retrieval_config, ensure_ascii=False, sort_keys=True),),
+    )
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_state(
+            conversation_id TEXT PRIMARY KEY,
+            payload_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS operation_results(
+            operation_id TEXT PRIMARY KEY,
+            tool_id TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            status TEXT NOT NULL CHECK(status IN ('executing','completed','failed')),
+            result_json TEXT,
+            error_text TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS provider_data_index(
+            provider_id TEXT NOT NULL,
+            record_type TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            indexed_at TEXT,
+            PRIMARY KEY(provider_id,record_type,record_id)
+        )
+    """)
+    connection.commit()
+
+
 def session_database(session_id):
     path = _session_path(session_id)
     with _session_lock(session_id):
         if not path.exists():
             _copy_baseline(path)
+        connection = sqlite3.connect(path)
+        try:
+            _sync_session_manifests(connection)
+        finally:
+            connection.close()
     return path
 
 
@@ -177,6 +281,56 @@ def reset_session(session_id):
     return path
 
 
+def load_conversation_state(session_id):
+    connection = sqlite3.connect(session_database(session_id))
+    try:
+        row = connection.execute(
+            "SELECT payload_json,expires_at FROM conversation_state ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        if not row:
+            return None
+        if row[1] <= datetime.now(timezone.utc).isoformat():
+            connection.execute("DELETE FROM conversation_state")
+            connection.commit()
+            return None
+        return json.loads(row[0])
+    finally:
+        connection.close()
+
+
+def save_conversation_state(session_id, state):
+    if not isinstance(state, dict) or state.get("status") not in {
+        "awaiting_tool_choice", "awaiting_argument", "awaiting_entity_choice",
+        "awaiting_confirmation", "executing", "completed", "failed", "cancelled",
+    }:
+        raise ValueError("Conversation state is invalid")
+    conversation_id = state.get("conversationId")
+    if not isinstance(conversation_id, str) or not conversation_id:
+        raise ValueError("Conversation state requires an ID")
+    payload = json.dumps(state, ensure_ascii=False, separators=(",", ":"))
+    if len(payload.encode("utf-8")) > 262144:
+        raise ValueError("Conversation state is too large")
+    now = datetime.now(timezone.utc)
+    expiry = state.get("expiresAt")
+    try:
+        expires_at = datetime.fromisoformat(expiry.replace("Z", "+00:00")) if isinstance(expiry, str) else now + timedelta(hours=24)
+    except ValueError as exc:
+        raise ValueError("Conversation expiry must be an ISO-8601 timestamp") from exc
+    if expires_at.tzinfo is None or expires_at <= now or expires_at > now + timedelta(hours=24, minutes=5):
+        expires_at = now + timedelta(hours=24)
+    connection = sqlite3.connect(session_database(session_id))
+    try:
+        connection.execute("DELETE FROM conversation_state")
+        connection.execute(
+            "INSERT INTO conversation_state VALUES(?,?,?,?)",
+            (conversation_id, payload, now.isoformat(), expires_at.isoformat()),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    return {"saved": True, "expiresAt": expires_at.isoformat()}
+
+
 def connect_readonly(path):
     path = Path(path).resolve()
     connection = sqlite3.connect(f"file:{path.as_posix()}?mode=ro", uri=True)
@@ -185,10 +339,199 @@ def connect_readonly(path):
     return connection
 
 
+def _provider_data_content(config, record):
+    values = []
+    for field in config.get("fields", []):
+        value = record.get(field)
+        if isinstance(value, list):
+            values.extend(item for item in value if isinstance(item, str))
+        elif isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, (int, float)) and not isinstance(value, bool):
+            values.append(str(int(value)) if isinstance(value, float) and value.is_integer() else str(value))
+    return "\n".join(values).strip()
+
+
+def _provider_data_key(provider_id, record_type, record_id):
+    return f"{provider_id}:{record_type}:{record_id}"
+
+
+def _sync_provider_data_index(connection):
+    providers = {
+        row["id"]: json.loads(row["manifest_json"])
+        for row in connection.execute("SELECT id,manifest_json FROM providers")
+    }
+    expected = {}
+    for provider_id, provider in providers.items():
+        config = provider.get("contextSearch")
+        if not config:
+            continue
+        allowed_types = set(config.get("recordTypes", []))
+        for row in connection.execute("SELECT record_type,record_id,payload_json FROM records WHERE provider_id=?", (provider_id,)):
+            record_type = row["record_type"]
+            if record_type not in allowed_types:
+                continue
+            content = _provider_data_content(config, json.loads(row["payload_json"]))
+            if not content:
+                continue
+            key = _provider_data_key(provider_id, record_type, row["record_id"])
+            expected[(provider_id, record_type, row["record_id"])] = (key, hashlib.sha256(content.encode("utf-8")).hexdigest())
+    existing = {
+        (row["provider_id"], row["record_type"], row["record_id"]): (row["content_hash"], row["indexed_at"], row["status"])
+        for row in connection.execute("""SELECT p.provider_id,p.record_type,p.record_id,p.content_hash,p.indexed_at,e.status
+            FROM provider_data_index p LEFT JOIN embeddings e
+            ON e.namespace='provider-data' AND e.owner_type='provider_record'
+                AND e.owner_id=(p.provider_id || ':' || p.record_type || ':' || p.record_id)
+                AND e.model_id=? AND e.model_version=?""", (MODEL_ID, MODEL_VERSION))
+    }
+    for record_key, (owner_id, content_hash) in expected.items():
+        old = existing.get(record_key)
+        if old and old[0] == content_hash and old[1] and old[2] == "ready":
+            continue
+        provider_id, record_type, record_id = record_key
+        connection.execute(
+            "INSERT INTO provider_data_index VALUES(?,?,?,?,NULL) ON CONFLICT(provider_id,record_type,record_id) DO UPDATE SET content_hash=excluded.content_hash,indexed_at=NULL",
+            (provider_id, record_type, record_id, content_hash),
+        )
+        embedding = connection.execute(
+            "SELECT id FROM embeddings WHERE namespace='provider-data' AND owner_type='provider_record' AND owner_id=? AND model_id=? AND model_version=?",
+            (owner_id, MODEL_ID, MODEL_VERSION),
+        ).fetchone()
+        if embedding:
+            connection.execute("UPDATE embeddings SET vector=NULL,status='pending' WHERE id=?", (embedding[0],))
+        else:
+            connection.execute(
+                "INSERT INTO embeddings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,NULL)",
+                (f"provider-embedding:{owner_id}", "provider-data", "provider_record", owner_id, MODEL_ID, MODEL_VERSION, TOKENIZER_ID, PREPROCESSING, DIMENSIONS, "mean", 1, "cosine", "pending"),
+            )
+    for record_key in set(existing) - set(expected):
+        owner_id = _provider_data_key(*record_key)
+        connection.execute("DELETE FROM embeddings WHERE namespace='provider-data' AND owner_type='provider_record' AND owner_id=?", (owner_id,))
+        connection.execute("DELETE FROM provider_data_index WHERE provider_id=? AND record_type=? AND record_id=?", record_key)
+    connection.commit()
+    return [
+        owner_id for record_key, (owner_id, content_hash) in expected.items()
+        if record_key not in existing or existing[record_key][0] != content_hash
+        or not existing[record_key][1] or existing[record_key][2] != "ready"
+    ]
+
+
+def store_provider_data_embeddings(session_id, entries):
+    if not isinstance(entries, list) or not entries or len(entries) > 100:
+        raise ValueError("Provider-data embedding entries must be a non-empty batch of at most 100 records")
+    with _session_lock(session_id):
+        connection = sqlite3.connect(session_database(session_id))
+        connection.row_factory = sqlite3.Row
+        try:
+            _sync_provider_data_index(connection)
+            accepted = 0
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    raise ValueError("Provider-data embedding entry must be an object")
+                provider_id, record_type, record_id = entry.get("providerId"), entry.get("recordType"), entry.get("recordId")
+                if not all(isinstance(value, str) and value for value in (provider_id, record_type, record_id)):
+                    raise ValueError("Provider-data embedding entry requires provider, record type, and record ID")
+                owner_id = _provider_data_key(provider_id, record_type, record_id)
+                expected = connection.execute(
+                    "SELECT p.content_hash,e.id,e.status FROM provider_data_index p JOIN embeddings e ON e.namespace='provider-data' AND e.owner_type='provider_record' AND e.owner_id=? AND e.model_id=? AND e.model_version=? WHERE p.provider_id=? AND p.record_type=? AND p.record_id=?",
+                    (owner_id, MODEL_ID, MODEL_VERSION, provider_id, record_type, record_id),
+                ).fetchone()
+                if not expected:
+                    raise ValueError(f"Provider-data record is not registered for indexing: {owner_id}")
+                if entry.get("contentHash") != expected[0]:
+                    raise ValueError(f"Provider-data record changed while its embedding was being generated: {owner_id}")
+                vector = entry.get("vector")
+                if not isinstance(vector, list) or len(vector) != DIMENSIONS or any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in vector):
+                    raise ValueError(f"Provider-data embedding must contain {DIMENSIONS} finite numbers")
+                norm = math.sqrt(sum(float(value) ** 2 for value in vector))
+                if abs(norm - 1.0) > 0.002:
+                    raise ValueError("Provider-data embeddings must be L2-normalized")
+                blob = struct.pack("<" + "f" * DIMENSIONS, *vector)
+                connection.execute("UPDATE embeddings SET vector=?,status='ready' WHERE id=?", (blob, expected[1]))
+                connection.execute(
+                    "UPDATE provider_data_index SET indexed_at=? WHERE provider_id=? AND record_type=? AND record_id=? AND content_hash=?",
+                    (datetime.now(timezone.utc).isoformat(), provider_id, record_type, record_id, expected[0]),
+                )
+                accepted += 1
+            connection.commit()
+            return accepted
+        finally:
+            connection.close()
+
+
+def search_provider_data(session_id, vector, provider_ids, limit=3, threshold=0.3):
+    if not isinstance(vector, list) or len(vector) != DIMENSIONS or any(not isinstance(value, (int, float)) or not math.isfinite(value) for value in vector):
+        raise ValueError(f"Provider-data query vector must contain {DIMENSIONS} finite numbers")
+    norm = math.sqrt(sum(float(value) ** 2 for value in vector))
+    if abs(norm - 1.0) > 0.002:
+        raise ValueError("Provider-data query vector must be L2-normalized")
+    if not isinstance(threshold, (int, float)) or not math.isfinite(threshold) or threshold < -1 or threshold > 1:
+        raise ValueError("Provider-data similarity threshold must be between -1 and 1")
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+        raise ValueError("Provider-data result limit must be a positive integer")
+    if not isinstance(provider_ids, list) or any(not isinstance(value, str) for value in provider_ids):
+        raise ValueError("Provider-data provider IDs must be a list of strings")
+    providers = list(dict.fromkeys(provider_ids))[:20]
+    if not providers:
+        return {}
+    connection = sqlite3.connect(session_database(session_id))
+    connection.row_factory = sqlite3.Row
+    try:
+        placeholders = ",".join("?" for _ in providers)
+        rows = connection.execute(
+            f"""SELECT p.provider_id,p.record_type,p.record_id,p.content_hash,p.indexed_at,r.payload_json,e.vector
+                FROM provider_data_index p
+                JOIN records r ON r.provider_id=p.provider_id AND r.record_type=p.record_type AND r.record_id=p.record_id
+                JOIN embeddings e ON e.namespace='provider-data' AND e.owner_type='provider_record'
+                    AND e.owner_id=(p.provider_id || ':' || p.record_type || ':' || p.record_id)
+                    AND e.status='ready' AND e.model_id=? AND e.model_version=?
+                WHERE p.provider_id IN ({placeholders}) AND p.indexed_at IS NOT NULL""",
+            (MODEL_ID, MODEL_VERSION, *providers),
+        ).fetchall()
+        # Re-evaluate content hashes so stale records cannot contribute evidence.
+        config_by_provider = {
+            row["id"]: json.loads(row["manifest_json"]).get("contextSearch", {})
+            for row in connection.execute("SELECT id,manifest_json FROM providers")
+        }
+        by_provider = {provider_id: [] for provider_id in providers}
+        indexed_at_by_provider = {}
+        query = [float(value) for value in vector]
+        for row in rows:
+            content = _provider_data_content(config_by_provider.get(row["provider_id"], {}), json.loads(row["payload_json"]))
+            if hashlib.sha256(content.encode("utf-8")).hexdigest() != row["content_hash"]:
+                continue
+            indexed_at_by_provider[row["provider_id"]] = max(
+                indexed_at_by_provider.get(row["provider_id"], ""), row["indexed_at"],
+            )
+            stored = struct.unpack("<" + "f" * DIMENSIONS, row["vector"])
+            similarity = sum(left * right for left, right in zip(query, stored))
+            if similarity < float(threshold):
+                continue
+            by_provider.setdefault(row["provider_id"], []).append({
+                "recordId": row["record_id"],
+                "recordType": row["record_type"],
+                "record": json.loads(row["payload_json"]),
+                "similarity": similarity,
+                "indexedAt": row["indexed_at"],
+            })
+        return {
+            provider_id: {
+                "namespace": "provider-data",
+                "indexedAt": indexed_at_by_provider.get(provider_id),
+                "hits": sorted(hits, key=lambda hit: hit["similarity"], reverse=True)[:max(1, min(int(limit), 10))],
+            }
+            for provider_id, hits in by_provider.items()
+        }
+    finally:
+        connection.close()
+
+
 def registry(session_id):
     connection = sqlite3.connect(session_database(session_id))
     connection.row_factory = sqlite3.Row
     try:
+        pending_provider_data = _sync_provider_data_index(connection)
+        manifest_by_id = {tool["id"]: tool for tool in json.loads((ROOT / "data" / "seed" / "tool-manifests.json").read_text(encoding="utf-8"))}
         providers = [dict(row) for row in connection.execute("SELECT id,name,description,version,status,manifest_json,adapter_id,transport,demo FROM providers ORDER BY id")]
         for provider in providers:
             provider["manifest"] = json.loads(provider.pop("manifest_json"))
@@ -204,6 +547,11 @@ def registry(session_id):
             item["executionAdapter"] = item.pop("execution_adapter")
             item["version"] = item.pop("version")
             item["available"] = item.pop("status") == "available"
+            metadata = manifest_by_id.get(item["id"], {})
+            item["operationType"] = metadata.get("operationType")
+            item["effect"] = metadata.get("effect")
+            if metadata.get("contextSearch"):
+                item["contextSearch"] = metadata["contextSearch"]
             tools.append(item)
         data = {}
         for row in connection.execute("SELECT provider_id,record_type,record_id,payload_json FROM records ORDER BY provider_id,record_type,record_id"):
@@ -218,7 +566,7 @@ def registry(session_id):
             asset["originalRef"] = asset.pop("original_ref")
             asset["metadata"] = json.loads(asset.pop("metadata_json"))
         data.setdefault("web", {})["assets"] = assets
-        return {"providers": providers, "tools": tools, "data": data, "toolEmbeddingsReady": embedding_state["total"] > 0 and embedding_state["ready"] == embedding_state["total"], "pendingToolEmbeddingIds": pending_embeddings, "toolRetrievalConfig": retrieval_config}
+        return {"providers": providers, "tools": tools, "data": data, "toolEmbeddingsReady": embedding_state["total"] > 0 and embedding_state["ready"] == embedding_state["total"], "pendingToolEmbeddingIds": pending_embeddings, "pendingProviderDataIds": pending_provider_data, "toolRetrievalConfig": retrieval_config}
     finally:
         connection.close()
 
@@ -342,24 +690,54 @@ def search_tools(session_id, vector, limit=20, threshold=0.0, scoring="weighted-
         connection.close()
 
 
-def execute_tool(session_id, tool_id, arguments):
+def execute_tool(session_id, tool_id, arguments, operation_id=None):
     from demo_providers import ADAPTERS
 
     path = session_database(session_id)
-    connection = sqlite3.connect(path)
-    connection.row_factory = sqlite3.Row
-    try:
-        row = connection.execute("SELECT t.*,p.status AS provider_status FROM tools t JOIN providers p ON p.id=t.provider_id WHERE t.id=?", (tool_id,)).fetchone()
-        if row is None:
-            raise LookupError(f"Unknown registered tool: {tool_id}")
-        if row["status"] != "available" or row["provider_status"] != "available":
-            raise RuntimeError(f"Provider unavailable: {row['provider_id']}")
-        errors = validate_arguments(json.loads(row["parameters_json"]), arguments)
-        if errors:
-            raise ValueError("Invalid arguments: " + "; ".join(errors))
-        adapter = ADAPTERS.get(row["execution_adapter"])
-        if adapter is None:
-            raise RuntimeError("Provider adapter is not trusted or registered")
-        return adapter.execute(connection, row["provider_id"], tool_id, arguments)
-    finally:
-        connection.close()
+    with _session_lock(session_id):
+        connection = sqlite3.connect(path)
+        connection.row_factory = sqlite3.Row
+        try:
+            row = connection.execute("SELECT t.*,p.status AS provider_status FROM tools t JOIN providers p ON p.id=t.provider_id WHERE t.id=?", (tool_id,)).fetchone()
+            if row is None:
+                raise LookupError(f"Unknown registered tool: {tool_id}")
+            if row["status"] != "available" or row["provider_status"] != "available":
+                raise RuntimeError(f"Provider unavailable: {row['provider_id']}")
+            errors = validate_arguments(json.loads(row["parameters_json"]), arguments)
+            if errors:
+                raise ValueError("Invalid arguments: " + "; ".join(errors))
+            adapter = ADAPTERS.get(row["execution_adapter"])
+            if adapter is None:
+                raise RuntimeError("Provider adapter is not trusted or registered")
+            side_effect = row["confirmation"] == "required"
+            payload_hash = hashlib.sha256(json.dumps({"toolId": tool_id, "arguments": arguments}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+            if side_effect and operation_id is not None:
+                if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 160:
+                    raise ValueError("Invalid operation identifier")
+                prior = connection.execute("SELECT tool_id,payload_hash,status,result_json FROM operation_results WHERE operation_id=?", (operation_id,)).fetchone()
+                if prior:
+                    if prior["tool_id"] != tool_id or prior["payload_hash"] != payload_hash:
+                        raise ValueError("Operation identifier was already used for a different action or argument set")
+                    if prior["status"] == "completed":
+                        return json.loads(prior["result_json"])
+                    raise RuntimeError(f"Operation cannot be safely repeated after status {prior['status']}")
+                connection.execute(
+                    "INSERT INTO operation_results(operation_id,tool_id,payload_hash,status,updated_at) VALUES(?,?,?,'executing',?)",
+                    (operation_id, tool_id, payload_hash, datetime.now(timezone.utc).isoformat()),
+                )
+                connection.commit()
+            try:
+                result = adapter.execute(connection, row["provider_id"], tool_id, arguments)
+            except Exception as exc:
+                if side_effect and operation_id is not None:
+                    connection.execute("UPDATE operation_results SET status='failed',error_text=?,updated_at=? WHERE operation_id=?", (str(exc)[:1000], datetime.now(timezone.utc).isoformat(), operation_id))
+                    connection.commit()
+                raise
+            if side_effect and operation_id is not None:
+                connection.execute("UPDATE operation_results SET status='completed',result_json=?,error_text=NULL,updated_at=? WHERE operation_id=?", (
+                    json.dumps(result, ensure_ascii=False, separators=(",", ":")), datetime.now(timezone.utc).isoformat(), operation_id,
+                ))
+                connection.commit()
+            return result
+        finally:
+            connection.close()
