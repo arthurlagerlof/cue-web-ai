@@ -1,0 +1,61 @@
+{
+  "anki": {
+    "cards": [
+      {"id":"demo-card-101","noteId":"demo-note-101","front":"What role do chloroplasts play in photosynthesis?","back":"They capture light energy and convert it into chemical energy stored in sugars.","extra":"Chlorophyll absorbs mainly red and blue light.","tags":["biology","plants","photosynthesis"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-102","noteId":"demo-note-102","front":"What is cellular respiration?","back":"The process cells use to release energy from glucose.","extra":"It produces ATP, carbon dioxide, and water.","tags":["biology","cells"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-103","noteId":"demo-note-103","front":"What is the purpose of a Python dictionary?","back":"It stores key-value pairs for efficient lookup by key.","extra":"Keys must be hashable.","tags":["programming","python"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-104","noteId":"demo-note-104","front":"What does a Python list comprehension create?","back":"A list produced by evaluating an expression for each item in an iterable.","extra":"An optional condition can filter the items.","tags":["programming","python"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-105","noteId":"demo-note-105","front":"How do you say ‘Good morning’ in Finnish?","back":"Hyvää huomenta.","extra":"A common greeting before noon.","tags":["language","finnish"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-106","noteId":"demo-note-106","front":"What does the Spanish word ‘biblioteca’ mean?","back":"Library.","extra":"It refers to a place where books and other materials can be borrowed.","tags":["language","spanish"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-107","noteId":"demo-note-107","front":"What is the capital of Iceland?","back":"Reykjavík.","extra":"It is the northernmost capital of a sovereign state.","tags":["geography","europe"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-108","noteId":"demo-note-108","front":"Which river flows through Budapest?","back":"The Danube.","extra":"The river divides Buda and Pest.","tags":["geography","rivers"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-109","noteId":"demo-note-109","front":"What does HTTP status code 404 indicate?","back":"The requested resource was not found.","extra":"It is a client error response.","tags":["programming","web"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-110","noteId":"demo-note-110","front":"What is DNA?","back":"A molecule that carries genetic instructions used in the development and functioning of organisms.","extra":"Its structure is commonly described as a double helix.","tags":["biology","genetics"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-111","noteId":"demo-note-111","front":"How do you say ‘thank you’ in Finnish?","back":"Kiitos.","extra":"A polite everyday expression.","tags":["language","finnish"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-112","noteId":"demo-note-112","front":"What is the largest ocean on Earth?","back":"The Pacific Ocean.","extra":"It covers more area than all of Earth's land combined.","tags":["geography","oceans"],"source":"Synthetic Cue demo collection"}
+    ]
+  },
+  "knowledge": {
+    "documents": [
+      {"id":"kb-local-first","title":"Local-first AI","excerpt":"Local-first applications keep private data and model inference on the user's device where practical.","language":"en","keywords":["privacy","device","AI"],"source":{"name":"Cue knowledge sample","ref":"knowledge/local-first"}},
+      {"id":"kb-vector-search","title":"Semantic retrieval","excerpt":"Embeddings can find related content, but similarity should rank candidates rather than authorize actions.","language":"en","keywords":["embeddings","search","safety"],"source":{"name":"Cue knowledge sample","ref":"knowledge/semantic-retrieval"}},
+      {"id":"kb-multilingual","title":"Monikielinen haku","excerpt":"Monikieliset upotukset auttavat löytämään aiheeseen liittyvää sisältöä eri kielillä.","language":"fi","keywords":["upotukset","haku","kielet"],"source":{"name":"Cue-tietonäyte","ref":"knowledge/monikielinen-haku"}}
+    ],
+    "chunks": [
+      {"id":"chunk-local-first-1","documentId":"kb-local-first","ordinal":0,"text":"Local-first AI keeps data and inference close to the user."},
+      {"id":"chunk-vector-search-1","documentId":"kb-vector-search","ordinal":0,"text":"Semantic similarity is for ranking. It does not grant permission."},
+      {"id":"chunk-multilingual-1","documentId":"kb-multilingual","ordinal":0,"text":"Monikieliset upotukset tukevat eri kielillä tehtävää semanttista hakua."}
+    ]
+  },
+  "web": {
+    "results": [
+      {"id":"web-1","title":"Local models for private assistants","summary":"An illustrative result about running language models on personal devices.","url":"https://example.invalid/local-models","imageAssetId":"web-research-image","keywords":["AI","local","models"]},
+      {"id":"web-2","title":"Designing safer tool use","summary":"An illustrative result on schema validation and explicit confirmation for actions.","url":"https://example.invalid/safer-tools","keywords":["safety","validation","tools"]},
+      {"id":"web-3","title":"Multilingual semantic search","summary":"An illustrative overview of cross-language embedding retrieval.","url":"https://example.invalid/multilingual-search","keywords":["multilingual","embedding","research"]}
+    ],
+    "assets": [
+      {"id":"web-research-image","mimeType":"image/svg+xml","alt":"Abstract illustration of a magnifying glass over research notes","originalRef":"src/demo/assets/research.svg","width":640,"height":360,"metadata":{"synthetic":true}}
+    ]
+  },
+  "calendar": {
+    "events": [
+      {"id":"event-1","title":"Design review","start":"2026-11-14T09:30:00+02:00","end":"2026-11-14T10:00:00+02:00","location":"Studio"},
+      {"id":"event-2","title":"Project sync","start":"2026-11-14T11:00:00+02:00","end":"2026-11-14T11:30:00+02:00","location":"Online"},
+      {"id":"event-3","title":"Library planning","start":"2026-11-15T10:00:00+02:00","end":"2026-11-15T10:45:00+02:00","location":"North Hall"},
+      {"id":"event-4","title":"Garden sensor workshop","start":"2026-11-15T13:00:00+02:00","end":"2026-11-15T14:00:00+02:00","location":"Workshop room"}
+    ]
+  },
+  "notifications": {
+    "items": [
+      {"id":"notification-1","app":"Messages","sender":"Alex","timestamp":"2026-11-13T18:42:00+02:00","preview":"Could you send me the meeting notes?"},
+      {"id":"notification-2","app":"Mail","sender":"Sam","timestamp":"2026-11-13T17:15:00+02:00","preview":"The fictional draft is ready for your review."},
+      {"id":"notification-3","app":"Messages","sender":"Mira","timestamp":"2026-11-13T16:05:00+02:00","preview":"The greenhouse sensors are working well."}
+    ]
+  },
+  "alarm": {
+    "items": [
+      {"id":"alarm-1","label":"Morning alarm","time":"2026-11-14T07:00:00+02:00","enabled":true},
+      {"id":"alarm-2","label":"Weekend reminder","time":"2026-11-15T08:30:00+02:00","enabled":false}
+    ]
+  }
+}

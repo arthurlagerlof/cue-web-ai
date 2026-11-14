@@ -1,0 +1,8 @@
+[
+  {"id":"anki","name":"Anki","description":"Synthetic flashcard collection","version":"1.0.0","status":"available","adapter":"anki","transport":"local_mock","demo":true},
+  {"id":"knowledge","name":"Knowledge","description":"Synthetic multilingual knowledge collection","version":"1.0.0","status":"available","adapter":"knowledge","transport":"local_mock","demo":true},
+  {"id":"web","name":"Web Search","description":"Synthetic mock web search","version":"1.0.0","status":"available","adapter":"web","transport":"local_mock","demo":true},
+  {"id":"calendar","name":"Google Calendar","description":"Synthetic calendar events","version":"1.0.0","status":"available","adapter":"calendar","transport":"local_mock","demo":true},
+  {"id":"notifications","name":"Android Notifications","description":"Synthetic captured notifications","version":"1.0.0","status":"available","adapter":"notifications","transport":"local_mock","demo":true},
+  {"id":"alarm","name":"Alarms","description":"Synthetic local alarms","version":"1.0.0","status":"available","adapter":"alarm","transport":"local_mock","demo":true}
+]

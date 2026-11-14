@@ -2,24 +2,32 @@ _Thanks to Jason Mayes for the watch._
 
 # Cue
 
-Existing React/Vite UI with browser-side multilingual embeddings and a local Python backend. Transcript processing has two independent modes: Anki semantic search and an OpenAI-compatible Chat Completions endpoint. Transcription remains optional; the main workflow accepts manually entered transcript text.
+Cue is a local-first assistant demo. The browser performs MiniLM embedding and local intent resolution; a Python service provides a session-isolated SQLite provider registry, mock execution, and retrieval. Providers own their manifests and adapters. Provider results use the versioned Cue Display Document contract.
 
 ## Run locally
 
 1. Install Node.js 20+ and Python 3.11+; run `npm install`.
-2. Terminal 1: set `LLM_API_KEY` in the backend process environment, or set it in the root `.env` file (the Python backend loads it; `.env` is gitignored). PowerShell example: `$env:LLM_API_KEY='your-key'; npm run backend`. Never prefix it with `VITE_`; the key is not exposed to frontend code or responses. `.env.example` contains only a placeholder. HTTPS is required for remote endpoints. To intentionally use a private/local endpoint set `ALLOW_LOCAL_LLM=1` in the backend environment.
-3. Terminal 2: run `npm run dev`, then open its localhost URL in a supported Chromium browser. Connect the Bangle.js using **Connect Bangle.js**.
-4. Enter a sample transcript and choose **Anki semantic search**. The browser embeds it using the existing MiniLM implementation; backend searches `semantic_mastery.db` read-only, returning note text, IDs, deck, and cosine similarity. Results are shown in the UI and the best note is sent over BLE.
-5. For **OpenAI-compatible API**, configure endpoint, model, and prompt in the UI. Configure `LLM_API_KEY` in the backend environment before use. API mode does not access the Anki DB. The backend requires `{ "version": 1, "display_text": "string" }`; API mode has not been live-tested and must not be tested until the key is configured.
+2. Build and verify the synthetic baseline with `npm run seed:demo` and `npm run verify:demo`.
+3. Start the backend using `npm run backend` and the UI with `npm run dev`. Open the Vite URL in a supported Chromium browser.
+4. Select a demo scenario or enter a request. Browser-side embedding searches available tools in the SQLite `tool` namespace; the local resolver chooses only retrieved tools. Side-effecting mock actions require confirmation.
+5. Use **Reset demo session** to restore that browser session's SQLite working copy to the packaged baseline.
 
-Use **Start microphone** to keep the rolling audio buffer available. **Freeze rolling buffer** only snapshots audio; the watch's tap trigger snapshots the buffer and starts transcription and processing on the laptop. The hold-to-transcribe control remains separate.
+The demo requires no API credentials or personal Anki files. The microphone and optional Bangle.js connection remain available; transcript entry is the simplest way to run scenarios.
 
-## Watch installation and protocol
+## Database and deployment
 
-Use **Install on watch** in the web UI. It connects over the standard Espruino Nordic UART BLE service, interrupts/resets the running application into the Espruino console, uploads the display app and its `.info` metadata into Storage, verifies file lengths, launches the app, and waits for the app's `BM_BLE_READY` startup signal. Confirm **BLE READY** is visible on the watch before testing. The app temporarily displays received UART text and replies to the raw `TEST` probe with `ACK:TEST\n`. Tap, swipe, and BLE receive callbacks are active only while the display app is open. Bangle.js UI lifecycle callbacks return to the clock and remove only the app's BLE listener and outstanding timers on app unload. The app provides paged text and persistent latest-result storage. Physical watch behavior and receipt of `ACK:TEST` have not been verified here.
+- `data/cue_demo.db` is built exclusively from `data/seed/provider-manifests.json`, `provider-data.json`, `tool-manifests.json`, and the normalized float32 `tool-embeddings.f32` fixture. It contains six synthetic providers, 15 tools, 12 illustrative Anki cards, 6 knowledge records (documents and chunks), 3 web results, 4 Calendar events, 3 notifications, 2 alarms, one asset, and 69 tool-example embeddings from the configured model.
+- Seeding is repeatable and never opens or migrates `semantic_mastery.db` or `cue_memory.db`. Personal databases, SQLite sidecars, and Anki exports remain ignored by Git; the synthetic baseline is explicitly unignored.
+- `CUE_DEMO_SEED_DB` selects the packaged baseline. `CUE_DEMO_RUNTIME_DIR` selects writable session storage; its default is a temporary-directory location, not the application directory. The baseline is opened read-only and copied into a separate database named from a hash of the HTTP session. Mock writes and browser-computed embeddings affect only that copy. Reset replaces it from the baseline.
+- Deploy the backend code together with the committed `data/cue_demo.db`; set `CUE_DEMO_SEED_DB` if the packaged file is at another path and provide a writable `CUE_DEMO_RUNTIME_DIR`. The application package may remain read-only. No developer collection, local migration, external service, or credential is needed.
 
-The web app reuses the verified project Nordic UART service and RX/TX characteristic UUIDs in `src/services/bluetooth.ts`. Frames use `BM`, protocol v1, little-endian message IDs, 10-byte maximum payload chunks under the conservative 20-byte ATT limit, stream parsing, reassembly, deduplication, timeouts, and acknowledgements. Result delivery retries up to three times if the watch does not acknowledge the complete message. Display text is limited to 512 UTF-8 bytes.
+## Architecture
 
-## Tests and limitations
+- `demo_database.py` builds the clean SQLite schema, exposes provider manifests/data, stores browser-generated vectors, searches only the `tool` namespace, validates arguments, and resolves trusted adapter IDs. `backend.py` never imports the legacy personal-database module.
+- Each registered provider has its own Python adapter in `demo_providers/`; providers own Anki, Knowledge, Web Search, Calendar, Notifications, and Alarm behavior. Tool definitions are loaded from SQLite, not selected from a Cue-side domain catalogue.
+- `src/intelligence/` handles semantic ranking, intent resolution, schema validation, confirmation, dependent plans, and provider-independent dispatch. Similarity only filters candidates; it never authorizes execution.
+- `src/display/schema/cue-display-v1.schema.json` defines Cue Display Document v1 using JSON Schema Draft 2020-12. The shared validator checks nested elements, actions, asset references, and registered-tool arguments before rendering. The React renderer interprets semantic tokens and never executes provider code.
 
-Run `C:/Python314/python.exe -m unittest discover -s tests` and `npm run build`. The backend has offline tests for read-only DB search, stored-vector decoding, output validation, URL protections, and watch byte limits. No API request is issued by tests. The official Espruino emulator and real-watch BLE workflow were not successfully exercised here; use the watch installation steps above for manual hardware validation. Web Bluetooth requires a supported Chromium browser on localhost/HTTPS.
+## Watch and tests
+
+The web app installs `watch/bangle-app.js` through the Espruino Nordic UART BLE service and transfers the validated Cue Display Document JSON. At 176×176 the watch adapts nested text, icons, lists, and page content to wrapped/paginated text; image elements show their alternative text because watch image decoding is not implemented. Tapping a displayed action sends its registered action ID back to Cue; side-effecting actions still require browser confirmation. Run `npm test`, `npm run build`, `npm run verify:demo`, and `py -3.14 -m unittest discover -s tests -v` for automated checks. The installed Espruino CLI supports hardware/IDE connections but no Bangle.js 2 emulator is included in this project/tooling, so emulator verification remains unperformed. Real Android/calendar/web integrations and image-to-watch optimization/transfer are intentionally out of scope.

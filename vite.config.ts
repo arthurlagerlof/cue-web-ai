@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite';
-const csp = "default-src 'self'; script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' https://huggingface.co https://cdn-lfs.huggingface.co https://*.hf.co; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
+const backendTarget = `http://127.0.0.1:${process.env.BACKEND_PORT || '8000'}`;
+const csp = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' https://huggingface.co https://cdn-lfs.huggingface.co https://*.hf.co https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 function securityHeaders() {
   return {
     name: 'security-headers',
@@ -12,4 +13,4 @@ function securityHeaders() {
   };
 }
 
-export default defineConfig({ plugins: [securityHeaders()], worker: { format: 'es' }, server: { host: '127.0.0.1', port: 5173, strictPort: true, proxy: { '/api': 'http://127.0.0.1:8000' } }, preview: { host: '127.0.0.1', port: 4173, strictPort: true, proxy: { '/api': 'http://127.0.0.1:8000' } } });
+export default defineConfig({ plugins: [securityHeaders()], worker: { format: 'es' }, server: { host: '127.0.0.1', port: 5173, strictPort: true, proxy: { '/api': backendTarget } }, preview: { host: '127.0.0.1', port: 4173, strictPort: true, proxy: { '/api': backendTarget } } });

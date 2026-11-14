@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://cue.local/schemas/cue-display-v1.schema.json",
+  "title": "Cue Display Document v1",
+  "type": "object",
+  "required": ["schema", "version", "id", "title", "source", "state", "pages", "actions", "assets"],
+  "properties": {
+    "schema": { "const": "cue.display" },
+    "version": { "const": 1 },
+    "id": { "type": "string", "minLength": 1 },
+    "title": { "type": "string" },
+    "source": { "type": "object", "required": ["app", "name"], "properties": { "app": { "type": "string", "minLength": 1 }, "name": { "type": "string", "minLength": 1 } }, "additionalProperties": true },
+    "state": { "enum": ["loading", "ready", "success", "empty", "error", "confirmation_required"] },
+    "pages": { "type": "array", "items": { "$ref": "#/$defs/page" } },
+    "actions": { "type": "array", "items": { "$ref": "#/$defs/action" } },
+    "assets": { "type": "array", "items": { "$ref": "#/$defs/asset" } },
+    "message": { "type": "string" },
+    "metadata": { "type": "object" }
+  },
+  "$defs": {
+    "page": { "type": "object", "required": ["id", "elements"], "properties": { "id": { "type": "string", "minLength": 1 }, "title": { "type": "string" }, "elements": { "type": "array", "items": { "$ref": "#/$defs/element" } } }, "additionalProperties": true },
+    "style": { "type": "object", "properties": { "size": { "enum": ["small", "medium", "large"] }, "align": { "enum": ["start", "center", "end"] }, "spacing": { "enum": ["none", "small", "medium", "large"] }, "emphasis": { "enum": ["normal", "strong", "muted"] } }, "additionalProperties": false },
+    "element": { "oneOf": [
+      { "type": "object", "required": ["type", "text"], "properties": { "type": { "const": "text" }, "text": { "type": "string" }, "role": { "enum": ["heading", "body", "caption", "label"] }, "style": { "$ref": "#/$defs/style" } }, "additionalProperties": true },
+      { "type": "object", "required": ["type", "assetId"], "properties": { "type": { "const": "image" }, "assetId": { "type": "string" }, "fit": { "enum": ["contain", "cover"] } }, "additionalProperties": true },
+      { "type": "object", "required": ["type", "name"], "properties": { "type": { "const": "icon" }, "name": { "type": "string" }, "role": { "type": "string" } }, "additionalProperties": true },
+      { "type": "object", "required": ["type", "layout", "children"], "properties": { "type": { "const": "container" }, "layout": { "enum": ["column", "row", "grid"] }, "children": { "type": "array", "items": { "$ref": "#/$defs/element" } }, "columns": { "type": "integer", "minimum": 1 } }, "additionalProperties": true },
+      { "type": "object", "required": ["type", "items"], "properties": { "type": { "const": "list" }, "items": { "type": "array", "items": { "type": "object", "required": ["id", "title"], "properties": { "id": { "type": "string" }, "title": { "type": "string" }, "description": { "type": "string" }, "actionId": { "type": "string" } }, "additionalProperties": true } } }, "additionalProperties": true },
+      { "type": "object", "required": ["type"], "properties": { "type": { "const": "divider" } }, "additionalProperties": true },
+      { "type": "object", "required": ["type", "actionId", "label"], "properties": { "type": { "const": "action" }, "actionId": { "type": "string" }, "label": { "type": "string" } }, "additionalProperties": true }
+    ] },
+    "action": { "type": "object", "required": ["id", "toolId", "arguments"], "properties": { "id": { "type": "string", "minLength": 1 }, "toolId": { "type": "string", "minLength": 1 }, "arguments": { "type": "object" }, "label": { "type": "string" } }, "additionalProperties": true },
+    "asset": { "type": "object", "required": ["id", "mimeType", "alt"], "properties": { "id": { "type": "string", "minLength": 1 }, "mimeType": { "type": "string", "pattern": "^[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+$" }, "alt": { "type": "string" }, "originalRef": { "type": "string" }, "width": { "type": "integer", "minimum": 1 }, "height": { "type": "integer", "minimum": 1 } }, "additionalProperties": true }
+  },
+  "additionalProperties": true
+}

@@ -6,3 +6,17 @@ dist/
 !.env.example
 __pycache__/
 semantic_mastery.db
+cue_memory.db
+cue_memory.db-shm
+cue_memory.db-wal
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.apkg
+*.colpkg
+*.anki2
+*.anki21
+*anki*backup*
+*anki*export*
+!data/cue_demo.db

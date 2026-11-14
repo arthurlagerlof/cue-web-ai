@@ -9,7 +9,7 @@ const UART_RX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 const UART_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
 const HEADER_SIZE = 9;
-const MAX_DISPLAY_BYTES = 512;
+const MAX_DISPLAY_BYTES = 2450;
 let nextMessageId = 1;
 
 export class BangleConnection {
@@ -17,6 +17,7 @@ export class BangleConnection {
   private characteristic?: GattCharacteristic;
   onCommand?: (command: string) => void;
   onTrigger?: () => void;
+  onAction?: (actionId: string) => void;
   onStatus?: (message: string) => void;
   onDiagnostic?: (message: string) => void;
   private incoming = new Uint8Array();
@@ -71,6 +72,11 @@ export class BangleConnection {
       if (type === 3 && count === 1 && index === 0 && payload.length === 1) {
         this.onDiagnostic?.(`ACK frame: id=${id}, status=${payload[0]}, waiting=${this.pendingAcks.has(id)}`);
         this.pendingAcks.get(id)?.(payload[0] === 0);
+        continue;
+      }
+      if (type === 4 && count === 1 && index === 0) {
+        try { this.onAction?.(new TextDecoder().decode(payload)); }
+        catch { this.onDiagnostic?.('Ignored invalid watch action payload'); }
         continue;
       }
       if (type !== 1 || count !== 1 || index !== 0 || payload.length !== 1 || payload[0] !== 1 || this.seen.has(id)) continue;
@@ -201,10 +207,15 @@ export class BangleConnection {
     if (!(await acknowledged)) throw new Error('No ACK:TEST returned from the watch.');
   }
 
+  async sendDisplayDocument(document: unknown) {
+    if (!document || typeof document !== 'object') throw new TypeError('A Cue Display Document is required.');
+    return this.sendDisplayText(JSON.stringify(document));
+  }
+
   async sendDisplayText(text: string) {
     if (!this.characteristic) throw new Error('Connect the Bangle.js before sending display text.');
     const bytes = new TextEncoder().encode(text);
-    if (bytes.length > MAX_DISPLAY_BYTES) throw new Error('Watch display text exceeds 512 UTF-8 bytes.');
+    if (bytes.length > MAX_DISPLAY_BYTES) throw new Error(`Watch display document exceeds ${MAX_DISPLAY_BYTES} UTF-8 bytes.`);
     const chunkSize = 10;
     const id = nextMessageId++ & 0xffff, count = Math.max(1, Math.ceil(bytes.length / chunkSize));
     this.onDiagnostic?.(`Sending ${bytes.length} UTF-8 bytes as ${count} frame(s), id=${id}`);
