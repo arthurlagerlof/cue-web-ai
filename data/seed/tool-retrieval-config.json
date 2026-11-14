@@ -1,0 +1,12 @@
+{
+  "minimumScore": 0.58,
+  "plausibleScore": 0.38,
+  "ambiguityMargin": 0.08,
+  "scoring": "weighted-max",
+  "weights": {
+    "description": 0.35,
+    "keyword": 0.3,
+    "example": 0.35
+  },
+  "maxOperations": 4
+}

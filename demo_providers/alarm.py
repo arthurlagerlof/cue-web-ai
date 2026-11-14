@@ -20,6 +20,12 @@ def execute(connection, provider_id, tool_id, arguments):
         item = {"id": next_id(connection, provider_id, "items", "alarm"), "label": arguments["label"], "time": instant.isoformat(), "enabled": True}
         save_record(connection, provider_id, "items", item)
         return document(provider_id, NAME, "Alarm created", [card(item["label"], item["time"], "Enabled")], state="success")
+    if tool_id == "alarm.delete":
+        item = record(connection, provider_id, "items", arguments["alarmId"])
+        if not item: return empty(provider_id, NAME, "Alarm", arguments["alarmId"])
+        connection.execute("DELETE FROM records WHERE provider_id=? AND record_type='items' AND record_id=?", (provider_id, arguments["alarmId"]))
+        connection.commit()
+        return document(provider_id, NAME, "Alarm deleted", [card(item["label"], item["time"], "Removed from the synthetic alarm list")], state="success")
     if tool_id == "alarm.update":
         item = record(connection, provider_id, "items", arguments["alarmId"])
         if not item: return empty(provider_id, NAME, "Alarm", arguments["alarmId"])

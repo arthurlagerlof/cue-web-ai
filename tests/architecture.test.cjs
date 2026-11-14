@@ -8,6 +8,8 @@ const modules = Promise.all([
   import('../src/intelligence/toolRegistry.js'),
   import('../src/intelligence/retrieval/semanticTools.js'),
   import('../src/demo/mockProviders.js'),
+  import('../src/intelligence/argumentResolution.js'),
+  import('../src/intelligence/retrieval/benchmark.js'),
 ]);
 const fixturePath = path.join(__dirname, '..', 'src', 'display', 'fixtures', 'display-documents.json');
 const fixtures = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
@@ -20,7 +22,7 @@ function sampleDocument(providerId, title, message, state = 'ready', assets = []
 function testProviders() {
   return [...new Set(manifests.map(tool => tool.providerId))].map(id => ({ id, execute: async (toolId, args) => {
     if (args.query === 'mock-error') return sampleDocument(id, 'Mock error', 'Simulated error', 'error');
-    if (toolId === 'calendar.find_events') return { document: sampleDocument(id, 'Calendar events', 'Design review'), data: { events: [], firstEvent: { start: '2026-11-14T09:30:00+02:00' } } };
+    if (toolId === 'calendar.find_events') return { document: sampleDocument(id, 'Calendar events', 'Design review'), data: { events: [], firstEvent: { title: 'Dentist appointment', start: '2026-11-14T09:30:00+02:00' } } };
     if (toolId === 'alarm.create') {
       const time = new Date(args.time);
       time.setMinutes(time.getMinutes() + (args.offsetMinutes ?? 0));
@@ -45,22 +47,9 @@ function fakeEmbed(text) {
   return { vector: vector.map(value => value / norm), dimensions: 384 };
 }
 
-function resolverFor(text) {
-  if (/flashcard|anki-kortteihin|kortti/i.test(text)) return { kind: 'tool', toolId: 'anki.create_card', arguments: { front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.', tags: ['biology'] } };
-  if (/search my anki|etsi anki/i.test(text)) return { kind: 'tool', toolId: 'anki.search_cards', arguments: { query: 'photosynthesis' } };
-  if (/events|kalenteritapahtumat/i.test(text)) return { kind: 'tool', toolId: 'calendar.find_events', arguments: { date: '2026-11-14' } };
-  if (/first meeting/i.test(text)) return { kind: 'multi_tool', operations: [
-    { id: 'events', toolId: 'calendar.find_events', arguments: { date: '2026-11-14' } },
-    { id: 'alarm', toolId: 'alarm.create', dependsOn: ['events'], arguments: { time: { $from: { operationId: 'events', path: 'firstEvent.start' } }, offsetMinutes: -15, label: 'Meeting alarm' } },
-  ] };
-  if (/search the web|hae verkosta/i.test(text)) return { kind: 'tool', toolId: 'web.search', arguments: { query: 'local AI research' } };
-  if (/message.*alex|alexin/i.test(text)) return { kind: 'tool', toolId: 'notifications.search', arguments: { query: 'Alex' } };
-  return { kind: 'clarification', question: 'Which item did you mean?' };
-}
-
-async function environment(resolve = ({ transcription }) => resolverFor(transcription)) {
+async function environment(options = {}) {
   const [, , , mock] = await modules;
-  return mock.createMockEnvironment({ manifests, providers: testProviders(), embed: async text => fakeEmbed(text), resolve, threshold: 0.2, ambiguityMargin: 0.02 });
+  return mock.createMockEnvironment({ manifests, providers: testProviders(), embed: options.embed ?? (async text => fakeEmbed(text)), threshold: options.threshold ?? 0.2, ambiguityMargin: options.ambiguityMargin ?? 0.02 });
 }
 
 test('Cue Display Document fixtures satisfy the v1 contract', async () => {
@@ -72,7 +61,7 @@ test('Cue Display Document fixtures satisfy the v1 contract', async () => {
 
 test('display validator checks nested components, assets, action IDs, and registry arguments', async () => {
   const [display, registryModule, , mock] = await modules;
-  const runtime = await mock.createMockEnvironment({ manifests, providers: testProviders(), embed: async text => fakeEmbed(text), resolve: async () => ({ kind: 'answer', text: 'ok' }) });
+  const runtime = await mock.createMockEnvironment({ manifests, providers: testProviders(), embed: async text => fakeEmbed(text) });
   const valid = display.validateDisplayDocument(fixtures[0], { registry: runtime.registry });
   assert.equal(valid.valid, true);
   const unknownComponent = structuredClone(fixtures[0]);
@@ -95,9 +84,51 @@ test('display validator checks nested components, assets, action IDs, and regist
   assert.equal(registryModule.validateArguments(runtime.registry.get('anki.search_cards').parameters, { query: 'x' }).valid, true);
 });
 
+test('retrieval aggregation is source-aware, configurable, and unaffected by weak extra examples', async () => {
+  const [, , retrieval] = await modules;
+  const records = [
+    { namespace: 'tool', toolId: 'calendar.find_events', sourceType: 'description', vector: [1, 0] },
+    { namespace: 'tool', toolId: 'calendar.find_events', sourceType: 'keyword', vector: [0.6, 0.8] },
+    { namespace: 'tool', toolId: 'calendar.find_events', sourceType: 'example', vector: [0.8, 0.6] },
+    ...Array.from({ length: 20 }, () => ({ namespace: 'tool', toolId: 'calendar.find_events', sourceType: 'example', vector: [0, 1] })),
+  ];
+  const candidate = retrieval.discoverTools([1, 0], records, { threshold: 0, strategy: 'weighted-max' })[0];
+  assert.equal(candidate.bestDescriptionSimilarity, 1);
+  assert.equal(candidate.bestKeywordSimilarity, 0.6);
+  assert.equal(candidate.bestExampleSimilarity, 0.8);
+  assert.ok(Math.abs(candidate.score - 0.81) < 1e-12);
+});
+
+test('synthetic benchmark covers registered tools, languages, ambiguity, and no-tool outcomes', async () => {
+  const benchmarkCases = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'seed', 'tool-routing-benchmark.json'), 'utf8'));
+  const toolIds = new Set(manifests.map(tool => tool.id));
+  const positiveIds = new Set(benchmarkCases.filter(item => item.expectedToolId).map(item => item.expectedToolId));
+  assert.deepEqual([...toolIds].sort(), [...positiveIds].sort());
+  assert.ok(benchmarkCases.some(item => item.language === 'en'));
+  assert.ok(benchmarkCases.some(item => item.language === 'fi'));
+  assert.ok(benchmarkCases.some(item => item.expectedOutcome === 'ambiguous'));
+  assert.ok(benchmarkCases.some(item => item.expectedOutcome === 'no_tool'));
+  const [, , , , , benchmark] = await modules;
+  const cases = [
+    { id: 'positive', language: 'en', request: 'positive', expectedToolId: 'test.lookup' },
+    { id: 'ambiguous', language: 'fi', request: 'ambiguous', expectedOutcome: 'ambiguous' },
+    { id: 'negative', language: 'en', request: 'negative', expectedOutcome: 'no_tool' },
+  ];
+  const vectors = { positive: [1, 0], ambiguous: [Math.SQRT1_2, Math.SQRT1_2], negative: [0, 0, 1] };
+  const records = [
+    { namespace: 'tool', toolId: 'test.lookup', sourceType: 'example', vector: [1, 0] },
+    { namespace: 'tool', toolId: 'test.first', sourceType: 'example', vector: [0, 1] },
+  ];
+  const result = await benchmark.evaluateToolBenchmark({ cases, records, embed: async request => vectors[request], config: { minimumScore: 0.99, plausibleScore: 0.5, ambiguityMargin: 0.1 } });
+  assert.equal(result.top1ToolAccuracy, 1);
+  assert.equal(result.ambiguityDetectionRate, 1);
+  assert.equal(result.correctNoToolRate, 1);
+  assert.equal(result.falseToolActivationRate, 0);
+});
+
 test('semantic retrieval finds expected tools in English and Finnish without mixing namespaces', async () => {
   const [, , retrieval, runtimeMock] = await modules;
-  const runtime = await runtimeMock.createMockEnvironment({ manifests, providers: testProviders(), embed: async text => fakeEmbed(text), resolve: async () => ({ kind: 'answer', text: 'unused' }), threshold: 0.2 });
+  const runtime = await runtimeMock.createMockEnvironment({ manifests, providers: testProviders(), embed: async text => fakeEmbed(text), threshold: 0.2 });
   const cases = [
     ['Create a flashcard about photosynthesis.', 'anki.create_card'],
     ['Lisää tämä Anki-kortteihin.', 'anki.create_card'],
@@ -128,20 +159,59 @@ test('end-to-end request uses registered tools and returns a validated display d
   assert.equal(noTool.kind, 'no_tool');
 });
 
-test('resolver supports ordinary answers and clarification, but cannot invent tool IDs', async () => {
-  const answerRuntime = await environment(async () => ({ kind: 'answer', text: 'This is a local ordinary answer.' }));
-  const answer = await answerRuntime.intelligence.handle('Find my morning alarm');
-  assert.equal(answer.kind, 'answer');
-  const clarifyRuntime = await environment(async () => ({ kind: 'clarification', question: 'Which date do you mean?' }));
-  const clarification = await clarifyRuntime.intelligence.handle('Find my morning alarm');
+test('semantic routing excludes generative model selection and retains clarifications', async () => {
+  const runtime = await environment();
+  const worker = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', 'model.worker.ts'), 'utf8');
+  assert.doesNotMatch(worker, /gemma|text-generation|resolve/i);
+  const search = await runtime.intelligence.handle('Search my Anki cards about chloroplasts');
+  assert.equal(search.kind, 'document');
+  const clarification = await runtime.intelligence.handle('Create a flashcard about photosynthesis');
   assert.equal(clarification.kind, 'clarification');
-  const invalidRuntime = await environment(async () => ({ kind: 'tool', toolId: 'remote.run', arguments: {} }));
-  await assert.rejects(invalidRuntime.intelligence.handle('Find my morning alarm'), /unregistered or unretrieved tool/);
+  assert.deepEqual(clarification.resolution.missing, ['front', 'back']);
+  const continued = await runtime.intelligence.handle('front: What is photosynthesis? back: Plants convert light into chemical energy.');
+  assert.equal(continued.kind, 'confirmation_required');
+  assert.equal(continued.pendingCall.toolId, 'anki.create_card');
+  assert.deepEqual(continued.pendingCall.arguments, { front: 'What is photosynthesis', back: 'Plants convert light into chemical energy' });
+});
+
+test('deterministic argument parsing supports Finnish dates, time zones, DST ambiguity, and corrections', async () => {
+  const [, , , , argumentResolution] = await modules;
+  const tool = { parameters: { type: 'object', properties: { time: { type: 'string', format: 'date-time' } }, required: ['time'] } };
+  const finnish = argumentResolution.resolveArguments({ request: 'Huomenna klo 14.00', tool, context: { now: new Date('2026-11-14T07:00:00Z'), timeZone: 'Europe/Helsinki', locale: 'fi-FI' } });
+  assert.equal(finnish.arguments.time, '2026-11-15T14:00:00+02:00');
+  assert.equal(finnish.fields.time.source, 'current_user_request');
+  assert.equal(finnish.fields.time.method, 'chrono-node');
+  const corrected = argumentResolution.resolveArguments({ request: '15:00', tool, previous: { time: { value: '2026-11-20T10:00:00+02:00', source: 'current_user_request' } }, context: { now: new Date('2026-11-14T07:00:00Z'), timeZone: 'Europe/Helsinki', locale: 'en' } });
+  assert.equal(corrected.arguments.time, '2026-11-20T15:00:00+02:00');
+  const daylightGap = argumentResolution.resolveArguments({ request: 'March 29 at 3:30', tool, context: { now: new Date('2026-03-01T10:00:00Z'), timeZone: 'Europe/Helsinki', locale: 'en' } });
+  assert.ok(daylightGap.ambiguous.length > 0);
+  const createTool = manifests.find(tool => tool.id === 'calendar.create_event');
+  const initial = argumentResolution.resolveArguments({ request: 'Schedule a meeting next Friday', tool: createTool, context: { now: new Date('2026-11-14T07:00:00Z'), timeZone: 'Europe/Helsinki', locale: 'en' } });
+  assert.equal(initial.fields.start.value, '2026-11-20');
+  const startFollowup = argumentResolution.resolveArguments({ request: 'At 14:30', tool: createTool, previous: initial.fields, context: { now: new Date('2026-11-14T07:00:00Z'), timeZone: 'Europe/Helsinki', locale: 'en' } });
+  assert.equal(startFollowup.arguments.start, '2026-11-20T14:30:00+02:00');
+  assert.ok(startFollowup.missing.includes('end'));
+  const endFollowup = argumentResolution.resolveArguments({ request: 'End at 15:00', tool: createTool, previous: startFollowup.fields, context: { now: new Date('2026-11-14T07:00:00Z'), timeZone: 'Europe/Helsinki', locale: 'en' } });
+  assert.equal(endFollowup.arguments.end, '2026-11-20T15:00:00+02:00');
+  assert.equal(endFollowup.arguments.start, '2026-11-20T14:30:00+02:00');
+});
+
+test('semantic multi-step requests use actual prior results and confirm only the write', async () => {
+  const isolatedVector = index => { const vector = Array(384).fill(0); vector[index] = 1; return { vector, dimensions: 384 }; };
+  const runtime = await environment({ embed: async text => ['Find my next dentist appointment', 'Find my first meeting tomorrow'].includes(text) ? isolatedVector(0) : ['set an alarm 30 minutes beforehand', 'Set an alarm for my first meeting'].includes(text) ? isolatedVector(1) : fakeEmbed(text) });
+  const result = await runtime.intelligence.handle('Find my next dentist appointment and set an alarm 30 minutes beforehand');
+  assert.equal(result.kind, 'confirmation_required', JSON.stringify(result));
+  assert.equal(result.pendingCall.toolId, 'alarm.create');
+  assert.equal(result.pendingCall.arguments.time, '2026-11-14T09:30:00+02:00');
+  assert.equal(result.pendingCall.arguments.offsetMinutes, -30);
+  assert.equal(result.completedOperations[0].toolId, 'calendar.find_events');
 });
 
 test('side effects require confirmation, and invalid or unknown calls are rejected', async () => {
   const runtime = await environment();
-  const pending = await runtime.intelligence.handle('Create a flashcard about photosynthesis.');
+  const clarification = await runtime.intelligence.handle('Create a flashcard about photosynthesis.');
+  assert.equal(clarification.kind, 'clarification');
+  const pending = await runtime.intelligence.handle('front: What is photosynthesis? back: Plants convert light into chemical energy.');
   assert.equal(pending.kind, 'confirmation_required');
   assert.equal(pending.pendingCall.toolId, 'anki.create_card');
   const result = await runtime.dispatcher.dispatch(pending.pendingCall, { confirmed: true });

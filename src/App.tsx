@@ -7,7 +7,7 @@ import { DisplayDocumentView } from './display/DisplayDocumentView';
 import { createDatabaseEnvironment } from './demo/databaseEnvironment.js';
 import watchAppSource from '../watch/bangle-app.js?raw';
 
-type Stage = 'transcribe' | 'embed' | 'resolve';
+type Stage = 'transcribe' | 'embed';
 type WorkerReply = { id: number; stage: Stage; status: string; model?: string; result?: any; error?: string };
 const workers = new Map<Stage, Worker>();
 function createWorker(stage: Stage) {
@@ -79,7 +79,7 @@ export default function App() {
   const [buffer, setBuffer] = useState(0);
   const [asrModel, setAsrModel] = useState<ASRModelSize>('tiny');
   const asrModelRef = useRef<ASRModelSize>('tiny');
-  const [status, setStatus] = useState<Record<Stage, string>>({ transcribe: 'Not started', embed: 'Not started', resolve: 'Not started' });
+  const [status, setStatus] = useState<Record<Stage, string>>({ transcribe: 'Not started', embed: 'Not started' });
   const [transcription, setTranscription] = useState('');
   const [embedding, setEmbedding] = useState<any>();
   const [logs, setLogs] = useState<string[]>([]);
@@ -88,6 +88,7 @@ export default function App() {
   const [scenario, setScenario] = useState('');
   const [displayDocument, setDisplayDocument] = useState<any>();
   const [pendingConfirmation, setPendingConfirmation] = useState<any>();
+  const [pendingClarification, setPendingClarification] = useState(false);
   const [holding, setHolding] = useState(false);
   const [frozenAudio, setFrozenAudio] = useState<Float32Array>();
   const [playbackActive, setPlaybackActive] = useState(false);
@@ -122,7 +123,7 @@ export default function App() {
     return () => { unsubscribe(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); watch.disconnect(); audio.stop(); };
   }, []);
 
-  function runModel(stage: Stage, data: { text?: string; instruction?: string; candidates?: any[]; asrModel?: ASRModelSize; audio?: Float32Array; sampleRate?: number }): Promise<WorkerReply> {
+  function runModel(stage: Stage, data: { text?: string; asrModel?: ASRModelSize; audio?: Float32Array; sampleRate?: number }): Promise<WorkerReply> {
     const id = ++sequence.current;
     let instance = workers.get(stage);
     if (!instance) {
@@ -154,16 +155,10 @@ export default function App() {
       setEmbedding({ ...reply.result, model: reply.model });
       return reply.result;
     };
-    const resolve = async ({ transcription: text, candidates }: { transcription: string; candidates: any[] }) => {
-      const timeContext = `Current local time: ${new Date().toLocaleString()} (${Intl.DateTimeFormat().resolvedOptions().timeZone}); locale: ${navigator.language}.`;
-      const reply = await runModel('resolve', { text, instruction: timeContext, candidates });
-      if (reply.status === 'error') throw new Error(reply.error);
-      return reply.result;
-    };
     const response = await fetch('/api/demo/registry', { credentials: 'same-origin', cache: 'no-store' });
     const registryData = await response.json();
     if (!response.ok) throw new Error(registryData.error ?? `Demo registry request failed (${response.status})`);
-    environment.current = await createDatabaseEnvironment({ registryData, embed, resolve, postApi });
+    environment.current = await createDatabaseEnvironment({ registryData, embed, postApi });
     log(`Loaded ${registryData.tools.length} provider-owned tools from the SQLite demo registry`);
     return environment.current;
   }
@@ -193,11 +188,12 @@ export default function App() {
   async function processTranscript(text: string) {
     const clean = text.trim();
     if (!clean) throw new Error('Enter transcript text first.');
-    setTranscription(clean); setTranscriptInput(clean); setBusy(true); setPendingConfirmation(undefined);
+    setTranscription(clean); setTranscriptInput(clean); setBusy(true); setPendingConfirmation(undefined); setPendingClarification(false);
     try {
       await showDocument(createDisplayDocument({ id: 'cue-loading', title: 'Working', source: { app: 'cue', name: 'Cue' }, state: 'loading', message: 'Discovering provider tools and preparing a local response.', elements: [{ type: 'text', text: clean, role: 'body' }] }));
       const runtime = await getEnvironment();
-      const outcome = await runtime.intelligence.handle(clean);
+      const outcome = await runtime.intelligence.handle(clean, { context: { now: new Date(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language } });
+      if (outcome.retrieval) log(`Retrieval ${outcome.retrieval.toolId}: ${outcome.retrieval.score.toFixed(3)} (description ${outcome.retrieval.bestDescriptionSimilarity?.toFixed(3) ?? '—'}, keyword ${outcome.retrieval.bestKeywordSimilarity?.toFixed(3) ?? '—'}, example ${outcome.retrieval.bestExampleSimilarity?.toFixed(3) ?? '—'}, margin ${outcome.retrieval.margin?.toFixed(3) ?? '—'})`);
       if (outcome.kind === 'confirmation_required') {
         setPendingConfirmation(outcome.pendingCall ? { call: outcome.pendingCall } : { plan: outcome.pendingPlan });
         const targetIds = outcome.operations?.map((operation: any) => operation.toolId) ?? [outcome.toolId];
@@ -209,8 +205,12 @@ export default function App() {
         await showDocument(outcome.document);
         log('Local tool completed and returned a validated Cue Display Document');
       } else {
+        setPendingClarification(outcome.kind === 'clarification' && Boolean(outcome.toolId));
+        if (outcome.kind === 'clarification' && outcome.toolId) setTranscriptInput('');
         const message = outcome.kind === 'answer' ? outcome.text : outcome.kind === 'clarification' ? outcome.question : outcome.text;
-        const document = createDisplayDocument({ id: `cue-${outcome.kind}`, title: outcome.kind === 'clarification' ? 'Clarification needed' : outcome.kind === 'no_tool' ? 'No matching tool' : 'Cue', source: { app: 'cue', name: 'Cue' }, state: outcome.kind === 'no_tool' ? 'empty' : 'ready', message, elements: [{ type: 'text', text: message ?? 'Please clarify your request.', role: 'body' }] });
+        const state = outcome.kind === 'no_tool' ? 'empty' : outcome.kind === 'partial_failure' ? 'error' : 'ready';
+        const title = outcome.kind === 'clarification' ? 'Clarification needed' : outcome.kind === 'no_tool' ? 'No matching tool' : outcome.kind === 'partial_failure' ? 'Operation partially failed' : 'Cue';
+        const document = createDisplayDocument({ id: `cue-${outcome.kind}`, title, source: { app: 'cue', name: 'Cue' }, state, message, elements: [{ type: 'text', text: message ?? 'Please clarify your request.', role: 'body' }] });
         await showDocument(document);
         log(`Tool intelligence outcome: ${outcome.kind}`);
       }
@@ -230,10 +230,17 @@ export default function App() {
         ? await environment.current.dispatcher.dispatch(pendingAction.call, { confirmed: true })
         : await environment.current.dispatcher.dispatchPlan(pendingAction.plan, { confirmed: true });
       setPendingConfirmation(undefined);
+      setPendingClarification(false);
       await showDocument(result.document);
       log(`Confirmed mock action completed: ${labels}`);
     } catch (error) { log(`Confirmed action failed: ${error instanceof Error ? error.message : String(error)}`); }
     finally { setBusy(false); }
+  }
+
+  function cancelPendingOperation() {
+    environment.current?.intelligence.cancelPendingOperation();
+    setPendingClarification(false);
+    log('Pending operation cancelled');
   }
 
   async function resetDemoData() {
@@ -245,6 +252,7 @@ export default function App() {
       displayDocumentRef.current = undefined;
       setDisplayDocument(undefined);
       setPendingConfirmation(undefined);
+      setPendingClarification(false);
       log('Demo session reset to the committed synthetic baseline');
     } catch (error) { log(`Demo reset failed: ${error instanceof Error ? error.message : String(error)}`); }
     finally { setBusy(false); }
@@ -368,7 +376,7 @@ export default function App() {
     <h1>Cue</h1>
     <p>Enter a request for local tool discovery, argument resolution, and mock-provider execution. AI inference runs in your browser.</p>
     <section><h2>Devices</h2><button onClick={() => watch.connected ? watch.disconnect() : void connectWatch()}>{watch.connected ? 'Disconnect watch' : 'Connect Bangle.js'}</button> <span>{watchName}</span> <button disabled={!watch.connected || testSending} onClick={() => void sendWatchTest()}>{testSending ? 'Sending raw test…' : 'Send raw TEST to watch'}</button><p><button disabled={installing} onClick={() => void installOnWatch()}>{installing ? 'Installing…' : 'Install on watch'}</button></p>{installStatus && <p role="status">{installStatus}</p>}<details><summary>Manual downloads</summary><p>These files can also be installed with the Espruino Web IDE.</p><button onClick={() => downloadWatchFile('cue.app.js', watchAppSource)}>Download watch display app</button> <a href="https://www.espruino.com/ide/" target="_blank" rel="noreferrer">Open Espruino Web IDE</a></details><br /><button onClick={() => void toggleMicrophone()}>{recording ? 'Stop microphone' : 'Start microphone'}</button><button disabled={!recording || buffer < 0.2} onClick={freezeBuffer}>Freeze rolling buffer</button> <strong style={{ color: recording ? '#16803c' : '#777' }}>{recording ? '● Recording' : 'Microphone off'}</strong><p>Rolling buffer: {buffer.toFixed(1)} / 10.0 seconds (sample rate {audio.sampleRate || '—'} Hz)</p></section>
-    <section><h2>Processing</h2><label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label><button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button><button disabled={busy || !recording || buffer < 0.2} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); void startHoldCapture(); }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()}>{holding ? 'Release to transcribe…' : 'Hold to transcribe (max 5 min)'}</button>{(['transcribe', 'embed', 'resolve'] as Stage[]).map(stage => <p key={stage}>{stage}: {status[stage]}{busy && <button onClick={() => stopStage(stage)}>Stop {stage}</button>}</p>)}<p>Tools and provider availability are loaded dynamically from the session's SQLite registry. Embeddings and intent resolution run in your browser.</p><label>Demo scenario<select value={scenario} onChange={event => { setScenario(event.target.value); setTranscriptInput(event.target.value); }}><option value="">Choose an example request</option>{DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}</select></label><label>Transcript text<textarea value={transcriptInput} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder="Enter sample transcript text" /></label><button disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>{busy ? 'Processing…' : 'Process transcript'}</button> <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button><label>Transcription (audio capture only)<textarea readOnly value={transcription} /></label><p>Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>{displayDocument && <><DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />{pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}</>}</section>
+    <section><h2>Processing</h2><label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label><button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button><button disabled={busy || !recording || buffer < 0.2} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); void startHoldCapture(); }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()}>{holding ? 'Release to transcribe…' : 'Hold to transcribe (max 5 min)'}</button>{(['transcribe', 'embed'] as Stage[]).map(stage => <p key={stage}>{stage}: {status[stage]}{busy && <button onClick={() => stopStage(stage)}>Stop {stage}</button>}</p>)}<p>Tools and provider availability are loaded dynamically from the session's SQLite registry. MiniLM retrieval and deterministic argument resolution run in your browser.</p><label>Demo scenario<select value={scenario} onChange={event => { setScenario(event.target.value); setTranscriptInput(event.target.value); }}><option value="">Choose an example request</option>{DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}</select></label><label>{pendingClarification ? 'Clarification' : 'Transcript text'}<textarea value={transcriptInput} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder={pendingClarification ? 'Enter the missing details or a correction' : 'Enter sample transcript text'} /></label>{pendingClarification && <p role="status">Reply here to continue the pending request. Your message will go directly to that request.</p>}<button disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>{busy ? 'Processing…' : pendingClarification ? 'Send clarification' : 'Process transcript'}</button> <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button><label>Transcription (audio capture only)<textarea readOnly value={transcription} /></label><p>Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>{displayDocument && <><DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />{pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}{pendingClarification && <button disabled={busy} onClick={cancelPendingOperation}>Cancel pending operation</button>}</>}</section>
     <section><h2>Status log</h2><pre>{logs.join('\n')}</pre></section>
   </main>;
 }

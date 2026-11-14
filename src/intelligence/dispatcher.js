@@ -52,7 +52,7 @@ export class ToolDispatcher {
     }
     const pendingConfirmation = plan.operations.filter(operation => this.registry.get(operation.toolId).confirmation === 'required');
     if (pendingConfirmation.length && !confirmed) return { state: 'confirmation_required', operations: pendingConfirmation.map(({ id, toolId }) => ({ id, toolId })), plan };
-    const results = new Map(), documents = new Map(), remaining = new Map(operationById);
+    const results = new Map(), documents = new Map(), remaining = new Map(operationById), executedSideEffects = new Set();
     while (remaining.size) {
       const ready = [...remaining.values()].filter(operation => (operation.dependsOn ?? []).every(id => results.has(id)));
       if (!ready.length) throw new TypeError('Plan contains an unknown dependency or cycle');
@@ -60,6 +60,11 @@ export class ToolDispatcher {
         for (const dependency of operation.dependsOn ?? []) if (!operationById.has(dependency)) throw new TypeError(`Unknown dependency: ${dependency}`);
         const args = resolveReferences(operation.arguments, results);
         const { tool, provider } = this.validateCall({ toolId: operation.toolId, arguments: args });
+        if (tool.confirmation === 'required') {
+          const signature = JSON.stringify({ toolId: tool.id, arguments: args });
+          if (executedSideEffects.has(signature)) throw new Error(`Duplicate side effect rejected: ${tool.id}`);
+          executedSideEffects.add(signature);
+        }
         const output = await provider.execute(tool.id, args, { confirmed });
         const document = assertDisplayDocument(output && output.document ? output.document : output, { registry: this.registry });
         documents.set(operation.id, document);

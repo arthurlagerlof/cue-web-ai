@@ -59,8 +59,17 @@ class BackendTests(unittest.TestCase):
         after = snapshot()
         self.assertEqual(before, after)
         self.assertEqual(first["providers"], 6)
-        self.assertEqual(first["tools"], 15)
-        self.assertEqual(first["records"], {"anki": 12, "knowledge": 6, "web": 3, "calendar": 4, "notifications": 3, "alarm": 2})
+        self.assertEqual(first["tools"], 18)
+        self.assertEqual(first["tool_embedding_rows"], 172)
+        self.assertEqual(first["ready_tool_embeddings"], 69)
+        self.assertEqual(first["records"], {"anki": 12, "knowledge": 6, "web": 3, "calendar": 5, "notifications": 3, "alarm": 2})
+        connection = sqlite3.connect(self.seed)
+        try:
+            sources = dict(connection.execute("SELECT source_type,COUNT(*) FROM tool_retrieval_records GROUP BY source_type"))
+            self.assertEqual(sources, {"description": 18, "example": 63, "keyword": 91})
+            self.assertEqual(connection.execute("SELECT COUNT(DISTINCT content_hash) FROM tool_retrieval_records").fetchone()[0], 172)
+        finally:
+            connection.close()
 
     def test_baseline_is_read_only_and_independent_of_personal_databases(self):
         connection = demo_database.connect_readonly(self.seed)
@@ -98,6 +107,11 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(len(calendar["data"]["events"]), 2)
         self.assertEqual(demo_database.execute_tool(session, "notifications.search", {"query": "Alex"})["source"]["app"], "notifications")
         self.assertEqual(demo_database.execute_tool(session, "alarm.find", {"query": "morning"})["source"]["app"], "alarm")
+        available = demo_database.execute_tool(session, "calendar.check_availability", {"start": "2026-11-14T12:00:00+02:00", "end": "2026-11-14T12:30:00+02:00"})
+        self.assertIn("Available", json.dumps(available))
+        demo_database.execute_tool(session, "calendar.delete_event", {"eventId": "event-5"})
+        demo_database.execute_tool(session, "alarm.delete", {"alarmId": "alarm-2"})
+        self.assertEqual(len(demo_database.registry(session)["data"]["alarm"]["items"]), 1)
         demo_database.execute_tool(session, "calendar.create_event", {"title": "Synthetic follow-up", "start": "2026-11-15T15:00:00+02:00", "end": "2026-11-15T15:30:00+02:00"})
         found = demo_database.execute_tool(session, "calendar.find_events", {"date": "2026-11-15"})
         self.assertEqual(len(found["data"]["events"]), 3)
@@ -109,8 +123,12 @@ class BackendTests(unittest.TestCase):
         vector = [0.0] * demo_database.DIMENSIONS
         vector[0] = 1.0
         demo_database.store_tool_embeddings(session, [{"exampleId": "anki.search_cards:0", "vector": vector}])
+        demo_database.store_tool_embeddings(session, [{"recordId": "anki.search_cards:keyword:0", "vector": vector}])
         results = demo_database.search_tools(session, vector, threshold=0.8)
         self.assertEqual(results[0]["toolId"], "anki.search_cards")
+        self.assertEqual(results[0]["bestDescriptionSimilarity"], 1.0)
+        self.assertEqual(results[0]["bestKeywordSimilarity"], 1.0)
+        self.assertIn("margin", results[0])
         orthogonal = [0.0] * demo_database.DIMENSIONS
         orthogonal[1] = 1.0
         self.assertEqual(demo_database.search_tools(session, orthogonal, threshold=0.9), [])
@@ -133,7 +151,9 @@ class BackendTests(unittest.TestCase):
             registry = json.loads(response.read())
             self.assertEqual(response.status, 200)
             self.assertEqual(len(registry["providers"]), 6)
-            self.assertEqual(len(registry["tools"]), 15)
+            self.assertEqual(len(registry["tools"]), 18)
+            self.assertEqual(registry["toolRetrievalConfig"]["scoring"], "weighted-max")
+            self.assertEqual(registry["toolRetrievalConfig"]["maxOperations"], 4)
             self.assertEqual(len(registry["data"]["anki"]["cards"]), 12)
             body = {"toolId": "anki.create_card", "arguments": {"front": "Question", "back": "Answer"}}
             connection.request("POST", "/api/demo/execute", body=json.dumps(body), headers=headers)

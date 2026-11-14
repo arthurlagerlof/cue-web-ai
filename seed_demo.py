@@ -5,10 +5,10 @@ import sqlite3
 import struct
 from pathlib import Path
 
-from demo_database import DEFAULT_SEED_PATH, DIMENSIONS, MODEL_ID, MODEL_VERSION, PREPROCESSING, TOKENIZER_ID, load_provider_manifests, seed_database
+from demo_database import DEFAULT_SEED_PATH, DIMENSIONS, MODEL_ID, MODEL_VERSION, PREPROCESSING, TOKENIZER_ID, TOOL_EMBEDDING_INDEX_PATH, load_provider_manifests, seed_database
 
 EXPECTED_PROVIDERS = {provider["id"] for provider in load_provider_manifests()}
-EXPECTED_COUNTS = {"anki": 12, "knowledge": 6, "web": 3, "calendar": 4, "notifications": 3, "alarm": 2}
+EXPECTED_COUNTS = {"anki": 12, "knowledge": 6, "web": 3, "calendar": 5, "notifications": 3, "alarm": 2}
 
 
 def verify_database(path=DEFAULT_SEED_PATH, require_embeddings=True):
@@ -37,12 +37,13 @@ def verify_database(path=DEFAULT_SEED_PATH, require_embeddings=True):
             if invalid:
                 raise AssertionError(f"Tool namespace ownership mismatch for {provider_id}")
         tool_count = connection.execute("SELECT COUNT(*) FROM tools").fetchone()[0]
-        embedding_rows = connection.execute("SELECT model_id,model_version,tokenizer,preprocessing,dimensions,pooling,normalized,similarity_metric,status,vector FROM embeddings WHERE namespace='tool'").fetchall()
+        embedding_rows = connection.execute("SELECT r.source_type,e.model_id,e.model_version,e.tokenizer,e.preprocessing,e.dimensions,e.pooling,e.normalized,e.similarity_metric,e.status,e.vector FROM tool_retrieval_records r JOIN embeddings e ON e.owner_type='tool_retrieval' AND e.owner_id=r.id WHERE e.namespace='tool'").fetchall()
         embedding_count = len(embedding_rows)
+        seeded_index = json.loads(TOOL_EMBEDDING_INDEX_PATH.read_text(encoding="utf-8")) if TOOL_EMBEDDING_INDEX_PATH.is_file() else []
         if tool_count == 0 or embedding_count == 0:
             raise AssertionError("Provider tool definitions or embedding rows are missing")
         ready_count = 0
-        for model_id, model_version, tokenizer, preprocessing, dimensions, pooling, normalized, metric, status, vector in embedding_rows:
+        for source_type, model_id, model_version, tokenizer, preprocessing, dimensions, pooling, normalized, metric, status, vector in embedding_rows:
             if (model_id, model_version, tokenizer, preprocessing, dimensions, pooling, normalized, metric) != (MODEL_ID, MODEL_VERSION, TOKENIZER_ID, PREPROCESSING, DIMENSIONS, "mean", 1, "cosine"):
                 raise AssertionError("Tool embedding metadata does not match the configured model")
             if status == "ready":
@@ -52,9 +53,10 @@ def verify_database(path=DEFAULT_SEED_PATH, require_embeddings=True):
                 if any(not math.isfinite(value) for value in values) or abs(math.sqrt(sum(value * value for value in values)) - 1.0) > 0.002:
                     raise AssertionError("Ready tool embeddings must be finite and normalized")
                 ready_count += 1
-        if require_embeddings and ready_count != embedding_count:
-            raise AssertionError(f"Expected {embedding_count} ready browser-model embeddings, found {ready_count}")
-        return {"providers": len(providers), "tools": tool_count, "tool_embedding_rows": embedding_count, "ready_tool_embeddings": ready_count, "records": EXPECTED_COUNTS, "path": str(path)}
+        seeded_ready = sum(1 for record in seeded_index if connection.execute("SELECT e.status FROM embeddings e JOIN tool_retrieval_records r ON r.id=e.owner_id WHERE e.owner_type='tool_retrieval' AND r.id=? AND r.content_hash=?", (record["id"], record["contentHash"])).fetchone() == ("ready",))
+        if require_embeddings and seeded_ready != len(seeded_index):
+            raise AssertionError(f"Expected {len(seeded_index)} unchanged seeded embeddings, found {seeded_ready}")
+        return {"providers": len(providers), "tools": tool_count, "tool_embedding_rows": embedding_count, "ready_tool_embeddings": ready_count, "seeded_fixture_embeddings": seeded_ready, "pending_tool_embeddings": embedding_count - ready_count, "records": EXPECTED_COUNTS, "path": str(path)}
     finally:
         connection.close()
 
@@ -63,14 +65,13 @@ def export_tool_embeddings(source_path, output_path=Path(__file__).resolve().par
     source_path = Path(source_path).resolve()
     source = sqlite3.connect(f"file:{source_path.as_posix()}?mode=ro", uri=True)
     try:
-        rows = source.execute("SELECT owner_id,model_id,model_version,tokenizer,preprocessing,dimensions,pooling,normalized,similarity_metric,status,vector FROM embeddings WHERE namespace='tool' ORDER BY owner_id").fetchall()
-        if not rows:
-            raise AssertionError("Source database has no tool embeddings")
+        seeded_index = json.loads(TOOL_EMBEDDING_INDEX_PATH.read_text(encoding="utf-8"))
         vectors = []
-        for row in rows:
-            if row[1:9] != (MODEL_ID, MODEL_VERSION, TOKENIZER_ID, PREPROCESSING, DIMENSIONS, "mean", 1, "cosine") or row[9] != "ready" or row[10] is None or len(row[10]) != DIMENSIONS * 4:
-                raise AssertionError(f"Tool embedding is not ready or compatible: {row[0]}")
-            vectors.append(row[10])
+        for record in seeded_index:
+            row = source.execute("SELECT e.model_id,e.model_version,e.tokenizer,e.preprocessing,e.dimensions,e.pooling,e.normalized,e.similarity_metric,e.status,e.vector FROM embeddings e JOIN tool_retrieval_records r ON r.id=e.owner_id WHERE e.namespace='tool' AND e.owner_type='tool_retrieval' AND r.id=? AND r.content_hash=?", (record["id"], record["contentHash"])).fetchone()
+            if row is None or row[:8] != (MODEL_ID, MODEL_VERSION, TOKENIZER_ID, PREPROCESSING, DIMENSIONS, "mean", 1, "cosine") or row[8] != "ready" or row[9] is None or len(row[9]) != DIMENSIONS * 4:
+                raise AssertionError(f"Tool embedding is not ready or compatible: {record['id']}")
+            vectors.append(row[9])
     finally:
         source.close()
     output_path = Path(output_path)

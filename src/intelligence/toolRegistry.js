@@ -6,6 +6,17 @@ export function validateArguments(schema, value, path = '$') {
     if (!rule || typeof rule !== 'object' || Array.isArray(rule)) { errors.push(`${currentPath}: invalid schema`); return; }
     if (rule.type === 'object') {
       if (!current || typeof current !== 'object' || Array.isArray(current)) { errors.push(`${currentPath}: expected object`); return; }
+      if (Array.isArray(rule.anyOf)) {
+        const satisfied = rule.anyOf.some(branch => {
+          if (!branch.type && Array.isArray(branch.required)) return branch.required.every(key => key in current);
+          const checkpoint = errors.length;
+          visit(branch, current, currentPath);
+          const valid = errors.length === checkpoint;
+          errors.length = checkpoint;
+          return valid;
+        });
+        if (!satisfied) errors.push(`${currentPath}: no anyOf alternative matched`);
+      }
       const required = Array.isArray(rule.required) ? rule.required : [];
       for (const key of required) if (!(key in current)) errors.push(`${currentPath}.${key}: required`);
       const properties = rule.properties || {};
@@ -37,7 +48,8 @@ export function validateToolDefinition(tool) {
   if (typeof tool.providerId !== 'string' || !tool.providerId || typeof tool.name !== 'string' || !tool.name || typeof tool.description !== 'string' || !tool.description) throw new TypeError(`Tool ${tool.id} requires providerId, name, and description`);
   if (!tool.parameters || tool.parameters.type !== 'object' || typeof tool.parameters.properties !== 'object') throw new TypeError(`Tool ${tool.id} requires an object JSON Schema`);
   if (!['none', 'required'].includes(tool.confirmation)) throw new TypeError(`Tool ${tool.id} requires a supported confirmation policy`);
-  if (!Array.isArray(tool.examples) || tool.examples.some(example => typeof example !== 'string' || !example.trim())) throw new TypeError(`Tool ${tool.id} requires non-empty example utterances`);
+  if (tool.keywords !== undefined && (!Array.isArray(tool.keywords) || tool.keywords.some(keyword => typeof keyword !== 'string' || !keyword.trim()))) throw new TypeError(`Tool ${tool.id} has invalid keywords`);
+  if (!Array.isArray(tool.examples) || tool.examples.some(example => typeof example === 'string' ? !example.trim() : !example || typeof example.text !== 'string' || !example.text.trim())) throw new TypeError(`Tool ${tool.id} requires non-empty example utterances`);
   if (tool.requiredPermissions !== undefined && (!Array.isArray(tool.requiredPermissions) || tool.requiredPermissions.some(permission => typeof permission !== 'string' || !permission))) throw new TypeError(`Tool ${tool.id} has invalid required permissions`);
   return tool;
 }

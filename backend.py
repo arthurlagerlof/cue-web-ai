@@ -113,7 +113,7 @@ class Handler(BaseHTTPRequestHandler):
                 count = store_tool_embeddings(sid, data.get("entries"))
                 return self.json_response({"indexed_examples": count, "namespace": "tool"})
             if self.path == "/api/demo/tools/search":
-                return self.json_response({"results": search_tools(sid, data.get("vector"), data.get("limit", 5), data.get("threshold", 0.0))})
+                return self.json_response({"results": search_tools(sid, data.get("vector"), data.get("limit", 20), data.get("threshold", 0.0), data.get("scoring", "weighted-max"), data.get("weights"))})
             if self.path == "/api/demo/execute":
                 tool_id = data.get("toolId")
                 arguments = data.get("arguments")
