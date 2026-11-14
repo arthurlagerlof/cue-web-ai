@@ -113,13 +113,12 @@ export class BangleConnection {
       output += new TextDecoder().decode(value);
       if (output.length > 4096) output = output.slice(-4096);
       waiters = waiters.filter(waiter => {
-        if (output.includes(waiter.token)) { window.clearTimeout(waiter.timer); waiter.resolve(); return false; }
         if (/Uncaught|SyntaxError|ReferenceError|TypeError/.test(output)) { window.clearTimeout(waiter.timer); waiter.reject(new Error(output.slice(-500))); return false; }
+        if (waiter.token === '>' ? output.includes('>') : new RegExp(`(^|[\\r\\n>])\\s*${waiter.token}\\s*(?=\\r|\\n)`).test(output)) { window.clearTimeout(waiter.timer); waiter.resolve(); return false; }
         return true;
       });
     };
     tx.addEventListener('characteristicvaluechanged', onData);
-    await tx.startNotifications();
 
     const write = async (text: string) => {
       const bytes = new TextEncoder().encode(text);
@@ -130,47 +129,54 @@ export class BangleConnection {
       }
     };
     const waitFor = (token: string) => new Promise<void>((resolve, reject) => {
-      const timer = window.setTimeout(() => reject(new Error(`Timed out waiting for watch response: ${token}`)), 12000);
+      const timer = window.setTimeout(() => {
+        waiters = waiters.filter(waiter => waiter.timer !== timer);
+        reject(new Error(`Timed out waiting for watch response: ${token}`));
+      }, 12000);
       waiters.push({ token, resolve, reject, timer });
-      if (output.includes(token)) { window.clearTimeout(timer); waiters = waiters.filter(waiter => waiter.token !== token); resolve(); }
     });
     const command = async (code: string, token: string) => {
       output = '';
-      const response = waitFor(token);
-      await write(`\x10${code};print(${JSON.stringify(token)})\n`);
-      await response;
+      await Promise.all([waitFor(token), write(`\x10${code};print(${JSON.stringify(token)})\n`)]);
       output = '';
     };
 
     try {
+      await tx.startNotifications();
       onProgress('Restarting into the Espruino console…');
       output = '';
-      const prompt = waitFor('>');
-      await write('\x03\x10reset();\n');
-      await prompt;
+      await Promise.all([waitFor('>'), write('\x03\x10reset();\n')]);
       const files = [
         { name: 'cue.app.js', content: appSource },
         { name: 'cue.info', content: JSON.stringify({ id: 'cue-memory', name: 'Cue', type: 'app', src: 'cue.app.js', version: '0.1.0', files: 'cue.app.js,cue.info' }) },
       ];
       for (const file of files) {
         onProgress(`Uploading ${file.name}…`);
+        const bytes = new TextEncoder().encode(file.content);
         const chunkSize = 48;
-        for (let offset = 0; offset < file.content.length; offset += chunkSize) {
-          const part = file.content.slice(offset, offset + chunkSize);
+        for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+          const part = bytes.slice(offset, offset + chunkSize);
+          const literal = JSON.stringify(Array.from(part, byte => String.fromCharCode(byte)).join(''))
+            .replace(/[\x80-\xff]/g, character => `\\x${character.charCodeAt(0).toString(16).padStart(2, '0')}`);
           const token = `BM_${files.indexOf(file)}_${offset}`;
-          const size = offset === 0 ? `,0,${file.content.length}` : `,${offset}`;
-          await command(`require('Storage').write(${JSON.stringify(file.name)},${JSON.stringify(part)}${size})`, token);
+          const size = offset === 0 ? `,0,${bytes.length}` : `,${offset}`;
+          await command(`require('Storage').write(${JSON.stringify(file.name)},${literal}${size})`, token);
         }
-        let checksum = 0;
-        for (let index = 0; index < file.content.length; index++) checksum = (checksum + file.content.charCodeAt(index)) >>> 0;
-        await command(`var s=require('Storage').read(${JSON.stringify(file.name)}),n=0;for(var i=0;i<s.length;i++)n=(n+s.charCodeAt(i))>>>0;if(s.length!==${file.content.length}||n!==${checksum})throw new Error('File verification failed')`, `BM_VERIFY_${files.indexOf(file)}`);
+        onProgress(`Verifying ${file.name}…`);
+        const fileIndex = files.indexOf(file);
+        await command(`var s=require('Storage').read(${JSON.stringify(file.name)});if(s===undefined||s.length!==${bytes.length})throw new Error('File verification failed: size');s=undefined`, `BM_VERIFY_${fileIndex}_SIZE`);
+        const verifyChunkSize = 512;
+        for (let offset = 0; offset < bytes.length; offset += verifyChunkSize) {
+          const part = bytes.slice(offset, offset + verifyChunkSize);
+          let checksum = 0;
+          for (const byte of part) checksum = (checksum + byte) >>> 0;
+          await command(`var s=require('Storage').read(${JSON.stringify(file.name)},${offset},${part.length}),n=0;if(s===undefined||s.length!==${part.length})throw new Error('File verification failed: read');for(var i=0;i<s.length;i++)n=(n+s.charCodeAt(i))>>>0;if(n!==${checksum})throw new Error('File verification failed: checksum');s=undefined`, `BM_VERIFY_${fileIndex}_${offset}`);
+        }
       }
       onProgress('Launching app and waiting for its BLE READY signal…');
       output = '';
-      const appReady = waitFor('BM_BLE_READY');
-      await write('\x10load("cue.app.js")\n');
-      await appReady;
-      onProgress('App launched: BLE READY received. Confirm the watch displays BLE READY before sending TEST.');
+      await Promise.all([waitFor('BM_BLE_READY'), write('\x10load("cue.app.js")\n')]);
+      onProgress('App launched: BLE READY received.');
     } finally {
       waiters.forEach(waiter => { window.clearTimeout(waiter.timer); waiter.reject(new Error('Installation ended.')); });
       tx.removeEventListener('characteristicvaluechanged', onData);

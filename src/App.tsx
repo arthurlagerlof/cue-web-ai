@@ -123,15 +123,21 @@ export default function App() {
   const running = useRef(false);
   const environment = useRef<any>();
   const displayDocumentRef = useRef<any>();
+  const pendingConfirmationRef = useRef<any>();
+  const watchConfirmationRef = useRef(false);
   const pending = useRef(new Map<number, { stage: Stage; resolve: (reply: WorkerReply) => void }>());
 
   const log = (message: string) => setLogs(old => [`${new Date().toLocaleTimeString()} ${message}`, ...old].slice(0, 30));
+  const updatePendingConfirmation = (pending: any) => {
+    pendingConfirmationRef.current = pending;
+    setPendingConfirmation(pending);
+  };
   useEffect(() => {
     const unsubscribe = audio.subscribe(() => { setRecording(audio.active); setBuffer(audio.bufferedSeconds); });
     void getSession()
       .then(() => getConversationState())
       .then(state => {
-        if (state?.status === 'awaiting_confirmation' && state.pendingConfirmation?.call) setPendingConfirmation({ call: state.pendingConfirmation.call, fromWorkflow: true });
+        if (state?.status === 'awaiting_confirmation' && state.pendingConfirmation?.call) updatePendingConfirmation({ call: state.pendingConfirmation.call, fromWorkflow: true });
         if (state && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(state.status)) setPendingClarification(true);
         if (state && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice', 'awaiting_confirmation'].includes(state.status)) {
           const message = state.pendingQuestion ?? 'Continue the pending local operation.';
@@ -155,6 +161,28 @@ export default function App() {
       } catch (error) { log(error instanceof Error ? error.message : String(error)); }
     };
     watch.onAction = actionId => {
+      if (actionId === '__cue_confirm' && watchConfirmationRef.current) {
+        watchConfirmationRef.current = false;
+        if (pendingConfirmationRef.current) void confirmPendingAction(pendingConfirmationRef.current, true);
+        else log('Ignored watch confirmation without a pending action');
+        return;
+      }
+      if (actionId === '__cue_cancel' && watchConfirmationRef.current) {
+        watchConfirmationRef.current = false;
+        if (!pendingConfirmationRef.current) {
+          log('Ignored watch cancellation without a pending action');
+          return;
+        }
+        cancelPendingOperation();
+        void watch.sendDisplayDocument(createDisplayDocument({
+          id: 'cue-watch-cancelled',
+          title: 'Cancelled',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'success',
+          message: 'The pending action was cancelled.',
+        })).catch(error => log(`Could not update watch after cancellation: ${error instanceof Error ? error.message : String(error)}`));
+        return;
+      }
       const action = displayDocumentRef.current?.actions?.find((item: any) => item.id === actionId);
       if (action) void dispatchDocumentAction(action);
       else log(`Ignored unknown watch action: ${actionId}`);
@@ -237,7 +265,7 @@ export default function App() {
       },
       initialState: initialState?.status === 'idle' ? undefined : initialState,
     });
-    if (initialState?.status === 'awaiting_confirmation' && initialState.pendingConfirmation?.call) setPendingConfirmation({ call: initialState.pendingConfirmation.call, fromWorkflow: true });
+    if (initialState?.status === 'awaiting_confirmation' && initialState.pendingConfirmation?.call) updatePendingConfirmation({ call: initialState.pendingConfirmation.call, fromWorkflow: true });
     if (initialState && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(initialState.status)) setPendingClarification(true);
     log(`Loaded ${registryData.tools.length} provider-owned tools from the SQLite demo registry`);
     return environment.current;
@@ -262,7 +290,10 @@ export default function App() {
     if (!validation.valid) throw new TypeError(`Invalid display document: ${validation.errors.join('; ')}`);
     displayDocumentRef.current = document;
     setDisplayDocument(document);
-    if (watch.connected) await watch.sendDisplayDocument(document);
+    if (watch.connected) {
+      watchConfirmationRef.current = document.state === 'confirmation_required';
+      await watch.sendDisplayDocument(document);
+    }
   }
 
   async function processTranscript(text: string) {
@@ -275,7 +306,7 @@ export default function App() {
       const outcome = await runtime.intelligence.handle(clean, { context: { now: new Date(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn } });
       if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
       if (outcome.normalizationError) log(`Argument normalization failed: ${outcome.normalizationError}`);
-      if (outcome.kind !== 'confirmation_required') setPendingConfirmation(undefined);
+      if (outcome.kind !== 'confirmation_required') updatePendingConfirmation(undefined);
       if (outcome.retrieval) {
         log(`Retrieval ${outcome.retrieval.toolId}: ${outcome.retrieval.score.toFixed(3)} (description ${outcome.retrieval.bestDescriptionSimilarity?.toFixed(3) ?? '—'}, keyword ${outcome.retrieval.bestKeywordSimilarity?.toFixed(3) ?? '—'}, example ${outcome.retrieval.bestExampleSimilarity?.toFixed(3) ?? '—'}, margin ${outcome.retrieval.margin?.toFixed(3) ?? '—'})`);
         if (outcome.retrieval.providerEvidence) {
@@ -283,7 +314,7 @@ export default function App() {
         }
       }
       if (outcome.kind === 'confirmation_required') {
-        setPendingConfirmation(outcome.pendingCall ? { call: outcome.pendingCall, fromWorkflow: true } : { plan: outcome.pendingPlan, fromWorkflow: true });
+        updatePendingConfirmation(outcome.pendingCall ? { call: outcome.pendingCall, fromWorkflow: true } : { plan: outcome.pendingPlan, fromWorkflow: true });
         const targetIds = outcome.operations?.map((operation: any) => operation.toolId) ?? [outcome.toolId];
         const targets = targetIds.map((id: string) => runtime.registry.get(id)?.name ?? id).join(', ');
         const proposed = outcome.pendingCall?.arguments ? `\nProposed arguments: ${JSON.stringify(outcome.pendingCall.arguments)}` : '';
@@ -323,20 +354,45 @@ export default function App() {
     finally { setBusy(false); }
   }
 
-  async function confirmPendingAction() {
-    const pendingAction = pendingConfirmation;
+  async function confirmPendingAction(pendingActionOverride?: any, confirmedOnWatch = false) {
+    const pendingAction = pendingActionOverride ?? pendingConfirmation;
     if (!pendingAction || !environment.current) return;
     const toolNames = pendingAction.call ? [pendingAction.call.toolId] : pendingAction.plan.operations.map((operation: any) => operation.toolId);
     const labels = toolNames.map((id: string) => environment.current.registry.get(id)?.name ?? id).join(', ');
-    if (!window.confirm(`Run the following local mock action(s)? ${labels}`)) return;
+    if (!confirmedOnWatch && !window.confirm(`Run the following local mock action(s)? ${labels}`)) {
+      if (watch.connected) watchConfirmationRef.current = true;
+      return;
+    }
     setBusy(true);
+    if (watch.connected) {
+      try {
+        await watch.sendDisplayDocument(createDisplayDocument({
+          id: 'cue-confirming-action',
+          title: 'Working',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'loading',
+          message: 'Running the confirmed action.',
+        }));
+      } catch (error) { log(`Could not update watch while confirming action: ${error instanceof Error ? error.message : String(error)}`); }
+    }
     try {
       let document;
       if (pendingAction.fromWorkflow) {
         const outcome = await environment.current.intelligence.handle('yes', { confirmed: true, context: { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn } });
         if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
         if (outcome.kind === 'confirmation_required') {
-          setPendingConfirmation({ call: outcome.pendingCall, fromWorkflow: true });
+          updatePendingConfirmation({ call: outcome.pendingCall, fromWorkflow: true });
+          watchConfirmationRef.current = true;
+          if (watch.connected) {
+            await watch.sendDisplayDocument(createDisplayDocument({
+              id: 'cue-confirm-next-action',
+              title: 'Confirmation required',
+              source: { app: 'cue', name: 'Cue' },
+              state: 'confirmation_required',
+              message: 'A later step also needs your confirmation.',
+              elements: [{ type: 'text', text: 'Review the next step, then choose Confirm or Cancel.', role: 'body' }],
+            }));
+          }
           return;
         }
         if (outcome.kind !== 'document') throw new Error(outcome.text ?? outcome.question ?? 'The confirmed workflow did not complete.');
@@ -347,17 +403,30 @@ export default function App() {
           : await environment.current.dispatcher.dispatchPlan(pendingAction.plan, { confirmed: true });
         document = result.document;
       }
-      setPendingConfirmation(undefined);
+      updatePendingConfirmation(undefined);
       setPendingClarification(false);
       await showDocument(document);
       log(`Confirmed mock action completed: ${labels}`);
-    } catch (error) { log(`Confirmed action failed: ${error instanceof Error ? error.message : String(error)}`); }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`Confirmed action failed: ${message}`);
+      if (watch.connected) {
+        void watch.sendDisplayDocument(createDisplayDocument({
+          id: 'cue-confirmed-action-error',
+          title: 'Action failed',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'error',
+          message,
+        })).catch(displayError => log(`Could not display action failure on watch: ${displayError instanceof Error ? displayError.message : String(displayError)}`));
+      }
+    }
     finally { setBusy(false); }
   }
 
   function cancelPendingOperation() {
     environment.current?.intelligence.cancelPendingOperation();
-    setPendingConfirmation(undefined);
+    updatePendingConfirmation(undefined);
+    watchConfirmationRef.current = false;
     setPendingClarification(false);
     if (environment.current) void postApi('/api/demo/conversation', { state: environment.current.intelligence.getState() }).catch(error => log(`Could not persist cancellation: ${error instanceof Error ? error.message : String(error)}`));
     log('Pending operation cancelled');
@@ -372,7 +441,8 @@ export default function App() {
       environment.current = undefined;
       displayDocumentRef.current = undefined;
       setDisplayDocument(undefined);
-      setPendingConfirmation(undefined);
+      updatePendingConfirmation(undefined);
+      watchConfirmationRef.current = false;
       setPendingClarification(false);
       log('Demo session reset to the committed synthetic baseline');
     } catch (error) { log(`Demo reset failed: ${error instanceof Error ? error.message : String(error)}`); }
@@ -382,13 +452,46 @@ export default function App() {
   async function dispatchDocumentAction(action: any) {
     if (!environment.current) return;
     try {
+      if (watch.connected) {
+        await watch.sendDisplayDocument(createDisplayDocument({
+          id: 'cue-action-working',
+          title: 'Working',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'loading',
+          message: 'Running the selected action.',
+        }));
+      }
       const result = await environment.current.dispatcher.dispatch({ toolId: action.toolId, arguments: action.arguments });
       if (result.state === 'confirmation_required') {
-        setPendingConfirmation({ call: { toolId: result.toolId, arguments: result.arguments }, fromWorkflow: false });
+        const pending = { call: { toolId: result.toolId, arguments: result.arguments }, fromWorkflow: false };
+        updatePendingConfirmation(pending);
+        if (watch.connected) {
+          watchConfirmationRef.current = true;
+          await watch.sendDisplayDocument(createDisplayDocument({
+            id: 'cue-action-confirmation-required',
+            title: 'Confirmation required',
+            source: { app: 'cue', name: 'Cue' },
+            state: 'confirmation_required',
+            message: 'This mock action will not run until you confirm.',
+            elements: [{ type: 'text', text: 'Review the pending action, then choose Confirm or Cancel.', role: 'body' }],
+          }));
+        }
         return;
       }
       await showDocument(result.document);
-    } catch (error) { log(`Display action rejected: ${error instanceof Error ? error.message : String(error)}`); }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      log(`Display action rejected: ${message}`);
+      if (watch.connected) {
+        void watch.sendDisplayDocument(createDisplayDocument({
+          id: 'cue-display-action-error',
+          title: 'Action failed',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'error',
+          message,
+        })).catch(displayError => log(`Could not display action failure on watch: ${displayError instanceof Error ? displayError.message : String(displayError)}`));
+      }
+    }
   }
 
   async function submitTranscript() {
@@ -412,6 +515,15 @@ export default function App() {
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log(`Pipeline error: ${message}`); void watch.send('STATUS:ERROR');
+      if (watch.connected) {
+        void watch.sendDisplayDocument(createDisplayDocument({
+          id: 'cue-audio-pipeline-error',
+          title: 'Recording failed',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'error',
+          message,
+        })).catch(displayError => log(`Could not display recording failure on watch: ${displayError instanceof Error ? displayError.message : String(displayError)}`));
+      }
     } finally { running.current = false; setBusy(false); }
   }
 
