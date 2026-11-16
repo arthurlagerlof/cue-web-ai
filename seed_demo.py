@@ -3,12 +3,13 @@ import json
 import math
 import sqlite3
 import struct
+from datetime import datetime
 from pathlib import Path
 
 from demo_database import DEFAULT_SEED_PATH, DIMENSIONS, MODEL_ID, MODEL_VERSION, PREPROCESSING, TOKENIZER_ID, TOOL_EMBEDDING_INDEX_PATH, load_provider_manifests, seed_database
 
 EXPECTED_PROVIDERS = {provider["id"] for provider in load_provider_manifests()}
-EXPECTED_COUNTS = {"anki": 12, "knowledge": 6, "web": 3, "calendar": 5, "notifications": 3, "alarm": 2}
+EXPECTED_COUNTS = {"anki": 20, "knowledge": 20, "web": 6, "calendar": 48, "notifications": 6, "alarm": 4}
 
 
 def verify_database(path=DEFAULT_SEED_PATH, require_embeddings=True):
@@ -26,12 +27,29 @@ def verify_database(path=DEFAULT_SEED_PATH, require_embeddings=True):
             count = connection.execute("SELECT COUNT(*) FROM records WHERE provider_id=?", (provider_id,)).fetchone()[0]
             if count != expected:
                 raise AssertionError(f"Expected {expected} {provider_id} records, found {count}")
+        clock_row = connection.execute("SELECT value_json FROM settings WHERE key='demo_clock'").fetchone()
+        if not clock_row:
+            raise AssertionError("The synthetic demo clock is missing")
+        demo_clock = json.loads(clock_row[0])
+        if not isinstance(demo_clock, str):
+            raise AssertionError("The baseline demo clock must be an ISO-8601 date-time")
+        try:
+            datetime.fromisoformat(demo_clock.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise AssertionError("The baseline demo clock must be an ISO-8601 date-time") from exc
         card_rows = connection.execute("SELECT payload_json FROM records WHERE provider_id='anki' AND record_type='cards'").fetchall()
         cards = [json.loads(row[0]) for row in card_rows]
-        if not 10 <= len(cards) <= 20 or any(not str(card.get("id", "")).startswith("demo-card-") or card.get("source") != "Synthetic Cue demo collection" for card in cards):
+        if not 20 <= len(cards) <= 40 or any(not str(card.get("id", "")).startswith("demo-card-") or card.get("source") != "Synthetic Cue demo collection" for card in cards):
             raise AssertionError("Anki records are not exclusively synthetic demo cards")
         if connection.execute("SELECT COUNT(*) FROM records WHERE provider_id='anki' AND record_type='cards' AND payload_json LIKE '%legacy%' COLLATE NOCASE").fetchone()[0]:
             raise AssertionError("Legacy Anki source found in the demo baseline")
+        calendar_rows = connection.execute("SELECT record_id,payload_json FROM records WHERE provider_id='calendar' AND record_type='events'").fetchall()
+        if not 30 <= len(calendar_rows) <= 50 or any(not row[0].startswith(("event-", "demo-event-")) for row in calendar_rows):
+            raise AssertionError("Calendar events must be a bounded, fictional synthetic collection")
+        for _, payload in calendar_rows:
+            event = json.loads(payload)
+            if not all(isinstance(event.get(field), str) and event[field] for field in ("title", "start", "end")):
+                raise AssertionError("A synthetic calendar event is missing required fields")
         for provider_id in EXPECTED_PROVIDERS:
             invalid = connection.execute("SELECT COUNT(*) FROM tools WHERE provider_id=? AND id NOT LIKE ?", (provider_id, provider_id + ".%" )).fetchone()[0]
             if invalid:
@@ -56,7 +74,7 @@ def verify_database(path=DEFAULT_SEED_PATH, require_embeddings=True):
         seeded_ready = sum(1 for record in seeded_index if connection.execute("SELECT e.status FROM embeddings e JOIN tool_retrieval_records r ON r.id=e.owner_id WHERE e.owner_type='tool_retrieval' AND r.id=? AND r.content_hash=?", (record["id"], record["contentHash"])).fetchone() == ("ready",))
         if require_embeddings and seeded_ready != len(seeded_index):
             raise AssertionError(f"Expected {len(seeded_index)} unchanged seeded embeddings, found {seeded_ready}")
-        return {"providers": len(providers), "tools": tool_count, "tool_embedding_rows": embedding_count, "ready_tool_embeddings": ready_count, "seeded_fixture_embeddings": seeded_ready, "pending_tool_embeddings": embedding_count - ready_count, "records": EXPECTED_COUNTS, "path": str(path)}
+        return {"providers": len(providers), "tools": tool_count, "tool_embedding_rows": embedding_count, "ready_tool_embeddings": ready_count, "seeded_fixture_embeddings": seeded_ready, "pending_tool_embeddings": embedding_count - ready_count, "records": EXPECTED_COUNTS, "demo_clock": demo_clock, "calendar_events": len(calendar_rows), "path": str(path)}
     finally:
         connection.close()
 

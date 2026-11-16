@@ -34,6 +34,25 @@ export function splitActionClauses(request) {
   return [request.trim()];
 }
 
+export function requiresExternalPlanning(request) {
+  const text = request.toLocaleLowerCase();
+  if (splitActionClauses(request).length > 1) return 'multiple dependent actions';
+  if (/\b(?:each|every|all)\b/.test(text) && /\b(?:create|set|add|send|update|summari[sz]e|compare|prepare)\b/.test(text)) {
+    return 'collection iteration';
+  }
+  if (/\b(?:first|earliest|latest|matching|related|same|that|those|them|it)\b/.test(text)
+    && /\b(?:and|then|before|after|for|with|using)\b/.test(text)) return 'contextual result reference';
+  if (/\b(?:alarm|reminder)\b/.test(text)
+    && /\b(?:before|after|beforehand|earlier|later)\b/.test(text)
+    && !/\b\d+(?:\.\d+)?\s*(?:seconds?|minutes?|mins?|hours?|hrs?|days?)\b/.test(text)) {
+    return 'implicit event context';
+  }
+  if (/\b(?:garden work|team meeting|dentist appointment|project review|family visit|grocery shopping)\b/.test(text)
+    && /\b(?:tomorrow|today|this week|next week)\b/.test(text)
+    && /\b(?:set|create|add|prepare|find|before|after)\b/.test(text)) return 'implicit provider discovery';
+  return undefined;
+}
+
 export class ToolIntelligence {
   constructor({ registry, dispatcher, embed, examples, searchTools, searchProviderData, rerankTools, onRerankDecision, rerankMinimumScore = 0.20, rerankMargin = 0.10, normalizeArguments, argumentNormalizerEnabled = () => true, threshold = 0.55, plausibleThreshold, ambiguityMargin = 0.08, weights, scoring = 'weighted-max', topK = 5, maxOperations = 8, initialState }) {
     this.registry = registry; this.dispatcher = dispatcher; this.embed = embed; this.examples = examples; this.searchTools = searchTools;
@@ -46,6 +65,10 @@ export class ToolIntelligence {
 
   getState() {
     return this.workflow ? JSON.parse(JSON.stringify(this.workflow)) : { status: 'idle' };
+  }
+
+  requiresExternalPlanning(request) {
+    return requiresExternalPlanning(request);
   }
 
   restoreState(state) {
@@ -411,7 +434,10 @@ export class ToolIntelligence {
           workflow.pendingEntityField = entityChoice.name;
           return this.clarification(workflow, 'awaiting_entity_choice', entityChoice.reason, { entities: entityChoice.options, resolution, toolId: tool.id, retrieval: match.retrieval, completedOperations: operationResults });
         }
-        const question = clarificationForResolution(tool, resolution);
+        const detailQuestion = clarificationForResolution(tool, resolution);
+        const question = workflow.normalizationError
+          ? `I couldn't automatically prepare the arguments. ${detailQuestion} You can also ask me to try again.`
+          : detailQuestion;
         return this.clarification(workflow, 'awaiting_argument', question, { resolution, toolId: tool.id, retrieval: match.retrieval, completedOperations: operationResults, normalizationError: workflow.normalizationError });
       }
       workflow.normalizationError = undefined;

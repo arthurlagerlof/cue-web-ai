@@ -12,7 +12,6 @@ const modules = Promise.all([
   import('../src/intelligence/retrieval/benchmark.js'),
   import('../src/intelligence/retrieval/providerData.js'),
   import('../src/intelligence/argumentNormalization.js'),
-  import('../src/services/gemmaService.js'),
   import('../src/intelligence/executionPlan.js'),
 ]);
 const fixturePath = path.join(__dirname, '..', 'src', 'display', 'fixtures', 'display-documents.json');
@@ -479,7 +478,7 @@ test('end-to-end request uses registered tools and returns a validated display d
 test('semantic routing excludes generative model selection and retains clarifications', async () => {
   const runtime = await environment();
   const worker = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', 'model.worker.ts'), 'utf8');
-  assert.doesNotMatch(worker, /gemma|text-generation|resolve/i);
+  assert.doesNotMatch(worker, /text-generation|resolve/i);
   const search = await runtime.intelligence.handle('Search my Anki cards about chloroplasts');
   assert.equal(search.kind, 'document');
   const clarification = await runtime.intelligence.handle('Create a flashcard about photosynthesis');
@@ -489,6 +488,14 @@ test('semantic routing excludes generative model selection and retains clarifica
   assert.equal(continued.kind, 'confirmation_required');
   assert.equal(continued.pendingCall.toolId, 'anki.create_card');
   assert.deepEqual(continued.pendingCall.arguments, { front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.' });
+});
+
+test('request-level routing escalates multi-step, collection, and implicit-context intents but keeps simple requests local', async () => {
+  const { requiresExternalPlanning } = await import('../src/intelligence/toolIntelligence.js');
+  assert.equal(requiresExternalPlanning('Set an alarm for 7:00 tomorrow'), undefined);
+  assert.equal(requiresExternalPlanning('Find my first meeting today and set an alarm 15 minutes beforehand'), 'multiple dependent actions');
+  assert.equal(requiresExternalPlanning('What events do I have today? Create an alarm at the start time of each event'), 'collection iteration');
+  assert.equal(requiresExternalPlanning('Set an alarm before the garden work tomorrow'), 'implicit event context');
 });
 
 test('clarification survives runtime reconstruction and short choices resume the original request', async () => {
@@ -592,161 +599,7 @@ test('argument normalization is conditional, schema-checked, retried once, and n
   }), { tool: calendarTool }), /explicit timezone|tool schema/);
 });
 
-test('hosted argument normalization uses Gemma only after failure or invalid output', async () => {
-  const [, , , , , , , normalization] = await modules;
-  const tool = manifests.find(item => item.id === 'anki.create_card');
-  const input = { tool, request: 'Create a flashcard about photosynthesis', deterministicArguments: {} };
-  const response = JSON.stringify({
-    status: 'resolved', arguments: { front: 'Question?', back: 'Answer.' }, missing: [], ambiguous: [],
-    provenance: { front: 'model_generated', back: 'model_generated' },
-  });
-
-  test('local-first normalization uses Dots 3 only when automatic mode permits fallback', async () => {
-    const normalizer = await import('../src/intelligence/argumentNormalization.js');
-    const tool = manifests.find(item => item.id === 'anki.create_card');
-    const input = {
-      originalRequest: 'Create a flashcard about photosynthesis',
-      request: 'Create a flashcard about photosynthesis',
-      tool,
-      deterministicArguments: {},
-      missing: ['front', 'back'],
-      ambiguous: [],
-      providerEvidence: [],
-    };
-    const validOutput = JSON.stringify({
-      status: 'resolved',
-      arguments: { front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.' },
-      missing: [],
-      ambiguous: [],
-      provenance: { front: 'model_generated', back: 'model_generated' },
-    });
-    let externalCalls = 0;
-    const localResult = await normalizer.normalizeArgumentsLocalFirst(input, {
-      local: async () => validOutput,
-      external: async () => { externalCalls++; return validOutput; },
-      allowExternal: true,
-    });
-    assert.equal(localResult.model, 'gemma-4-e2b');
-    assert.equal(externalCalls, 0);
-
-    const automaticResult = await normalizer.normalizeArgumentsLocalFirst(input, {
-      local: async () => { throw new Error('local model unavailable'); },
-      external: async () => { externalCalls++; return validOutput; },
-      allowExternal: true,
-    });
-    assert.equal(automaticResult.model, 'openrouter-dots3-note');
-    assert.equal(externalCalls, 1);
-    await assert.rejects(normalizer.normalizeArgumentsLocalFirst(input, {
-      local: async () => { throw new Error('local model unavailable'); },
-      external: async () => { externalCalls++; return validOutput; },
-      allowExternal: false,
-    }), /local model unavailable/);
-    assert.equal(externalCalls, 1);
-  });
-  let localCalls = 0;
-  let fallbackReason;
-  const fallback = async () => { localCalls++; return response; };
-  const primary = await normalization.normalizeArgumentsWithFallback(input, { primary: async () => response, fallback });
-  assert.equal(primary.model, 'openrouter-dots3-note');
-  assert.equal(localCalls, 0);
-  const result = await normalization.normalizeArgumentsWithFallback(input, {
-    primary: async () => 'invalid json', fallback, onFallback: reason => { fallbackReason = reason; },
-  });
-  assert.equal(result.model, 'gemma-4-e2b');
-  assert.match(fallbackReason, /valid JSON/);
-  assert.equal(localCalls, 1);
-  await assert.rejects(normalization.normalizeArgumentsWithFallback(input, {
-    primary: async () => { throw new Error('HTTP 429'); },
-    fallback: async () => { throw new Error('GPU unavailable'); },
-  }), /HTTP 429.*GPU unavailable/);
-});
-
-test('Gemma hardware gate and service lifecycle use mocks without loading model weights', async () => {
-  const [, , , , , , , , gemma] = await modules;
-  const baseNavigator = {
-    deviceMemory: 8,
-    hardwareConcurrency: 8,
-    userAgent: 'Desktop Chromium',
-    gpu: { requestAdapter: async () => ({
-      limits: { maxBufferSize: 1, maxStorageBufferBindingSize: 1 },
-      requestDevice: async () => ({ limits: {}, destroy() {} }),
-    }) },
-  };
-  assert.equal((await gemma.detectGemmaEligibility({ ...baseNavigator, gpu: undefined })).status, 'unsupported');
-  assert.equal((await gemma.detectGemmaEligibility({ ...baseNavigator, deviceMemory: 4 })).status, 'ineligible');
-  assert.equal((await gemma.detectGemmaEligibility({ ...baseNavigator, deviceMemory: undefined })).status, 'ineligible');
-  assert.equal((await gemma.detectGemmaEligibility({ ...baseNavigator, hardwareConcurrency: 4 })).status, 'ineligible');
-  assert.equal((await gemma.detectGemmaEligibility({ ...baseNavigator, userAgent: 'Android mobile' })).status, 'ineligible');
-  assert.equal((await gemma.detectGemmaEligibility({ ...baseNavigator, gpu: { requestAdapter: async () => { throw new Error('adapter failed'); } } })).status, 'ineligible');
-  assert.equal((await gemma.detectGemmaEligibility({ ...baseNavigator, gpu: { requestAdapter: async () => null } })).status, 'ineligible');
-  assert.equal((await gemma.detectGemmaEligibility({ ...baseNavigator, gpu: { requestAdapter: async () => ({ limits: {} }) } })).status, 'ineligible');
-  assert.equal((await gemma.detectGemmaEligibility(baseNavigator)).status, 'eligible');
-
-  let initialized = 0;
-  const states = [];
-  const service = gemma.createGemmaService({
-    detectEligibility: async () => ({ status: 'eligible', reason: 'mock eligible' }),
-    runtimeFactory: onStatus => ({
-      async initialize() { initialized++; onStatus('loading', { loaded: 1 }); },
-      async generate(_prompt, onProgress) { onProgress({ generatedCharacters: 3 }); return '{"status":"resolved"}'; },
-      cancel() {},
-      dispose() {},
-    }),
-    onState: state => states.push(state.status),
-  });
-  assert.equal((await service.preload()).status, 'ready');
-  await service.preload();
-  assert.equal(initialized, 1);
-  assert.equal(await service.generate('mock prompt'), '{"status":"resolved"}');
-  assert.ok(states.includes('downloading'));
-  assert.ok(states.includes('loading'));
-  service.dispose();
-  assert.equal(service.getState().status, 'disabled');
-
-  let forbiddenInitialization = 0;
-  const ineligible = gemma.createGemmaService({
-    detectEligibility: async () => ({ status: 'ineligible', reason: 'low memory' }),
-    runtimeFactory: () => { forbiddenInitialization++; throw new Error('must not initialize'); },
-  });
-  assert.equal((await ineligible.preload()).status, 'ineligible');
-  assert.equal((await ineligible.preload()).status, 'ineligible');
-  assert.equal(forbiddenInitialization, 0);
-
-  const failedInitialization = gemma.createGemmaService({
-    detectEligibility: async () => ({ status: 'eligible', reason: 'mock eligible' }),
-    runtimeFactory: () => ({ initialize: async () => { throw new Error('mock initialization failed'); }, generate: async () => '', cancel() {}, dispose() {} }),
-  });
-  assert.equal((await failedInitialization.preload()).status, 'error');
-  await assert.rejects(failedInitialization.generate('prompt'), /not ready/);
-
-  const timeoutService = gemma.createGemmaService({
-    detectEligibility: async () => ({ status: 'eligible', reason: 'mock eligible' }),
-    runtimeFactory: () => ({ initialize: async () => {}, generate: async () => new Promise(() => {}), cancel() {}, dispose() {} }),
-  });
-  await timeoutService.preload();
-  await assert.rejects(timeoutService.generate('prompt', { timeoutMs: 5 }), /timed out/);
-  assert.equal(timeoutService.getState().status, 'error');
-
-  let disabledInitialization = 0;
-  const disabled = gemma.createGemmaService({
-    detectEligibility: async () => ({ status: 'eligible', reason: 'mock eligible' }),
-    runtimeFactory: () => { disabledInitialization++; throw new Error('disabled model must not initialize'); },
-  });
-  assert.equal((await disabled.preload({ enabled: false })).status, 'disabled');
-  assert.equal(disabledInitialization, 0);
-});
-
-test('MediaPipe GenAI worker fileset uses the ES module WASM loader', async () => {
-  const { FilesetResolver } = await import('@mediapipe/tasks-genai');
-  const fileset = await FilesetResolver.forGenAiTasks(
-    'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-genai@0.10.30/wasm',
-    true,
-  );
-  assert.match(fileset.wasmLoaderPath, /genai_wasm_module_internal\.js$/);
-  assert.match(fileset.wasmBinaryPath, /genai_wasm_module_internal\.wasm$/);
-});
-
-test('mock Gemma normalization is invoked only for suitable Anki generation requests', async () => {
+test('model-assisted argument normalization is invoked only for suitable Anki generation requests', async () => {
   let calls = 0;
   const runtime = await environment({
     normalizeArguments: async () => {
@@ -766,7 +619,7 @@ test('mock Gemma normalization is invoked only for suitable Anki generation requ
   assert.equal(natural.pendingCall.arguments.front, 'What is photosynthesis?');
   assert.equal(natural.resolution.fields.front.source, 'model_generated');
   const explicitRuntime = await environment({
-    normalizeArguments: async () => { calls++; throw new Error('Deterministic parsing should skip Gemma'); },
+    normalizeArguments: async () => { calls++; throw new Error('Deterministic parsing should skip model normalization'); },
   });
   const explicit = await explicitRuntime.intelligence.handle('Create a card with front: What is photosynthesis? back: Plants convert light into chemical energy.');
   assert.equal(explicit.kind, 'confirmation_required');
@@ -780,6 +633,36 @@ test('mock Gemma normalization is invoked only for suitable Anki generation requ
   assert.equal(disabled.kind, 'clarification');
   assert.equal(calls, 1);
   assert.equal(disabled.normalizationError, undefined);
+});
+
+test('Anki clarification continues the original generation request after an incomplete model response', async () => {
+  const prompts = [];
+  const runtime = await environment({
+    searchTools: async () => [{ toolId: 'anki.create_card', score: 0.9, bestDescriptionSimilarity: 0.9, bestKeywordSimilarity: 0.9, bestExampleSimilarity: 0.9, margin: 0.2 }],
+    normalizeArguments: async prompt => {
+      prompts.push(prompt);
+      if (prompts.length === 1) throw new Error('OpenRouter returned an empty response after one retry.');
+      return JSON.stringify({
+        status: 'resolved',
+        arguments: { front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.' },
+        missing: [], ambiguous: [],
+        provenance: { front: 'model_generated', back: 'model_generated' },
+      });
+    },
+  });
+  const first = await runtime.intelligence.handle('Create an Anki card about photosynthesis');
+  assert.equal(first.kind, 'clarification');
+  assert.equal(prompts.length, 1, JSON.stringify(first));
+  assert.match(first.normalizationError, /empty/);
+  assert.match(first.question, /couldn't automatically prepare/);
+  const answer = 'Invent the front and back based on a logical basic question about photosynthesis';
+  const continued = await runtime.intelligence.handle(answer);
+  assert.equal(continued.kind, 'confirmation_required', JSON.stringify(continued));
+  assert.equal(continued.pendingCall.arguments.front, 'What is photosynthesis?');
+  assert.equal(continued.pendingCall.arguments.back, 'Plants convert light into chemical energy.');
+  assert.match(prompts[1], /Create an Anki card about photosynthesis/);
+  assert.ok(prompts[1].includes(answer));
+  assert.equal(continued.normalizationError, undefined);
 });
 
 test('deterministic argument parsing supports Finnish dates, time zones, DST ambiguity, and corrections', async () => {
@@ -886,6 +769,45 @@ test('side effects require confirmation, and invalid or unknown calls are reject
   await assert.rejects(restricted.dispatcher.dispatch({ toolId: 'alarm.permission_test', arguments: {} }), /lacks execution permission/);
 });
 
+test('malformed interpolation is rejected before any plan operation or confirmation', async () => {
+  const runtime = await environment();
+  const calendar = runtime.registry.getProvider('calendar');
+  const alarm = runtime.registry.getProvider('alarm');
+  let executions = 0;
+  for (const provider of [calendar, alarm]) {
+    const execute = provider.execute;
+    provider.execute = async (...args) => { executions++; return execute(...args); };
+  }
+  const plan = {
+    schema: 'cue.execution-plan', version: 1, id: 'invalid-interpolation', conversationId: 'invalid-interpolation',
+    originalRequest: 'Set an alarm for the event', status: 'ready',
+    operations: [
+      { id: 'events', toolId: 'calendar.find_events', purpose: 'Find events', arguments: { date: '2026-11-15' }, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false },
+      { id: 'alarm', toolId: 'alarm.create', purpose: 'Create alarm', arguments: { label: '${events[0].title}', time: '${events[0].start}' }, dependsOn: ['events'], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: true },
+    ],
+  };
+  await assert.rejects(() => runtime.dispatcher.dispatchPlan(plan), /interpolation|ISO date-time/);
+  assert.equal(executions, 0);
+});
+
+test('invalid resolved dates are rejected before confirmation', async () => {
+  const runtime = await environment();
+  const calendar = runtime.registry.getProvider('calendar');
+  calendar.execute = async () => ({
+    document: sampleDocument('calendar', 'Calendar events', 'Invalid event'),
+    data: { firstEvent: { start: 'not-a-date' } },
+  });
+  const plan = {
+    schema: 'cue.execution-plan', version: 1, id: 'invalid-bound-date', conversationId: 'invalid-bound-date',
+    originalRequest: 'Set an alarm for the event', status: 'ready',
+    operations: [
+      { id: 'events', toolId: 'calendar.find_events', purpose: 'Find events', arguments: { date: '2026-11-15' }, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false },
+      { id: 'alarm', toolId: 'alarm.create', purpose: 'Create alarm', arguments: { label: 'Event' }, dependsOn: ['events'], inputBindings: [{ targetArgument: 'time', sourceOperation: 'events', sourcePointer: '/firstEvent/start' }], conditions: [], status: 'pending', requiresConfirmation: true },
+    ],
+  };
+  await assert.rejects(() => runtime.dispatcher.dispatchPlan(plan), /expected an ISO date-time/);
+});
+
 test('multi-tool plan uses a returned event time before creating the dependent alarm', async () => {
   const runtime = await environment();
   const plan = {
@@ -915,6 +837,175 @@ test('multi-tool plan uses a returned event time before creating the dependent a
   assert.equal(result.document.id, 'alarm-success');
   assert.equal(result.plan.status, 'completed');
   assert.ok(JSON.stringify(result.document).includes('2026-11-14T07:15:00.000Z'));
+});
+
+test('execution plans fan out over validated collection items with per-item confirmation and bounded expansion', async () => {
+  const runtime = await environment();
+  const alarmCalls = [];
+  const alarmProvider = runtime.registry.getProvider('alarm');
+  const executeAlarm = alarmProvider.execute;
+  alarmProvider.execute = async (toolId, args, context) => {
+    if (toolId === 'alarm.create') alarmCalls.push({ ...args, operationId: context.operationId });
+    return executeAlarm(toolId, args, context);
+  };
+  const makePlan = (id, date = '2026-11-15') => ({
+    schema: 'cue.execution-plan', version: 1, id, conversationId: `conversation-${id}`,
+    originalRequest: 'Create an alarm at the start time of each event',
+    status: 'ready',
+    operations: [
+      { id: 'events', toolId: 'calendar.find_events', purpose: 'Find events', arguments: { date }, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false },
+      {
+        id: 'alarms', toolId: 'alarm.create', purpose: 'Create an alarm for every event',
+        arguments: {}, dependsOn: ['events'], inputBindings: [], conditions: [],
+        forEach: {
+          sourceOperation: 'events',
+          sourcePointer: '/events',
+          bindings: [
+            { targetArgument: 'label', sourcePointer: '/title' },
+            { targetArgument: 'time', sourcePointer: '/start' },
+          ],
+        },
+        status: 'pending', requiresConfirmation: true,
+      },
+    ],
+  });
+
+  let outcome = await runtime.dispatcher.dispatchPlan(makePlan('plan-event-fanout'));
+  assert.equal(outcome.state, 'confirmation_required');
+  assert.equal(alarmCalls.length, 0);
+  assert.deepEqual(outcome.pendingConfirmation.arguments, {
+    label: 'Lunch break', time: '2026-11-15T08:00:00+02:00',
+  });
+  const firstOperationId = outcome.pendingConfirmation.operationId;
+  outcome = await runtime.dispatcher.dispatchPlan(outcome.plan, {
+    confirmed: true, confirmedOperationId: firstOperationId, executionState: outcome.executionState,
+  });
+  assert.equal(outcome.state, 'confirmation_required');
+  assert.equal(alarmCalls.length, 1);
+  const secondOperationId = outcome.pendingConfirmation.operationId;
+  outcome = await runtime.dispatcher.dispatchPlan(outcome.plan, {
+    confirmed: true, confirmedOperationId: secondOperationId, executionState: outcome.executionState,
+  });
+  assert.equal(outcome.state, 'completed');
+  assert.deepEqual(alarmCalls.map(({ label, time }) => [label, time]), [
+    ['Lunch break', '2026-11-15T08:00:00+02:00'],
+    ['Project sync meeting', '2026-11-15T10:00:00+02:00'],
+  ]);
+  assert.equal(new Set(alarmCalls.map(call => call.operationId)).size, 2);
+  assert.equal(outcome.results.alarms.length, 2);
+
+  const empty = await runtime.dispatcher.dispatchPlan(makePlan('plan-empty-fanout', '2026-11-16'));
+  assert.equal(empty.state, 'completed');
+  assert.deepEqual(empty.results.alarms, []);
+  assert.equal(alarmCalls.length, 2);
+
+  let cancelled = await runtime.dispatcher.dispatchPlan(makePlan('plan-cancelled-fanout'));
+  cancelled = await runtime.dispatcher.dispatchPlan(cancelled.plan, {
+    confirmed: true,
+    confirmedOperationId: cancelled.pendingConfirmation.operationId,
+    executionState: cancelled.executionState,
+  });
+  assert.equal(cancelled.state, 'confirmation_required');
+  const cancelledState = structuredClone(cancelled.executionState);
+  cancelledState.plan.status = 'cancelled';
+  cancelledState.plan.operations.find(operation => operation.id === cancelledState.pendingConfirmation.operationId).status = 'skipped';
+  cancelledState.pendingConfirmation = undefined;
+  const cancellation = await runtime.dispatcher.dispatchPlan(cancelledState.plan, { executionState: cancelledState });
+  assert.equal(cancellation.state, 'cancelled');
+  assert.equal(alarmCalls.length, 3);
+
+  const calendarProvider = runtime.registry.getProvider('calendar');
+  const executeCalendar = calendarProvider.execute;
+  calendarProvider.execute = async (toolId, args, context) => {
+    if (toolId !== 'calendar.find_events') return executeCalendar(toolId, args, context);
+    const events = Array.from({ length: 8 }, (_, index) => ({
+      id: `item-${index}`, title: `Event ${index}`, start: `2026-11-17T${String(index + 8).padStart(2, '0')}:00:00+02:00`,
+    }));
+    return { document: sampleDocument('calendar', 'Calendar events', 'Eight events'), data: { events } };
+  };
+  const limited = await runtime.dispatcher.dispatchPlan(makePlan('plan-limited-fanout'));
+  assert.equal(limited.state, 'operation_limit');
+  assert.match(limited.question, /above the 8-operation limit/);
+  assert.equal(alarmCalls.length, 3);
+});
+
+test('a newly registered provider tool composes with existing tools through declared result bindings', async () => {
+  const mock = await import('../src/demo/mockProviders.js');
+  const tool = {
+    id: 'test_catalog.lookup_record',
+    providerId: 'test_catalog',
+    name: 'Look up a test record',
+    description: 'Return one synthetic test record with a label and start time.',
+    examples: ['Look up a test record'],
+    keywords: ['test record lookup'],
+    parameters: { type: 'object', properties: { query: { type: 'string', minLength: 1 } }, required: ['query'], additionalProperties: false },
+    resultSchema: { type: 'object', properties: { record: { type: 'object', properties: { title: { type: 'string' }, start: { type: 'string' } } } } },
+    confirmation: 'none',
+  };
+  let lookupCount = 0;
+  const provider = {
+    id: 'test_catalog',
+    execute: async () => {
+      lookupCount++;
+      return {
+        document: sampleDocument('test_catalog', 'Synthetic record', 'Ready'),
+        data: { record: { title: 'Test appointment', start: '2026-11-17T10:00:00+02:00' } },
+      };
+    },
+  };
+  const runtime = await mock.createMockEnvironment({
+    manifests: [...manifests, tool],
+    providers: [...testProviders(), provider],
+    embed: async text => fakeEmbed(text),
+  });
+  const plan = {
+    schema: 'cue.execution-plan', version: 1, id: 'plan-unfamiliar-tool', conversationId: 'conversation-unfamiliar-tool',
+    originalRequest: 'Look up the appointment and set an alarm',
+    status: 'ready',
+    operations: [
+      { id: 'lookup', toolId: tool.id, purpose: 'Look up the appointment', arguments: { query: 'appointment' }, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false },
+      {
+        id: 'alarm', toolId: 'alarm.create', purpose: 'Set an alarm',
+        arguments: {}, dependsOn: ['lookup'],
+        inputBindings: [
+          { targetArgument: 'label', sourceOperation: 'lookup', sourcePointer: '/record/title' },
+          { targetArgument: 'time', sourceOperation: 'lookup', sourcePointer: '/record/start' },
+        ],
+        conditions: [], status: 'pending', requiresConfirmation: true,
+      },
+    ],
+  };
+  const pending = await runtime.dispatcher.dispatchPlan(plan);
+  assert.equal(lookupCount, 1);
+  assert.equal(pending.pendingConfirmation.toolId, 'alarm.create');
+  assert.deepEqual(pending.pendingConfirmation.arguments, {
+    label: 'Test appointment', time: '2026-11-17T10:00:00+02:00',
+  });
+});
+
+test('all static plan arguments validate before the dispatcher can begin side effects', async () => {
+  const runtime = await environment();
+  let sideEffects = 0;
+  const alarmProvider = runtime.registry.getProvider('alarm');
+  alarmProvider.execute = async () => { sideEffects++; return sampleDocument('alarm', 'Alarm', 'Created', 'success'); };
+  const plan = {
+    schema: 'cue.execution-plan', version: 1, id: 'plan-invalid-later-arguments', conversationId: 'conversation-invalid-later-arguments',
+    originalRequest: 'Create an alarm and a card', status: 'ready',
+    operations: [
+      {
+        id: 'alarm', toolId: 'alarm.create', purpose: 'Create an alarm',
+        arguments: { time: '2026-11-17T09:00:00+02:00', label: 'Meeting' },
+        dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: true,
+      },
+      {
+        id: 'card', toolId: 'anki.create_card', purpose: 'Create a card',
+        arguments: { front: 5, back: 'A synthetic answer' },
+        dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: true,
+      },
+    ],
+  };
+  await assert.rejects(runtime.dispatcher.dispatchPlan(plan), /Invalid execution plan/);
+  assert.equal(sideEffects, 0);
 });
 
 test('execution plans validate bindings, deterministic transforms, conditions, and operation limits', async () => {
@@ -956,20 +1047,34 @@ test('execution controller skips a dependent operation when its source value is 
 
 test('execution controller persists failed status when bound arguments are invalid', async () => {
   const runtime = await environment();
+  const calendarProvider = runtime.registry.getProvider('calendar');
+  calendarProvider.execute = async () => ({
+    document: sampleDocument('calendar', 'Malformed result', 'A malformed synthetic start time'),
+    data: { events: [], firstEvent: { start: 42 } },
+  });
   const plan = {
     schema: 'cue.execution-plan', version: 1, id: 'plan-invalid-arguments', conversationId: 'conversation-invalid-arguments',
     originalRequest: 'Find my calendar events', status: 'ready',
-    operations: [{
-      id: 'events', toolId: 'calendar.find_events', purpose: 'Find calendar events',
-      arguments: {}, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false,
-    }],
+    operations: [
+      {
+        id: 'events', toolId: 'calendar.find_events', purpose: 'Find calendar events',
+        arguments: { date: '2026-11-14' }, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false,
+      },
+      {
+        id: 'alarm', toolId: 'alarm.create', purpose: 'Create a reminder alarm',
+        arguments: { label: 'Reminder' }, dependsOn: ['events'],
+        inputBindings: [{ targetArgument: 'time', sourceOperation: 'events', sourcePointer: '/firstEvent/start' }],
+        conditions: [], status: 'pending', requiresConfirmation: true,
+      },
+    ],
   };
   const savedStates = [];
   await assert.rejects(runtime.dispatcher.dispatchPlan(plan, {
     onStateChange: state => savedStates.push(state),
   }), /Invalid bound arguments/);
   assert.equal(savedStates.at(-1).plan.status, 'failed');
-  assert.equal(savedStates.at(-1).plan.operations[0].status, 'failed');
+  assert.equal(savedStates.at(-1).plan.operations[0].status, 'succeeded');
+  assert.equal(savedStates.at(-1).plan.operations[1].status, 'failed');
 });
 
 test('mock providers cover empty, error, image, and independent knowledge retrieval', async () => {

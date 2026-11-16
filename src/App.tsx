@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from 'react';
 import { RollingAudio } from './services/audio';
 import { BangleConnection } from './services/bluetooth';
 import { ASR_MODELS, type ASRModelSize } from './services/asrModels';
-import { createGemmaService } from './services/gemmaService.js';
 import { createDisplayDocument, validateDisplayDocument } from './display/document.js';
 import { DisplayDocumentView } from './display/DisplayDocumentView';
 import { createDatabaseEnvironment } from './demo/databaseEnvironment.js';
@@ -17,6 +16,7 @@ type PlanExecutionState = {
   pendingConfirmation?: { operationId: string; toolId: string; arguments: Record<string, unknown> };
   results: Record<string, unknown>;
   documents: Record<string, unknown>;
+  reasoningHistory?: Array<{ question: string; answer: string }>;
 };
 const workers = new Map<Stage, Worker>();
 function createWorker(stage: Stage) {
@@ -74,6 +74,12 @@ async function getConversationState() {
 
 function interactionIdForState(state: any) {
   return `${state.conversationId}:${state.status}:${state.currentIndex ?? 0}`;
+}
+
+function clockForRuntime(runtime: any) {
+  const now = runtime.demoClock ? new Date(runtime.demoClock) : new Date();
+  if (Number.isNaN(now.getTime())) throw new TypeError('The configured demo clock is invalid.');
+  return now;
 }
 
 function createClarificationDocument(state: any, message: string) {
@@ -144,8 +150,6 @@ export default function App() {
     try { return window.localStorage.getItem('cue.calendar.weekStartsOn') === '0' ? 0 : 1; }
     catch { return 1; }
   });
-  const [gemmaState, setGemmaState] = useState<{ status: string; progress?: { reason?: string; message?: string; generatedCharacters?: number } }>({ status: 'not_checked' });
-  const [gemmaService] = useState(() => createGemmaService({ onState: state => setGemmaState(state) }));
   const [transcription, setTranscription] = useState('');
   const [embedding, setEmbedding] = useState<any>();
   const [logs, setLogs] = useState<string[]>([]);
@@ -241,7 +245,7 @@ export default function App() {
     };
     watch.onStatus = message => { setWatchName('Not connected'); log(message); };
     watch.onDiagnostic = message => log(`BLE: ${message}`);
-    return () => { unsubscribe(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); gemmaService.dispose(); watch.disconnect(); audio.stop(); };
+    return () => { unsubscribe(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); watch.disconnect(); audio.stop(); };
   }, []);
 
   function setAiPreference(mode: AiMode) {
@@ -308,20 +312,11 @@ export default function App() {
       registryData,
       embed,
       postApi,
-      argumentNormalizerEnabled: () => true,
-      reasoningMode: () => aiModeRef.current,
+      argumentNormalizerEnabled: () => aiModeRef.current === 'automatic',
       normalizeArguments: async (prompt: string) => {
         const result = await postApi('/api/demo/normalize', { prompt });
         if (typeof result.text !== 'string' || !result.text.trim()) throw new Error('OpenRouter returned an empty response.');
         return result.text;
-      },
-      onNormalizerFallback: (reason: string) => log(`OpenRouter normalizer unavailable or invalid: ${reason}. Trying local Gemma fallback.`),
-      fallbackNormalizeArguments: async (prompt: string) => {
-        const state = await gemmaService.preload();
-        if (state.status !== 'ready') {
-          throw new Error(state.progress?.message ?? state.progress?.reason ?? `Gemma is unavailable (${state.status}).`);
-        }
-        return gemmaService.generate(prompt);
       },
       rerankTools,
       onRerankDecision: (decision: RerankDecision) => log(`Cross-encoder decision: top ${decision.topScore}, second ${decision.secondScore ?? 'none'}, margin ${decision.margin ?? 'n/a'}; score >= ${decision.minimumScore}: ${decision.scorePassed ? 'pass' : 'fail'}; margin >= ${decision.minimumMargin}: ${decision.margin === null ? 'not applicable' : decision.marginPassed ? 'pass' : 'fail'}; ${decision.decision}`),
@@ -361,11 +356,22 @@ export default function App() {
     }
   }
 
-  async function processDots3Request(request: string, runtime: any, context: any) {
-    const embedded = await runtime.intelligence.embed(request);
-    const vector = Array.isArray(embedded) ? embedded : embedded.vector;
-    const response = await postApi('/api/demo/reason', { request, context, vector });
+  async function processDots3Request(request: string, runtime: any, context: any, resumedExecutionState?: any) {
+    let response;
+    if (resumedExecutionState) {
+      response = { kind: 'plan', plan: resumedExecutionState.plan };
+      log('Resuming the saved execution plan');
+    } else {
+      const previous = await getConversationState();
+      const searchText = previous?.pendingReasoning && previous.originalRequest
+        ? `${previous.originalRequest}\n${request}` : request;
+      const embedded = await runtime.intelligence.embed(searchText);
+      const vector = Array.isArray(embedded) ? embedded : embedded.vector;
+      log('External planning started with the currently registered tool catalog');
+      response = await postApi('/api/demo/reason', { request, context, vector });
+    }
     if (response.kind === 'clarification') {
+      log('External planner requested clarification');
       updatePendingConfirmation(undefined);
       await postApi('/api/demo/conversation', { state: response.state });
       setPendingClarification(true);
@@ -380,6 +386,7 @@ export default function App() {
       return;
     }
     if (response.kind === 'no_tool') {
+      log('External planner found no registered tool for the request');
       updatePendingConfirmation(undefined);
       setPendingClarification(false);
       await showDocument(createDisplayDocument({
@@ -393,23 +400,68 @@ export default function App() {
       return;
     }
     if (response.kind !== 'plan' || !response.plan) throw new TypeError('Dots 3 returned an unsupported reasoning outcome.');
+    for (const operation of response.plan.operations) {
+      log(`Validated plan proposal: ${operation.toolId}; dependencies=${operation.dependsOn.length}; bindings=${operation.inputBindings.length}; fan-out=${Boolean(operation.forEach)}`);
+    }
 
+    const reasoningHistory = response.reasoningHistory ?? resumedExecutionState?.reasoningHistory ?? [];
+    const fanOutProgress = new Map<string, string>();
     const saveExecutionState = async (executionState: any) => {
+      executionState.reasoningHistory = reasoningHistory;
+      for (const [templateId, iteration] of Object.entries(executionState.iterations ?? {}) as Array<[string, any]>) {
+        const completed = iteration.children.filter((id: string) => executionState.plan.operations.find((operation: any) => operation.id === id)?.status === 'succeeded').length;
+        const progress = `${completed}/${iteration.children.length}`;
+        if (fanOutProgress.get(templateId) !== progress) {
+          log(`Fan-out ${templateId}: ${progress} item operations completed`);
+          fanOutProgress.set(templateId, progress);
+        }
+      }
       const state = executionState.plan.status === 'waiting_for_confirmation' ? 'awaiting_confirmation'
         : executionState.plan.status === 'completed' ? 'completed'
-          : executionState.plan.status === 'failed' ? 'failed' : 'executing';
+          : executionState.plan.status === 'failed' ? 'failed'
+            : executionState.plan.status === 'waiting_for_input' ? 'awaiting_argument' : 'executing';
       await postApi('/api/demo/conversation', {
         state: {
           conversationId: executionState.plan.conversationId,
           status: state,
           originalRequest: executionState.plan.originalRequest,
-          pendingQuestion: executionState.pendingConfirmation ? `Confirm ${executionState.pendingConfirmation.toolId}?` : undefined,
+          reasoningHistory: executionState.reasoningHistory,
+          pendingReasoning: state === 'awaiting_argument',
+          pendingQuestion: executionState.pendingConfirmation
+            ? `Confirm ${executionState.pendingConfirmation.toolId}?`
+            : executionState.pendingQuestion,
           executionState,
         },
       });
     };
-    const outcome = await runtime.dispatcher.dispatchPlan(response.plan, { onStateChange: saveExecutionState });
+    const outcome = await runtime.dispatcher.dispatchPlan(response.plan, { executionState: resumedExecutionState, onStateChange: saveExecutionState });
+    outcome.executionState.reasoningHistory = reasoningHistory;
+    if (outcome.state === 'operation_limit') {
+      await postApi('/api/demo/conversation', {
+        state: {
+          conversationId: outcome.plan.conversationId,
+          status: 'awaiting_argument',
+          originalRequest: outcome.plan.originalRequest,
+          reasoningHistory: outcome.executionState.reasoningHistory,
+          pendingReasoning: true,
+          pendingQuestion: outcome.question,
+          executionState: outcome.executionState,
+        },
+      });
+      setPendingClarification(true);
+      updatePendingConfirmation(undefined);
+      await showDocument(createDisplayDocument({
+        id: 'cue-plan-operation-limit',
+        title: 'Narrow the request',
+        source: { app: 'cue', name: 'Cue' },
+        state: 'clarification_required',
+        message: outcome.question,
+        elements: [{ type: 'text', text: outcome.question, role: 'body' }],
+      }));
+      return;
+    }
     if (outcome.state === 'confirmation_required') {
+      log(`Confirmation required for ${outcome.pendingConfirmation.toolId}`);
       updatePendingConfirmation({ plan: outcome.plan, executionState: outcome.executionState, externalPlan: true });
       setPendingClarification(false);
       const pending = outcome.pendingConfirmation;
@@ -431,6 +483,7 @@ export default function App() {
         conversationId: outcome.plan.conversationId,
         status: outcome.plan.status,
         originalRequest: outcome.plan.originalRequest,
+        reasoningHistory: outcome.executionState.reasoningHistory,
         executionState: outcome.executionState,
       },
     });
@@ -477,8 +530,22 @@ export default function App() {
     try {
       await showDocument(createDisplayDocument({ id: 'cue-loading', title: 'Working', source: { app: 'cue', name: 'Cue' }, state: 'loading', message: 'Discovering provider tools and preparing a local response.', elements: [{ type: 'text', text: clean, role: 'body' }] }));
       const runtime = await getEnvironment();
-      const context = { now: new Date(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn };
+      const requestNow = clockForRuntime(runtime);
+      const context = { now: requestNow, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn };
       const savedState = await getConversationState();
+      if (aiModeRef.current === 'web_ai' && savedState?.pendingReasoning) {
+        const message = 'This request is awaiting hosted reasoning. Switch to Automatic or Always Dots 3 to continue, or cancel the pending request.';
+        setPendingClarification(true);
+        await showDocument(createDisplayDocument({
+          id: 'cue-hosted-workflow-paused',
+          title: 'Hosted workflow paused',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'clarification_required',
+          message,
+          elements: [{ type: 'text', text: message, role: 'body' }],
+        }));
+        return;
+      }
       if (savedState?.executionState?.pendingConfirmation) {
         const restoredPending = pendingAction?.externalPlan ? pendingAction : {
           plan: savedState.executionState.plan,
@@ -488,6 +555,10 @@ export default function App() {
         if (/^(?:yes|yeah|yep|sure|ok|okay|confirm|confirmed|do it|go ahead)$/i.test(clean)) {
           setTranscriptInput('');
           await confirmPendingAction(restoredPending, true);
+          return;
+        }
+        if (savedState?.status === 'executing' && savedState.executionState) {
+          await processDots3Request(clean, runtime, context, savedState.executionState);
           return;
         }
         if (/^(?:cancel|stop|never mind|nevermind|no|don't|do not)$/i.test(clean)) {
@@ -508,23 +579,34 @@ export default function App() {
         }));
         return;
       }
-      if (!continuePendingLocally && (aiModeRef.current === 'dots3_always' || savedState?.pendingReasoning
-        || (savedState?.executionState && ['awaiting_confirmation', 'executing'].includes(savedState.status)))) {
+      if (!continuePendingLocally && aiModeRef.current !== 'web_ai'
+        && (aiModeRef.current === 'dots3_always' || savedState?.pendingReasoning
+          || (savedState?.executionState && ['awaiting_confirmation', 'executing'].includes(savedState.status)))) {
         await processDots3Request(clean, runtime, context);
         return;
       }
-      const outcome = await runtime.intelligence.handle(clean, { context: { now: new Date(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn } });
+      const escalationReason = aiModeRef.current === 'automatic' ? runtime.intelligence.requiresExternalPlanning(clean) : undefined;
+      if (!continuePendingLocally && escalationReason) {
+        log(`Automatic mode escalated: ${escalationReason}`);
+        await processDots3Request(clean, runtime, context);
+        return;
+      }
+      log('Local-first request routing accepted');
+      const outcome = await runtime.intelligence.handle(clean, { context: { ...context, now: requestNow } });
       if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
       const rerankDiagnostics = outcome.diagnostics?.rerank ?? outcome.retrieval?.rerankDiagnostics;
       if (rerankDiagnostics?.candidates) {
         log(`Cross-encoder ranking: ${rerankDiagnostics.candidates.map((item: any) => `${item.toolId} ${item.score.toFixed(3)}`).join(', ')}`);
       }
-      if (!continuePendingLocally && aiModeRef.current === 'automatic' && outcome.state?.status === 'awaiting_tool_choice') {
+      if (!continuePendingLocally && aiModeRef.current === 'automatic'
+        && (outcome.state?.status === 'awaiting_tool_choice' || outcome.kind === 'no_tool')) {
         log(rerankDiagnostics?.error
           ? `Cross-encoder unavailable: ${rerankDiagnostics.error}; trying the configured Dots 3 fallback`
           : rerankDiagnostics?.candidates
             ? 'Cross-encoder scores or margin below routing thresholds; trying the configured Dots 3 fallback'
-            : 'Tool choice remains uncertain; cross-encoder result unavailable for this outcome; trying the configured Dots 3 fallback');
+            : outcome.kind === 'no_tool'
+              ? 'Local retrieval found no matching tool; trying the configured Dots 3 fallback'
+              : 'Tool choice remains uncertain; cross-encoder result unavailable for this outcome; trying the configured Dots 3 fallback');
         await processDots3Request(clean, runtime, context);
         return;
       }
@@ -650,6 +732,7 @@ export default function App() {
                 : state.plan.status === 'completed' ? 'completed'
                   : state.plan.status === 'failed' ? 'failed' : 'executing',
               originalRequest: state.plan.originalRequest,
+              reasoningHistory: state.reasoningHistory,
               pendingQuestion: state.pendingConfirmation ? `Confirm ${state.pendingConfirmation.toolId}?` : undefined,
               executionState: state,
             },
@@ -941,8 +1024,7 @@ export default function App() {
         <option value="automatic">Automatic</option>
         <option value="dots3_always">Always Dots 3</option>
       </select></label>
-      <p>Web AI uses browser-side MiniLM, deterministic logic, and local Gemma when available; it never calls OpenRouter. Automatic tries local reasoning first and uses Dots 3 through OpenRouter only when local tool selection is ambiguous. Always Dots 3 sends the current request, relevant schemas, and necessary pending context to OpenRouter for reasoning. Requests still reach Cue’s backend for registered provider operations; do not enter sensitive information in external modes.</p>
-      <p role="status">Local Gemma: {gemmaState.status}{gemmaState.progress?.reason ? ` — ${gemmaState.progress.reason}` : ''}{gemmaState.progress?.message ? ` — ${gemmaState.progress.message}` : ''}{gemmaState.progress?.generatedCharacters ? ` — ${gemmaState.progress.generatedCharacters} generated characters` : ''}</p>
+      <p>Web AI uses browser-side MiniLM and deterministic argument resolution; it never calls OpenRouter. Automatic keeps straightforward requests local and escalates multi-step, collection, implicit-context, or uncertain requests to Dots 3. Automatic may also use Dots 3 to normalize arguments that deterministic resolution cannot complete. Always Dots 3 sends requests to OpenRouter with the available registered tool catalog. All operations still use Cue’s registered provider tools; do not enter sensitive information in external modes.</p>
       <label>Calendar week starts<select value={weekStartsOn} onChange={event => setCalendarWeekStart(Number(event.target.value))}><option value={1}>Monday</option><option value={0}>Sunday</option></select></label><label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label><button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button><button disabled={busy || !recording || buffer < 0.2} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); void startHoldCapture(); }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()}>{holding ? 'Release to transcribe…' : 'Hold to transcribe (max 5 min)'}</button>{(['transcribe', 'embed', 'rerank'] as Stage[]).map(stage => <p key={stage}>{stage === 'rerank' ? 'cross-encoder' : stage}: {status[stage]}{busy && <button onClick={() => stopStage(stage)}>Stop {stage === 'rerank' ? 'cross-encoder' : stage}</button>}</p>)}<p>Tools and provider availability are loaded dynamically from the session's SQLite registry. MiniLM retrieval and deterministic argument resolution run in your browser.</p><label>Demo scenario<select value={scenario} onChange={event => { setScenario(event.target.value); setTranscriptInput(event.target.value); }}><option value="">Choose an example request</option>{DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}</select></label><label>{pendingClarification ? 'Clarification' : 'Transcript text'}<textarea value={transcriptInput} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder={pendingClarification ? 'Enter the missing details or a correction' : 'Enter sample transcript text'} /></label>{pendingClarification && <p role="status">Reply here to continue the pending request. Your message will go directly to that request.</p>}<button disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>{busy ? 'Processing…' : pendingClarification ? 'Send clarification' : 'Process transcript'}</button> <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button><label>Transcription (audio capture only)<textarea readOnly value={transcription} /></label><p>Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>{displayDocument && <><DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />{pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}{pendingClarification && <button disabled={busy} onClick={() => void cancelPendingOperation().catch(error => log(`Could not cancel pending operation: ${error instanceof Error ? error.message : String(error)}`))}>Cancel pending operation</button>}</>}</section>
     <section><h2>Status log</h2><pre>{logs.join('\n')}</pre></section>
   </main>;

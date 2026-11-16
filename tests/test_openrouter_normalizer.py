@@ -70,6 +70,20 @@ class OpenRouterTests(unittest.TestCase):
         with self.assertRaisesRegex(openrouter_normalizer.NormalizerError, "invalid or incomplete"):
             openrouter_normalizer.generate("prompt")
 
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"})
+    @patch("openrouter_normalizer.urllib.request.build_opener")
+    def test_empty_and_truncated_responses_report_the_cause(self, build_opener):
+        for content, finish_reason, cause in [
+            ("", "stop", "empty"),
+            ('{"status":', "length", "truncated"),
+        ]:
+            with self.subTest(cause=cause):
+                build_opener.return_value.open.return_value = MockResponse({
+                    "choices": [{"message": {"content": content}, "finish_reason": finish_reason}],
+                })
+                with self.assertRaisesRegex(openrouter_normalizer.NormalizerResponseError, cause):
+                    openrouter_normalizer.generate("prompt")
+
 
 if __name__ == "__main__":
     unittest.main()

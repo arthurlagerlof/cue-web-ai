@@ -51,6 +51,7 @@ export function validateToolDefinition(tool) {
   if (tool.keywords !== undefined && (!Array.isArray(tool.keywords) || tool.keywords.some(keyword => typeof keyword !== 'string' || !keyword.trim()))) throw new TypeError(`Tool ${tool.id} has invalid keywords`);
   if (!Array.isArray(tool.examples) || tool.examples.some(example => typeof example === 'string' ? !example.trim() : !example || typeof example.text !== 'string' || !example.text.trim())) throw new TypeError(`Tool ${tool.id} requires non-empty example utterances`);
   if (tool.requiredPermissions !== undefined && (!Array.isArray(tool.requiredPermissions) || tool.requiredPermissions.some(permission => typeof permission !== 'string' || !permission))) throw new TypeError(`Tool ${tool.id} has invalid required permissions`);
+  if (tool.resultSchema !== undefined && (!tool.resultSchema || typeof tool.resultSchema !== 'object' || Array.isArray(tool.resultSchema))) throw new TypeError(`Tool ${tool.id} has an invalid result schema`);
   return tool;
 }
 

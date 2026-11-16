@@ -40,6 +40,23 @@ class BackendTests(unittest.TestCase):
         finally:
             connection.close()
 
+    def test_argument_normalization_retries_incomplete_output_once(self):
+        response = '{"status":"resolved"}'
+        with patch("backend.generate_normalization", side_effect=[
+                backend.NormalizerResponseError("OpenRouter returned a truncated response"), response,
+        ]) as generate:
+            self.assertEqual(backend.generate_argument_normalization("original prompt"), response)
+        self.assertEqual([call.kwargs["max_tokens"] for call in generate.call_args_list], [2048, 4096])
+        self.assertEqual([call.args[0] for call in generate.call_args_list], ["original prompt", "original prompt"])
+        with patch("backend.generate_normalization", side_effect=backend.NormalizerResponseError("OpenRouter returned an empty response")) as generate:
+            with self.assertRaisesRegex(backend.NormalizerError, "empty.*retry"):
+                backend.generate_argument_normalization("original prompt")
+            self.assertEqual(generate.call_count, 2)
+        with patch("backend.generate_normalization", side_effect=backend.NormalizerError("OpenRouter request failed (HTTP 429)")) as generate:
+            with self.assertRaisesRegex(backend.NormalizerError, "429"):
+                backend.generate_argument_normalization("original prompt")
+            generate.assert_called_once()
+
     def test_seed_is_synthetic_complete_and_idempotent(self):
         first = verify_database(self.seed, require_embeddings=False)
         manifest = json.loads((Path(__file__).resolve().parents[1] / "data" / "seed" / "tool-manifests.json").read_text(encoding="utf-8"))
@@ -70,7 +87,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(first["tools"], 18)
         self.assertEqual(first["tool_embedding_rows"], expected_embedding_rows)
         self.assertEqual(first["ready_tool_embeddings"], first["seeded_fixture_embeddings"])
-        self.assertEqual(first["records"], {"anki": 12, "knowledge": 6, "web": 3, "calendar": 5, "notifications": 3, "alarm": 2})
+        self.assertEqual(first["records"], {"anki": 20, "knowledge": 20, "web": 6, "calendar": 48, "notifications": 6, "alarm": 4})
         connection = sqlite3.connect(self.seed)
         try:
             sources = dict(connection.execute("SELECT source_type,COUNT(*) FROM tool_retrieval_records GROUP BY source_type"))
@@ -78,6 +95,180 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(connection.execute("SELECT COUNT(DISTINCT content_hash) FROM tool_retrieval_records").fetchone()[0], expected_embedding_rows)
         finally:
             connection.close()
+
+    def test_demo_clock_is_configurable_and_shifts_only_synthetic_dates(self):
+        configured_clock = "2027-01-02T08:00:00+02:00"
+        with patch.dict(os.environ, {"CUE_DEMO_CLOCK": configured_clock}):
+            demo_database.seed_database(self.seed)
+            registry = demo_database.registry("configured-clock")
+        self.assertEqual(registry["demoClock"], configured_clock)
+        shifted = next(item for item in registry["data"]["calendar"]["events"] if item["id"] == "demo-event-001")
+        self.assertEqual(shifted["start"], "2027-01-02T09:00:00+02:00")
+        self.assertEqual(shifted["end"], "2027-01-02T09:30:00+02:00")
+
+    def test_external_plan_validation_accepts_generic_fanout_and_rejects_bad_result_paths(self):
+        tools = demo_database.registry("fanout-plan-validation")["tools"]
+        response = {
+            "kind": "plan",
+            "question": None,
+            "text": None,
+            "operations": [
+                {
+                    "id": "events",
+                    "toolId": "calendar.find_events",
+                    "purpose": "Find the requested events",
+                    "arguments": {"date": "2026-11-16"},
+                    "dependsOn": [],
+                    "inputBindings": [],
+                    "conditions": [],
+                    "forEach": None,
+                },
+                {
+                    "id": "alarms",
+                    "toolId": "alarm.create",
+                    "purpose": "Create an alarm for each event",
+                    "arguments": {},
+                    "dependsOn": ["events"],
+                    "inputBindings": [],
+                    "conditions": [],
+                    "forEach": {
+                        "sourceOperation": "events",
+                        "sourcePointer": "/events",
+                        "bindings": [
+                            {"targetArgument": "label", "sourcePointer": "/title", "transform": None},
+                            {"targetArgument": "time", "sourcePointer": "/start", "transform": None},
+                        ],
+                    },
+                },
+            ],
+        }
+        planned = backend._validate_reasoning_result(response, tools, request="Create alarms for today's events", prior_state=None)
+        self.assertEqual(planned["kind"], "plan")
+        self.assertEqual(planned["plan"]["operations"][1]["forEach"]["sourceOperation"], "op_1")
+        self.assertEqual(planned["plan"]["operations"][1]["requiresConfirmation"], True)
+        with patch("backend.search_provider_data", return_value={}), \
+                patch("backend.generate_normalization", return_value=json.dumps(response)) as generate:
+            hosted = backend.reason_with_dots3("fanout-plan-validation", "Create alarms for today's events", vector=[1.0] * 384)
+        self.assertEqual(hosted["plan"]["operations"][1]["forEach"], planned["plan"]["operations"][1]["forEach"])
+        self.assertEqual(generate.call_count, 1)
+
+        invalid = json.loads(json.dumps(response))
+        invalid["operations"][1]["forEach"]["sourcePointer"] = "/events/0/title"
+        with self.assertRaisesRegex(ValueError, "must reference an array"):
+            backend._validate_reasoning_result(invalid, tools, request="Create alarms", prior_state=None)
+
+        invalid_static = json.loads(json.dumps(response))
+        invalid_static["operations"][1]["forEach"] = None
+        clarification = backend._validate_reasoning_result(invalid_static, tools, request="Create alarms", prior_state=None)
+        self.assertEqual(clarification["kind"], "clarification")
+
+    def test_dots3_corrects_invalid_responses_once_and_keeps_original_request(self):
+        valid = {
+            "kind": "plan", "question": None, "text": None,
+            "operations": [{
+                "id": "alarm", "toolId": "alarm.create", "purpose": "Set alarm",
+                "arguments": {"label": "Garden", "time": "2026-11-17T09:00:00+02:00"},
+                "dependsOn": [], "inputBindings": [], "conditions": [], "forEach": None,
+            }],
+        }
+        malformed = json.loads(json.dumps(valid))
+        malformed["operations"][0]["arguments"] = {
+            "label": "${events[0].title}", "time": "${events[0].start}",
+        }
+        unknown = json.loads(json.dumps(valid))
+        unknown["operations"][0]["toolId"] = "calendar.invented"
+        invalid_argument = json.loads(json.dumps(valid))
+        invalid_argument["operations"][0]["arguments"]["invented"] = 1
+        invalid_date = json.loads(json.dumps(valid))
+        invalid_date["operations"][0]["arguments"]["time"] = "tomorrow morning"
+        bad_structure = {"kind": "plan", "question": None, "text": None, "operations": [{}]}
+        for invalid in ("not json", json.dumps(malformed), json.dumps(unknown),
+                        json.dumps(invalid_argument), json.dumps(invalid_date), json.dumps(bad_structure)):
+            with self.subTest(invalid=invalid), \
+                    patch("backend.search_provider_data", return_value={}), \
+                    patch("backend.generate_normalization", side_effect=[invalid, json.dumps(valid)]) as generate:
+                result = backend.reason_with_dots3("retry-test", "Set an alarm for garden work", vector=[1.0] * 384)
+                self.assertEqual(result["plan"]["operations"][0]["arguments"], valid["operations"][0]["arguments"])
+                self.assertEqual(generate.call_count, 2)
+                correction = generate.call_args_list[1].args[0]
+                self.assertIn("validationError", correction)
+                self.assertIn(json.dumps(invalid, ensure_ascii=False), correction)
+                self.assertIn("Set an alarm for garden work", correction)
+        with patch("backend.search_provider_data", return_value={}), \
+                patch("backend.generate_normalization", return_value=json.dumps(malformed)) as generate:
+            with self.assertRaisesRegex(backend.NormalizerError, "couldn't construct a valid plan"):
+                backend.reason_with_dots3("retry-failure", "Set an alarm", vector=[1.0] * 384)
+            self.assertEqual(generate.call_count, 2)
+
+    def test_dots3_clarification_retains_execution_context_and_answer(self):
+        original = "Set an alarm for every garden event"
+        prior = {
+            "conversationId": "existing", "status": "awaiting_argument", "originalRequest": original,
+            "pendingReasoning": True, "pendingQuestion": "Which date?",
+            "executionState": {
+                "plan": {"operations": [{"id": "events", "status": "succeeded"}, {"id": "alarms", "dependsOn": ["events"]}]},
+                "results": {"events": {"events": [{"title": "Garden"}]}},
+                "iterations": {"alarms": {"children": ["fan_1_1"]}}, "executedSideEffects": [],
+            },
+        }
+        clarification = {"kind": "clarification", "question": "How early?", "text": None, "operations": []}
+        with patch("backend.load_conversation_state", return_value=prior), \
+                patch("backend.search_provider_data", return_value={}), \
+                patch("backend.generate_normalization", return_value=json.dumps(clarification)) as generate:
+            result = backend.reason_with_dots3("resume-test", "Tomorrow", vector=[1.0] * 384)
+        self.assertEqual(result["state"]["originalRequest"], original)
+        self.assertEqual(result["state"]["executionState"], prior["executionState"])
+        self.assertEqual(result["state"]["reasoningHistory"], [{"question": "Which date?", "answer": "Tomorrow"}])
+        prompt = generate.call_args.args[0]
+        self.assertIn('"originalRequest":"Set an alarm for every garden event"', prompt)
+        self.assertIn('"currentRequest":"Tomorrow"', prompt)
+        self.assertIn('"iterations"', prompt)
+        self.assertIn('"results"', prompt)
+        plan = {
+            "kind": "plan", "question": None, "text": None,
+            "operations": [{
+                "id": "events", "toolId": "calendar.find_events", "purpose": "Find garden events",
+                "arguments": {"query": "garden", "date": "2026-11-17"},
+                "dependsOn": [], "inputBindings": [], "conditions": [], "forEach": None,
+            }],
+        }
+        with patch("backend.load_conversation_state", return_value=result["state"]), \
+                patch("backend.search_provider_data", return_value={}), \
+                patch("backend.generate_normalization", return_value=json.dumps(plan)) as generate:
+            continued = backend.reason_with_dots3("resume-test", "15 minutes", vector=[1.0] * 384)
+        self.assertEqual(continued["plan"]["originalRequest"], original)
+        self.assertEqual(continued["reasoningHistory"], [
+            {"question": "Which date?", "answer": "Tomorrow"},
+            {"question": "How early?", "answer": "15 minutes"},
+        ])
+        self.assertIn('"answer":"Tomorrow"', generate.call_args.args[0])
+        prior["executionState"]["executedSideEffects"] = ["already executed"]
+        with patch("backend.load_conversation_state", return_value=prior), \
+                patch("backend.search_provider_data", return_value={}), \
+                patch("backend.generate_normalization") as generate:
+            with self.assertRaisesRegex(backend.NormalizerError, "cannot safely replan"):
+                backend.reason_with_dots3("resume-test", "Tomorrow", vector=[1.0] * 384)
+            generate.assert_not_called()
+
+    def test_dots3_rejects_forward_dependencies_and_missing_paths(self):
+        tools = demo_database.registry("bad-references")["tools"]
+        response = {
+            "kind": "plan", "question": None, "text": None, "operations": [
+                {"id": "alarm", "toolId": "alarm.create", "purpose": "Set alarm", "arguments": {},
+                 "dependsOn": ["events"], "inputBindings": [
+                     {"targetArgument": "time", "sourceOperation": "events", "sourcePointer": "/firstEvent/start", "transform": None},
+                     {"targetArgument": "label", "sourceOperation": "events", "sourcePointer": "/firstEvent/title", "transform": None},
+                 ], "conditions": [], "forEach": None},
+                {"id": "events", "toolId": "calendar.find_events", "purpose": "Find events",
+                 "arguments": {"date": "2026-11-17"}, "dependsOn": [], "inputBindings": [], "conditions": [], "forEach": None},
+            ],
+        }
+        with self.assertRaisesRegex(ValueError, "earlier operations"):
+            backend._validate_reasoning_result(response, tools, request="Set an alarm", prior_state=None)
+        response["operations"].reverse()
+        response["operations"][1]["inputBindings"][0]["sourcePointer"] = "/firstEvent/invented"
+        with self.assertRaisesRegex(ValueError, "undeclared result field"):
+            backend._validate_reasoning_result(response, tools, request="Set an alarm", prior_state=None)
 
     def test_persisted_conversation_state_is_session_scoped_and_expires(self):
         state = {
@@ -191,11 +382,11 @@ class BackendTests(unittest.TestCase):
         baseline_count = self.query_one(self.seed, "SELECT COUNT(*) FROM records WHERE provider_id='anki'")
         created = demo_database.execute_tool("visitor-one", "anki.create_card", {"front": "Synthetic question", "back": "Synthetic answer", "tags": ["demo"]})
         self.assertEqual(created["state"], "success")
-        self.assertEqual(len(demo_database.registry("visitor-one")["data"]["anki"]["cards"]), 13)
-        self.assertEqual(len(demo_database.registry("visitor-two")["data"]["anki"]["cards"]), 12)
+        self.assertEqual(len(demo_database.registry("visitor-one")["data"]["anki"]["cards"]), 21)
+        self.assertEqual(len(demo_database.registry("visitor-two")["data"]["anki"]["cards"]), 20)
         self.assertEqual(self.query_one(self.seed, "SELECT COUNT(*) FROM records WHERE provider_id='anki'"), baseline_count)
         demo_database.reset_session("visitor-one")
-        self.assertEqual(len(demo_database.registry("visitor-one")["data"]["anki"]["cards"]), 12)
+        self.assertEqual(len(demo_database.registry("visitor-one")["data"]["anki"]["cards"]), 20)
 
     def test_provider_adapters_search_synthetic_records_and_persist_changes(self):
         session = "provider-test"
@@ -211,7 +402,7 @@ class BackendTests(unittest.TestCase):
         self.assertIn("Available", json.dumps(available))
         demo_database.execute_tool(session, "calendar.delete_event", {"eventId": "event-5"})
         demo_database.execute_tool(session, "alarm.delete", {"alarmId": "alarm-2"})
-        self.assertEqual(len(demo_database.registry(session)["data"]["alarm"]["items"]), 1)
+        self.assertEqual(len(demo_database.registry(session)["data"]["alarm"]["items"]), 3)
         demo_database.execute_tool(session, "calendar.create_event", {"title": "Synthetic follow-up", "start": "2026-11-15T15:00:00+02:00", "end": "2026-11-15T15:30:00+02:00"})
         found = demo_database.execute_tool(session, "calendar.find_events", {"date": "2026-11-15"})
         self.assertEqual(len(found["data"]["events"]), 3)
@@ -234,8 +425,8 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(result["data"]["events"][0]["id"], "event-3")
         self.assertEqual(result["data"]["firstEvent"]["id"], "event-3")
         empty_result = demo_database.execute_tool(session, "calendar.find_events", {
-            "start_datetime": "2026-11-16T00:00:00+02:00",
-            "end_datetime": "2026-11-17T00:00:00+02:00",
+            "start_datetime": "2027-01-01T00:00:00+02:00",
+            "end_datetime": "2027-01-02T00:00:00+02:00",
         })
         self.assertEqual(empty_result["state"], "empty")
 
@@ -245,10 +436,10 @@ class BackendTests(unittest.TestCase):
         first = demo_database.execute_tool(session, "anki.create_card", arguments, "conversation-one:0")
         repeated = demo_database.execute_tool(session, "anki.create_card", arguments, "conversation-one:0")
         self.assertEqual(first, repeated)
-        self.assertEqual(len(demo_database.registry(session)["data"]["anki"]["cards"]), 13)
+        self.assertEqual(len(demo_database.registry(session)["data"]["anki"]["cards"]), 21)
         with self.assertRaisesRegex(ValueError, "already used"):
             demo_database.execute_tool(session, "anki.create_card", {**arguments, "front": "Different"}, "conversation-one:0")
-        self.assertEqual(len(demo_database.registry(session)["data"]["anki"]["cards"]), 13)
+        self.assertEqual(len(demo_database.registry(session)["data"]["anki"]["cards"]), 21)
 
     def test_sqlite_tool_namespace_indexing_and_similarity_search(self):
         session = "embedding-test"
@@ -286,7 +477,7 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(len(registry["tools"]), 18)
             self.assertEqual(registry["toolRetrievalConfig"]["scoring"], "weighted-max")
             self.assertEqual(registry["toolRetrievalConfig"]["maxOperations"], 8)
-            self.assertEqual(len(registry["data"]["anki"]["cards"]), 12)
+            self.assertEqual(len(registry["data"]["anki"]["cards"]), 20)
             connection.request("GET", "/api/demo/conversation", headers={"Origin": "http://localhost:5173", "Cookie": cookie})
             response = connection.getresponse()
             self.assertEqual(response.status, 200)
@@ -296,7 +487,7 @@ class BackendTests(unittest.TestCase):
                 response = connection.getresponse()
                 self.assertEqual(response.status, 200)
                 self.assertEqual(json.loads(response.read())["text"], '{"status":"resolved"}')
-                generate.assert_called_once_with("synthetic prompt")
+                generate.assert_called_once_with("synthetic prompt", max_tokens=2048)
             with patch("backend.generate_normalization", return_value="Direct answer.") as generate:
                 connection.request("POST", "/api/demo/respond", body=json.dumps({"prompt": "What is a comet?"}), headers=headers)
                 response = connection.getresponse()
@@ -316,6 +507,7 @@ class BackendTests(unittest.TestCase):
                         "dependsOn": [],
                         "inputBindings": [],
                         "conditions": [],
+                        "forEach": None,
                     },
                     {
                         "id": "create-alarm",
@@ -334,6 +526,7 @@ class BackendTests(unittest.TestCase):
                             "operation": "find-events",
                             "pointer": "/firstEvent/start",
                         }],
+                        "forEach": None,
                     },
                 ],
             }
@@ -359,6 +552,8 @@ class BackendTests(unittest.TestCase):
                 self.assertEqual(planned["plan"]["operations"][1]["inputBindings"][0]["sourceOperation"], "op_1")
                 self.assertTrue(planned["plan"]["operations"][1]["requiresConfirmation"])
                 self.assertEqual(generate.call_args.kwargs["response_schema"]["properties"]["operations"]["maxItems"], 8)
+                self.assertIn("forEach", generate.call_args.kwargs["response_schema"]["properties"]["operations"]["items"]["required"])
+                self.assertIn("resultSchema", generate.call_args.args[0])
                 self.assertEqual(search_provider_data.call_args.args[1], [1.0] + [0.0] * 383)
                 self.assertIn("Synthetic dentist appointment", generate.call_args.args[0])
                 self.assertNotIn("Authorization", json.dumps(planned))

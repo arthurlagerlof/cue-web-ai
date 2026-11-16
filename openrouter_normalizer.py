@@ -12,6 +12,10 @@ class NormalizerError(Exception):
     pass
 
 
+class NormalizerResponseError(NormalizerError):
+    pass
+
+
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -61,9 +65,12 @@ def generate(prompt, *, response_schema=None, max_tokens=1024, timeout=30):
     try:
         result = json.loads(body)
         choice = result["choices"][0]
-        content = choice["message"]["content"]
-        if choice.get("finish_reason") == "length" or not isinstance(content, str) or not content.strip():
-            raise ValueError("Empty or truncated output")
-    except (ValueError, KeyError, IndexError, TypeError) as exc:
-        raise NormalizerError("OpenRouter returned an invalid or incomplete response") from exc
+        finish_reason = choice.get("finish_reason")
+        content = choice["message"].get("content")
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError) as exc:
+        raise NormalizerResponseError("OpenRouter returned an invalid or incomplete response") from exc
+    if finish_reason == "length":
+        raise NormalizerResponseError("OpenRouter returned a truncated response")
+    if not isinstance(content, str) or not content.strip():
+        raise NormalizerResponseError("OpenRouter returned an empty response")
     return content

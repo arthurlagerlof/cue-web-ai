@@ -1,4 +1,5 @@
 import { validateArguments } from './toolRegistry.js';
+import { validateFormats } from './argumentNormalization.js';
 
 export const PLAN_SCHEMA = 'cue.execution-plan';
 export const PLAN_VERSION = 1;
@@ -14,7 +15,42 @@ const planStatuses = new Set([
 ]);
 const transforms = new Set(['subtract_duration', 'add_duration', 'format_datetime', 'select_first']);
 
-export function validateExecutionPlan(plan, registry, { maxOperations = MAX_PLAN_OPERATIONS } = {}) {
+function containsInterpolation(value) {
+  if (typeof value === 'string') return value.includes('${') || value.includes('{{') || value.includes('}}');
+  if (Array.isArray(value)) return value.some(containsInterpolation);
+  return value !== null && typeof value === 'object' && Object.values(value).some(containsInterpolation);
+}
+
+function validPointer(pointer) {
+  return typeof pointer === 'string' && pointer.startsWith('/') && !/~(?![01])/.test(pointer);
+}
+
+function schemaAtPointer(schema, pointer) {
+  if (!schema || typeof schema !== 'object' || schema.$ref) return undefined;
+  return pointer.slice(1).split('/').reduce((current, rawSegment) => {
+    if (!current || typeof current !== 'object' || current.$ref) return undefined;
+    const segment = rawSegment.replace(/~1/g, '/').replace(/~0/g, '~');
+    return current.type === 'array' && /^\d+$/.test(segment) ? current.items : current.properties?.[segment];
+  }, schema);
+}
+
+function validateTransform(transform, path, add) {
+  if (!transform) return;
+  if (typeof transform !== 'object' || !transforms.has(transform.type)
+    || Object.keys(transform).some(key => !['type', 'duration'].includes(key))) {
+    add(path, 'contains an unsupported transformation');
+    return;
+  }
+  if (['subtract_duration', 'add_duration'].includes(transform.type)
+    && (typeof transform.duration !== 'string' || !parseDuration(transform.duration))) {
+    add(`${path}.duration`, 'must be a supported ISO duration');
+  }
+}
+
+export function validateExecutionPlan(plan, registry, {
+  maxOperations = MAX_PLAN_OPERATIONS,
+  validateStaticArguments = false,
+} = {}) {
   const errors = [];
   const add = (path, message) => errors.push(`${path}: ${message}`);
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) return { valid: false, errors: ['$: expected an object'] };
@@ -58,17 +94,65 @@ export function validateExecutionPlan(plan, registry, { maxOperations = MAX_PLAN
       const bindingPath = `${path}.inputBindings[${bindingIndex}]`;
       if (!binding || typeof binding !== 'object' || typeof binding.targetArgument !== 'string'
         || typeof binding.sourceOperation !== 'string' || typeof binding.sourcePointer !== 'string'
-        || !binding.sourcePointer.startsWith('/') || /~(?![01])/.test(binding.sourcePointer)) {
+        || !validPointer(binding.sourcePointer)
+        || Object.keys(binding).some(key => !['targetArgument', 'sourceOperation', 'sourcePointer', 'transform'].includes(key))) {
         add(bindingPath, 'requires targetArgument, sourceOperation, and a JSON Pointer');
         continue;
       }
       if (!tool?.parameters?.properties?.[binding.targetArgument]) add(`${bindingPath}.targetArgument`, 'is not a registered tool argument');
-      if (binding.transform && (!transforms.has(binding.transform.type) || Object.keys(binding.transform).some(key => !['type', 'duration'].includes(key)))) {
-        add(`${bindingPath}.transform`, 'contains an unsupported transformation');
+      validateTransform(binding.transform, `${bindingPath}.transform`, add);
+    }
+    if (validateStaticArguments && tool && operation.arguments && typeof operation.arguments === 'object' && !Array.isArray(operation.arguments)) {
+      if (containsInterpolation(operation.arguments)) add(`${path}.arguments`, 'interpolation is unsupported; use result bindings');
+      const bindings = [
+        ...(operation.inputBindings ?? []),
+        ...(operation.forEach?.bindings ?? []),
+      ];
+      const bound = new Set();
+      for (const binding of bindings) {
+        if (typeof binding?.targetArgument !== 'string') continue;
+        if (bound.has(binding.targetArgument)) add(`${path}.inputBindings`, `binds '${binding.targetArgument}' more than once`);
+        bound.add(binding.targetArgument);
       }
-      if (binding.transform && ['subtract_duration', 'add_duration'].includes(binding.transform.type)
-        && (typeof binding.transform.duration !== 'string' || !parseDuration(binding.transform.duration))) {
-        add(`${bindingPath}.transform.duration`, 'must be a supported ISO duration');
+      const args = { ...operation.arguments };
+      for (const target of bound) delete args[target];
+      const partialSchema = {
+        ...tool.parameters,
+        required: (tool.parameters.required ?? []).filter(key => !bound.has(key)),
+      };
+      const alternatives = partialSchema.anyOf;
+      delete partialSchema.anyOf;
+      const validation = validateArguments(partialSchema, args);
+      if (!validation.valid) add(`${path}.arguments`, validation.errors.join('; '));
+      const formatErrors = validateFormats(partialSchema, args);
+      if (formatErrors.length) add(`${path}.arguments`, formatErrors.join('; '));
+      if (Array.isArray(alternatives) && !alternatives.some(branch =>
+        Array.isArray(branch.required) && branch.required.every(key => Object.hasOwn(args, key) || bound.has(key)),
+      )) add(`${path}.arguments`, 'does not satisfy any required argument alternative');
+    }
+
+    if (operation.forEach !== undefined) {
+      const each = operation.forEach;
+      if (!each || typeof each !== 'object' || Array.isArray(each)
+        || typeof each.sourceOperation !== 'string' || !validPointer(each.sourcePointer)
+        || !Array.isArray(each.bindings)
+        || Object.keys(each).some(key => !['sourceOperation', 'sourcePointer', 'bindings'].includes(key))) {
+        add(`${path}.forEach`, 'requires a source operation, array JSON Pointer, and bindings');
+      } else {
+        const targets = new Set();
+        for (const [bindingIndex, binding] of each.bindings.entries()) {
+          const bindingPath = `${path}.forEach.bindings[${bindingIndex}]`;
+          if (!binding || typeof binding !== 'object' || typeof binding.targetArgument !== 'string'
+            || !validPointer(binding.sourcePointer)
+            || Object.keys(binding).some(key => !['targetArgument', 'sourcePointer', 'transform'].includes(key))) {
+            add(bindingPath, 'requires targetArgument and an item JSON Pointer');
+            continue;
+          }
+          if (targets.has(binding.targetArgument)) add(`${bindingPath}.targetArgument`, 'must be unique');
+          targets.add(binding.targetArgument);
+          if (!tool?.parameters?.properties?.[binding.targetArgument]) add(`${bindingPath}.targetArgument`, 'is not a registered tool argument');
+          validateTransform(binding.transform, `${bindingPath}.transform`, add);
+        }
       }
     }
     for (const [conditionIndex, condition] of (operation.conditions ?? []).entries()) {
@@ -91,6 +175,33 @@ export function validateExecutionPlan(plan, registry, { maxOperations = MAX_PLAN
       if (binding) {
         if (!byId.has(binding.sourceOperation)) add(`${path}.inputBindings`, `references unknown operation '${binding.sourceOperation}'`);
         else if (!operation.dependsOn.includes(binding.sourceOperation)) add(`${path}.inputBindings`, `source '${binding.sourceOperation}' must be a dependency`);
+        else {
+          const sourceTool = registry?.get(byId.get(binding.sourceOperation)?.toolId);
+          if (sourceTool?.resultSchema && !sourceTool.resultSchema.$ref
+            && !schemaAtPointer(sourceTool.resultSchema, binding.sourcePointer)) {
+            add(`${path}.inputBindings`, `references an undeclared result field '${binding.sourcePointer}'`);
+          }
+        }
+      }
+    }
+    if (operation.forEach) {
+      const sourceId = operation.forEach.sourceOperation;
+      if (!byId.has(sourceId)) add(`${path}.forEach`, `references unknown operation '${sourceId}'`);
+      else if (!operation.dependsOn.includes(sourceId)) add(`${path}.forEach`, `source '${sourceId}' must be a dependency`);
+      else {
+        const sourceTool = registry?.get(byId.get(sourceId)?.toolId);
+        const arraySchema = schemaAtPointer(sourceTool?.resultSchema, operation.forEach.sourcePointer);
+        if (arraySchema && arraySchema.type !== 'array') {
+          add(`${path}.forEach.sourcePointer`, 'must reference an array in the registered result schema');
+        }
+        const itemSchema = arraySchema?.items;
+        if (itemSchema) {
+          for (const [bindingIndex, binding] of (operation.forEach.bindings ?? []).entries()) {
+            if (!schemaAtPointer(itemSchema, binding.sourcePointer)) {
+              add(`${path}.forEach.bindings[${bindingIndex}].sourcePointer`, 'is not declared in the registered result schema');
+            }
+          }
+        }
       }
     }
     for (const condition of operation.conditions ?? []) {
@@ -115,6 +226,23 @@ export function validateExecutionPlan(plan, registry, { maxOperations = MAX_PLAN
   for (const id of byId.keys()) if (!visit(id)) {
     add('$.operations', 'contains a dependency cycle');
     break;
+  }
+
+  for (const operation of byId.values()) {
+    if (!operation?.forEach || !byId.has(operation.forEach.sourceOperation)) continue;
+    const pending = [...(operation.dependsOn ?? [])];
+    const visitedDependencies = new Set();
+    while (pending.length) {
+      const dependency = pending.pop();
+      if (visitedDependencies.has(dependency)) continue;
+      visitedDependencies.add(dependency);
+      const source = byId.get(dependency);
+      if (source && registry?.get(source.toolId)?.confirmation === 'required') {
+        add('$.operations', `fan-out '${operation.id}' cannot depend on side effect '${dependency}'`);
+        break;
+      }
+      pending.push(...(source?.dependsOn ?? []));
+    }
   }
 
   return { valid: errors.length === 0, errors };
@@ -172,5 +300,28 @@ export function resolveOperationArguments(operation, results, tool) {
   }
   const validation = validateArguments(tool.parameters, args);
   if (!validation.valid) throw new TypeError(`Invalid bound arguments for ${tool.id}: ${validation.errors.join('; ')}`);
+  const formatErrors = validateFormats(tool.parameters, args);
+  if (formatErrors.length || containsInterpolation(args)) throw new TypeError(`Invalid bound arguments for ${tool.id}: ${formatErrors.join('; ') || 'interpolation is unsupported'}`);
+  return args;
+}
+
+export function resolveForEachArguments(operation, item, results, tool) {
+  const args = structuredClone(operation.arguments);
+  for (const binding of operation.inputBindings ?? []) {
+    const source = results.get(binding.sourceOperation);
+    if (source === undefined) throw new Error(`Dependency result unavailable: ${binding.sourceOperation}`);
+    const value = applyBindingTransform(readJsonPointer(source, binding.sourcePointer), binding.transform);
+    if (value === undefined) throw new Error(`Dependency value unavailable: ${binding.sourceOperation}${binding.sourcePointer}`);
+    args[binding.targetArgument] = value;
+  }
+  for (const binding of operation.forEach?.bindings ?? []) {
+    const value = applyBindingTransform(readJsonPointer(item, binding.sourcePointer), binding.transform);
+    if (value === undefined) throw new Error(`Fan-out item value unavailable: ${binding.sourcePointer}`);
+    args[binding.targetArgument] = value;
+  }
+  const validation = validateArguments(tool.parameters, args);
+  if (!validation.valid) throw new TypeError(`Invalid fan-out arguments for ${tool.id}: ${validation.errors.join('; ')}`);
+  const formatErrors = validateFormats(tool.parameters, args);
+  if (formatErrors.length || containsInterpolation(args)) throw new TypeError(`Invalid fan-out arguments for ${tool.id}: ${formatErrors.join('; ') || 'interpolation is unsupported'}`);
   return args;
 }

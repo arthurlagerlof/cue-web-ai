@@ -3,7 +3,7 @@ import { validateArguments } from './toolRegistry.js';
 const responseProperties = new Set(['status', 'arguments', 'missing', 'ambiguous', 'provenance']);
 const provenanceValues = new Set(['current_user_request', 'previous_conversation', 'model_extracted', 'model_generated', 'inferred']);
 
-function validateFormats(schema, value, path, errors = []) {
+export function validateFormats(schema, value, path = '$', errors = []) {
   if (schema.type === 'object' && value && typeof value === 'object' && !Array.isArray(value)) {
     for (const [name, child] of Object.entries(value)) {
       if (schema.properties?.[name]) validateFormats(schema.properties[name], child, `${path}.${name}`, errors);
@@ -13,9 +13,12 @@ function validateFormats(schema, value, path, errors = []) {
   } else if (typeof value === 'string') {
     if (schema.format === 'date') {
       const date = /^\d{4}-\d{2}-\d{2}$/.test(value) ? new Date(`${value}T00:00:00Z`) : undefined;
-      if (!date || date.toISOString().slice(0, 10) !== value) errors.push(`${path}: expected a valid ISO date`);
+      if (!date || Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== value) errors.push(`${path}: expected a valid ISO date`);
     } else if (schema.format === 'date-time') {
-      if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) || Number.isNaN(Date.parse(value))) {
+      const datePart = value.slice(0, 10);
+      const calendarDate = /^\d{4}-\d{2}-\d{2}$/.test(datePart) ? new Date(`${datePart}T00:00:00Z`) : undefined;
+      if (!/^\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d(?:\.\d+)?)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.test(value) || Number.isNaN(Date.parse(value))
+        || !calendarDate || Number.isNaN(calendarDate.getTime()) || calendarDate.toISOString().slice(0, 10) !== datePart) {
         errors.push(`${path}: expected an ISO date-time with an explicit timezone`);
       }
     } else if (schema.format === 'time' && !/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(value)) {
@@ -151,37 +154,6 @@ export async function normalizeArgumentsWithModel(input, { generate, maxAttempts
       lastError = error;
       if (attempt + 1 < maxAttempts) prompt = `${basePrompt}\nCorrect the previous invalid response. Validation error: ${error.message}`;
     }
-
   }
   throw lastError ?? new Error('The model could not normalize the arguments.');
-}
-
-export async function normalizeArgumentsWithFallback(input, { primary, fallback, onFallback = () => {} }) {
-  try {
-    const result = await normalizeArgumentsWithModel(input, { generate: primary });
-    return { ...result, model: 'openrouter-dots3-note' };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    onFallback(reason);
-    try {
-      const result = await normalizeArgumentsWithModel(input, { generate: fallback });
-      return { ...result, model: 'gemma-4-e2b' };
-    } catch (fallbackError) {
-      const fallbackReason = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
-      throw new Error(`OpenRouter normalizer failed: ${reason}; Gemma fallback failed: ${fallbackReason}`);
-    }
-  }
-}
-
-export async function normalizeArgumentsLocalFirst(input, { local, external, allowExternal = false, onFallback = () => {} }) {
-  try {
-    const result = await normalizeArgumentsWithModel(input, { generate: local });
-    return { ...result, model: 'gemma-4-e2b' };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    if (!allowExternal || typeof external !== 'function') throw error;
-    onFallback(reason);
-    const result = await normalizeArgumentsWithModel(input, { generate: external });
-    return { ...result, model: 'openrouter-dots3-note' };
-  }
 }

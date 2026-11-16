@@ -12,26 +12,51 @@
       {"id":"demo-card-109","noteId":"demo-note-109","front":"What does HTTP status code 404 indicate?","back":"The requested resource was not found.","extra":"It is a client error response.","tags":["programming","web"],"source":"Synthetic Cue demo collection"},
       {"id":"demo-card-110","noteId":"demo-note-110","front":"What is DNA?","back":"A molecule that carries genetic instructions used in the development and functioning of organisms.","extra":"Its structure is commonly described as a double helix.","tags":["biology","genetics"],"source":"Synthetic Cue demo collection"},
       {"id":"demo-card-111","noteId":"demo-note-111","front":"How do you say ‘thank you’ in Finnish?","back":"Kiitos.","extra":"A polite everyday expression.","tags":["language","finnish"],"source":"Synthetic Cue demo collection"},
-      {"id":"demo-card-112","noteId":"demo-note-112","front":"What is the largest ocean on Earth?","back":"The Pacific Ocean.","extra":"It covers more area than all of Earth's land combined.","tags":["geography","oceans"],"source":"Synthetic Cue demo collection"}
+      {"id":"demo-card-112","noteId":"demo-note-112","front":"What is the largest ocean on Earth?","back":"The Pacific Ocean.","extra":"It covers more area than all of Earth's land combined.","tags":["geography","oceans"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-113","noteId":"demo-note-113","front":"What is a Python generator?","back":"An iterator that yields values lazily, one at a time.","extra":"Generator functions use yield.","tags":["programming","python"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-114","noteId":"demo-note-114","front":"What does a database transaction provide?","back":"A group of operations treated as one unit, typically with atomicity, consistency, isolation, and durability.","extra":"The familiar acronym is ACID.","tags":["programming","databases"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-115","noteId":"demo-note-115","front":"What is the difference between HTTP PUT and PATCH?","back":"PUT generally replaces a resource representation; PATCH applies a partial modification.","extra":"Exact semantics depend on the API contract.","tags":["programming","web"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-116","noteId":"demo-note-116","front":"What is an allele?","back":"One of the alternative forms of a gene at a particular locus.","extra":"An individual may carry two alleles for many genes.","tags":["biology","genetics"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-117","noteId":"demo-note-117","front":"Where does most cellular ATP production occur in eukaryotes?","back":"Across the inner mitochondrial membrane during oxidative phosphorylation.","extra":"Glycolysis takes place in the cytosol.","tags":["biology","cells"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-118","noteId":"demo-note-118","front":"How do you say ‘library’ in Finnish?","back":"Kirjasto.","extra":"Example: Menen kirjastoon means ‘I am going to the library.’","tags":["language","finnish"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-119","noteId":"demo-note-119","front":"What does the Spanish word ‘despacio’ mean?","back":"Slowly.","extra":"It can be used to ask someone to speak more slowly.","tags":["language","spanish"],"source":"Synthetic Cue demo collection"},
+      {"id":"demo-card-120","noteId":"demo-note-120","front":"Which mountain range separates much of Spain from France?","back":"The Pyrenees.","extra":"The range extends from the Bay of Biscay to the Mediterranean Sea.","tags":["geography","europe"],"source":"Synthetic Cue demo collection"}
     ]
   },
   "knowledge": {
     "documents": [
       {"id":"kb-local-first","title":"Local-first AI","excerpt":"Local-first applications keep private data and model inference on the user's device where practical.","language":"en","keywords":["privacy","device","AI"],"source":{"name":"Cue knowledge sample","ref":"knowledge/local-first"}},
       {"id":"kb-vector-search","title":"Semantic retrieval","excerpt":"Embeddings can find related content, but similarity should rank candidates rather than authorize actions.","language":"en","keywords":["embeddings","search","safety"],"source":{"name":"Cue knowledge sample","ref":"knowledge/semantic-retrieval"}},
-      {"id":"kb-multilingual","title":"Monikielinen haku","excerpt":"Monikieliset upotukset auttavat löytämään aiheeseen liittyvää sisältöä eri kielillä.","language":"fi","keywords":["upotukset","haku","kielet"],"source":{"name":"Cue-tietonäyte","ref":"knowledge/monikielinen-haku"}}
+      {"id":"kb-multilingual","title":"Monikielinen haku","excerpt":"Monikieliset upotukset auttavat löytämään aiheeseen liittyvää sisältöä eri kielillä.","language":"fi","keywords":["upotukset","haku","kielet"],"source":{"name":"Cue-tietonäyte","ref":"knowledge/monikielinen-haku"}},
+      {"id":"kb-confirmation","title":"Explicit confirmation","excerpt":"Side effects should remain pending until the user confirms the exact registered operation and arguments.","language":"en","keywords":["confirmation","permissions","actions"],"source":{"name":"Cue knowledge sample","ref":"knowledge/explicit-confirmation"}},
+      {"id":"kb-json-pointer","title":"JSON Pointer result binding","excerpt":"A validated JSON Pointer can select a value from a completed operation result for a dependent operation.","language":"en","keywords":["JSON Pointer","result binding","workflow"],"source":{"name":"Cue knowledge sample","ref":"knowledge/json-pointer"}},
+      {"id":"kb-fanout","title":"Collection fan-out","excerpt":"A bounded fan-out applies one validated registered operation to each item in a selected result collection.","language":"en","keywords":["collections","iteration","fan-out"],"source":{"name":"Cue knowledge sample","ref":"knowledge/fan-out"}},
+      {"id":"kb-idempotency","title":"Idempotent operation identifiers","excerpt":"Stable operation identifiers prevent a resumed workflow from repeating a completed side effect.","language":"en","keywords":["idempotency","retry","operations"],"source":{"name":"Cue knowledge sample","ref":"knowledge/idempotency"}},
+      {"id":"kb-timezones","title":"Time zones and event ranges","excerpt":"Calendar searches should use explicit time zones and half-open date ranges to avoid boundary duplication.","language":"en","keywords":["calendar","time zones","date ranges"],"source":{"name":"Cue knowledge sample","ref":"knowledge/time-zones"}},
+      {"id":"kb-local-retrieval","title":"Local tool retrieval","excerpt":"Local semantic retrieval narrows candidates, but a separate planner may need the complete available tool catalog.","language":"en","keywords":["MiniLM","tool discovery","retrieval"],"source":{"name":"Cue knowledge sample","ref":"knowledge/local-retrieval"}},
+      {"id":"kb-synthetic-data","title":"Synthetic fixture data","excerpt":"Deterministic fictional records make integration tests repeatable without connecting real personal accounts.","language":"en","keywords":["fixtures","synthetic data","testing"],"source":{"name":"Cue knowledge sample","ref":"knowledge/synthetic-data"}}
     ],
     "chunks": [
       {"id":"chunk-local-first-1","documentId":"kb-local-first","ordinal":0,"text":"Local-first AI keeps data and inference close to the user."},
       {"id":"chunk-vector-search-1","documentId":"kb-vector-search","ordinal":0,"text":"Semantic similarity is for ranking. It does not grant permission."},
-      {"id":"chunk-multilingual-1","documentId":"kb-multilingual","ordinal":0,"text":"Monikieliset upotukset tukevat eri kielillä tehtävää semanttista hakua."}
+      {"id":"chunk-multilingual-1","documentId":"kb-multilingual","ordinal":0,"text":"Monikieliset upotukset tukevat eri kielillä tehtävää semanttista hakua."},
+      {"id":"chunk-confirmation-1","documentId":"kb-confirmation","ordinal":0,"text":"Confirm the exact side effect and arguments before dispatch."},
+      {"id":"chunk-json-pointer-1","documentId":"kb-json-pointer","ordinal":0,"text":"Use validated JSON Pointers to bind values from completed results."},
+      {"id":"chunk-fanout-1","documentId":"kb-fanout","ordinal":0,"text":"Fan-out is bounded and invokes a registered tool once for each selected item."},
+      {"id":"chunk-idempotency-1","documentId":"kb-idempotency","ordinal":0,"text":"Stable operation IDs prevent duplicate effects during workflow resumption."},
+      {"id":"chunk-timezones-1","documentId":"kb-timezones","ordinal":0,"text":"Use explicit time zones and half-open ranges for calendar queries."},
+      {"id":"chunk-local-retrieval-1","documentId":"kb-local-retrieval","ordinal":0,"text":"Retrieval provides candidates; external planning may use the full tool catalog."},
+      {"id":"chunk-synthetic-data-1","documentId":"kb-synthetic-data","ordinal":0,"text":"Fictional seeded records enable deterministic integration tests."}
     ]
   },
   "web": {
     "results": [
       {"id":"web-1","title":"Local models for private assistants","summary":"An illustrative result about running language models on personal devices.","url":"https://example.invalid/local-models","imageAssetId":"web-research-image","keywords":["AI","local","models"]},
       {"id":"web-2","title":"Designing safer tool use","summary":"An illustrative result on schema validation and explicit confirmation for actions.","url":"https://example.invalid/safer-tools","keywords":["safety","validation","tools"]},
-      {"id":"web-3","title":"Multilingual semantic search","summary":"An illustrative overview of cross-language embedding retrieval.","url":"https://example.invalid/multilingual-search","keywords":["multilingual","embedding","research"]}
+      {"id":"web-3","title":"Multilingual semantic search","summary":"An illustrative overview of cross-language embedding retrieval.","url":"https://example.invalid/multilingual-search","keywords":["multilingual","embedding","research"]},
+      {"id":"web-4","title":"Safer workflow resumption","summary":"An illustrative guide to preserving completed results and pending confirmations across retries.","url":"https://example.invalid/workflow-resumption","keywords":["workflow","retry","idempotency"]},
+      {"id":"web-5","title":"Calendar data and time zones","summary":"An illustrative overview of explicit offsets, event intervals, and daylight-saving transitions.","url":"https://example.invalid/calendar-time-zones","keywords":["calendar","time zones","dates"]},
+      {"id":"web-6","title":"Testing model-assisted applications","summary":"An illustrative article about mocking model outputs while exercising real validators and dispatchers.","url":"https://example.invalid/model-assisted-tests","keywords":["testing","mocking","structured plans"]}
     ],
     "assets": [
       {"id":"web-research-image","mimeType":"image/svg+xml","alt":"Abstract illustration of a magnifying glass over research notes","originalRef":"src/demo/assets/research.svg","width":640,"height":360,"metadata":{"synthetic":true}}
@@ -43,20 +68,68 @@
       {"id":"event-2","title":"Project sync","start":"2026-11-14T11:00:00+02:00","end":"2026-11-14T11:30:00+02:00","location":"Online"},
       {"id":"event-3","title":"Library planning","start":"2026-11-15T10:00:00+02:00","end":"2026-11-15T10:45:00+02:00","location":"North Hall"},
       {"id":"event-4","title":"Garden sensor workshop","start":"2026-11-15T13:00:00+02:00","end":"2026-11-15T14:00:00+02:00","location":"Workshop room"},
-      {"id":"event-5","title":"Dentist appointment","start":"2026-11-20T14:30:00+02:00","end":"2026-11-20T15:00:00+02:00","location":"North Clinic"}
+      {"id":"event-5","title":"Dentist appointment","start":"2026-11-20T14:30:00+02:00","end":"2026-11-20T15:00:00+02:00","location":"North Clinic"},
+      {"id":"demo-event-001","title":"Morning team meeting","start":"2026-11-16T09:00:00+02:00","end":"2026-11-16T09:30:00+02:00","location":"Studio 2","eventType":"meeting","category":"work","attendees":["Nora","Elias"],"description":"Weekly team check-in."},
+      {"id":"demo-event-002","title":"Pick up garden supplies","start":"2026-11-16T11:15:00+02:00","end":"2026-11-16T11:45:00+02:00","location":"Greenway Market","eventType":"reminder","category":"errand"},
+      {"id":"demo-event-003","title":"Garden work","start":"2026-11-16T16:00:00+02:00","end":"2026-11-16T17:30:00+02:00","location":"Back garden","eventType":"reminder","category":"outdoors","description":"Prepare the raised beds and prune the berry bushes."},
+      {"id":"demo-event-004","title":"Evening run","start":"2026-11-16T18:15:00+02:00","end":"2026-11-16T19:00:00+02:00","location":"Riverside path","eventType":"reminder","category":"exercise"},
+      {"id":"demo-event-005","title":"Morning team meeting","start":"2026-11-17T08:30:00+02:00","end":"2026-11-17T09:00:00+02:00","location":"Video call","eventType":"meeting","category":"work","attendees":["Nora","Elias","Mika"],"description":"Review the sprint board and today's priorities."},
+      {"id":"demo-event-006","title":"Dentist appointment","start":"2026-11-17T10:20:00+02:00","end":"2026-11-17T11:05:00+02:00","location":"North Clinic","eventType":"appointment","category":"health"},
+      {"id":"demo-event-007","title":"Garden work","start":"2026-11-17T15:00:00+02:00","end":"2026-11-17T16:30:00+02:00","location":"Back garden","eventType":"reminder","category":"outdoors","description":"Move the compost and cover the herb bed before the cold night."},
+      {"id":"demo-event-008","title":"Grocery shopping","start":"2026-11-17T18:00:00+02:00","end":"2026-11-17T18:45:00+02:00","location":"Harbor Market","eventType":"reminder","category":"errand"},
+      {"id":"demo-event-009","title":"Project review — design","start":"2026-11-18T09:15:00+02:00","end":"2026-11-18T10:00:00+02:00","location":"Studio 2","eventType":"meeting","category":"work","attendees":["Aino","Leo"],"description":"Review the revised interaction flow."},
+      {"id":"demo-event-010","title":"Library planning","start":"2026-11-18T12:00:00+02:00","end":"2026-11-18T12:40:00+02:00","location":"Central Library","eventType":"meeting","category":"personal"},
+      {"id":"demo-event-011","title":"Pick up supplies","start":"2026-11-18T17:00:00+02:00","end":"2026-11-18T17:30:00+02:00","location":"Hardware shop","eventType":"reminder","category":"errand"},
+      {"id":"demo-event-012","title":"Weekly planning","start":"2026-11-19T08:45:00+02:00","end":"2026-11-19T09:15:00+02:00","location":"Home office","eventType":"meeting","category":"personal","attendees":["Nora"]},
+      {"id":"demo-event-013","title":"Project review — budget","start":"2026-11-19T10:00:00+02:00","end":"2026-11-19T10:45:00+02:00","location":"Meeting room B","eventType":"meeting","category":"work","attendees":["Elias","Mika"],"description":"Check the fictional November project budget."},
+      {"id":"demo-event-014","title":"Lunch with Mira","start":"2026-11-19T12:15:00+02:00","end":"2026-11-19T13:15:00+02:00","location":"Cedar Cafe","eventType":"lunch","category":"personal"},
+      {"id":"demo-event-015","title":"Evening run","start":"2026-11-19T18:30:00+02:00","end":"2026-11-19T19:20:00+02:00","location":"Riverside path","eventType":"reminder","category":"exercise"},
+      {"id":"demo-event-016","title":"Morning team meeting","start":"2026-11-20T09:00:00+02:00","end":"2026-11-20T09:30:00+02:00","location":"Video call","eventType":"meeting","category":"work"},
+      {"id":"demo-event-017","title":"Dentist appointment","start":"2026-11-20T14:30:00+02:00","end":"2026-11-20T15:00:00+02:00","location":"North Clinic","eventType":"appointment","category":"health","description":"Routine check-up."},
+      {"id":"demo-event-018","title":"Project review","start":"2026-11-20T14:45:00+02:00","end":"2026-11-20T15:30:00+02:00","location":"Studio 2","eventType":"meeting","category":"work","attendees":["Aino","Leo"]},
+      {"id":"demo-event-019","title":"Visit family","start":"2026-11-20T19:00:00+02:00","end":"2026-11-20T21:00:00+02:00","location":"West District","eventType":"reminder","category":"personal"},
+      {"id":"demo-event-020","title":"Morning swim","start":"2026-11-21T08:00:00+02:00","end":"2026-11-21T08:50:00+02:00","location":"Community pool","eventType":"reminder","category":"exercise"},
+      {"id":"demo-event-021","title":"Pick up supplies","start":"2026-11-21T11:00:00+02:00","end":"2026-11-21T11:35:00+02:00","location":"Garden center","eventType":"reminder","category":"errand"},
+      {"id":"demo-event-022","title":"Household tasks","start":"2026-11-21T14:00:00+02:00","end":"2026-11-21T16:00:00+02:00","location":"Home","eventType":"reminder","category":"household","description":"Tidy the storage room and replace the hallway bulb."},
+      {"id":"demo-event-023","title":"Board game night","start":"2026-11-21T19:00:00+02:00","end":"2026-11-21T22:00:00+02:00","location":"Nora's apartment","eventType":"reminder","category":"personal"},
+      {"id":"demo-event-024","title":"Weekly planning","start":"2026-11-22T09:30:00+02:00","end":"2026-11-22T10:00:00+02:00","location":"Home office","eventType":"meeting","category":"personal"},
+      {"id":"demo-event-025","title":"Grocery shopping","start":"2026-11-22T11:30:00+02:00","end":"2026-11-22T12:20:00+02:00","location":"Harbor Market","eventType":"reminder","category":"errand"},
+      {"id":"demo-event-026","title":"Garden work","start":"2026-11-22T15:00:00+02:00","end":"2026-11-22T16:30:00+02:00","location":"Back garden","eventType":"reminder","category":"outdoors"},
+      {"id":"demo-event-027","title":"Prepare for Monday","start":"2026-11-22T20:30:00+02:00","end":"2026-11-22T21:00:00+02:00","location":"Home","eventType":"reminder","category":"personal"},
+      {"id":"demo-event-028","title":"Morning team meeting","start":"2026-11-23T09:00:00+02:00","end":"2026-11-23T09:30:00+02:00","location":"Studio 2","eventType":"meeting","category":"work","attendees":["Nora","Mika"]},
+      {"id":"demo-event-029","title":"Project review — design","start":"2026-11-23T10:00:00+02:00","end":"2026-11-23T10:45:00+02:00","location":"Meeting room B","eventType":"meeting","category":"work"},
+      {"id":"demo-event-030","title":"Library planning","start":"2026-11-23T15:30:00+02:00","end":"2026-11-23T16:15:00+02:00","location":"Central Library","eventType":"appointment","category":"personal"},
+      {"id":"demo-event-031","title":"Morning check-in","start":"2026-11-24T08:45:00+01:00","end":"2026-11-24T09:05:00+01:00","location":"Video call","eventType":"meeting","category":"work","attendees":["Aino"]},
+      {"id":"demo-event-032","title":"Pick up garden supplies","start":"2026-11-24T12:00:00+01:00","end":"2026-11-24T12:30:00+01:00","location":"Greenway Market","eventType":"reminder","category":"errand"},
+      {"id":"demo-event-033","title":"Evening basketball","start":"2026-11-25T18:00:00+01:00","end":"2026-11-25T19:30:00+01:00","location":"East Sports Hall","eventType":"reminder","category":"sports"},
+      {"id":"demo-event-034","title":"Project review — budget","start":"2026-11-26T10:00:00+01:00","end":"2026-11-26T10:50:00+01:00","location":"Meeting room A","eventType":"meeting","category":"work","attendees":["Elias","Leo"]},
+      {"id":"demo-event-035","title":"Overnight train reminder","start":"2026-11-26T23:30:00+01:00","end":"2026-11-27T00:30:00+01:00","location":"Central Station","eventType":"reminder","category":"travel","description":"Fictional overnight trip to visit family."},
+      {"id":"demo-event-036","title":"Dentist appointment","start":"2026-11-27T09:15:00+01:00","end":"2026-11-27T09:55:00+01:00","location":"North Clinic","eventType":"appointment","category":"health"},
+      {"id":"demo-event-037","title":"Project review","start":"2026-11-28T13:00:00-05:00","end":"2026-11-28T13:45:00-05:00","location":"Remote","eventType":"meeting","category":"work","description":"Synthetic remote review in a different time zone."},
+      {"id":"demo-event-038","title":"Visit family","start":"2026-11-29T10:00:00+01:00","end":"2026-11-29T13:00:00+01:00","location":"West District","eventType":"reminder","category":"personal"},
+      {"id":"demo-event-039","title":"Monthly planning","start":"2026-11-30T09:00:00+01:00","end":"2026-11-30T10:00:00+01:00","location":"Home office","eventType":"meeting","category":"personal","attendees":["Nora","Elias"]},
+      {"id":"demo-event-040","title":"Garden work","start":"2026-12-03T16:00:00+01:00","end":"2026-12-03T17:30:00+01:00","location":"Back garden","eventType":"reminder","category":"outdoors"},
+      {"id":"demo-event-041","title":"Grocery shopping","start":"2026-12-08T17:30:00+01:00","end":"2026-12-08T18:15:00+01:00","location":"Harbor Market","eventType":"reminder","category":"errand"},
+      {"id":"demo-event-042","title":"Project review — design","start":"2026-12-12T11:00:00+01:00","end":"2026-12-12T11:50:00+01:00","location":"Studio 2","eventType":"meeting","category":"work","attendees":["Aino","Mika"]},
+      {"id":"demo-event-043","title":"Garden work — greenhouse setup","start":"2026-11-17T16:00:00+02:00","end":"2026-11-17T17:00:00+02:00","location":"Back garden","eventType":"reminder","category":"outdoors","description":"Set up the small greenhouse shelving."}
     ]
   },
   "notifications": {
     "items": [
       {"id":"notification-1","app":"Messages","sender":"Alex","timestamp":"2026-11-13T18:42:00+02:00","preview":"Could you send me the meeting notes?"},
       {"id":"notification-2","app":"Mail","sender":"Sam","timestamp":"2026-11-13T17:15:00+02:00","preview":"The fictional draft is ready for your review."},
-      {"id":"notification-3","app":"Messages","sender":"Mira","timestamp":"2026-11-13T16:05:00+02:00","preview":"The greenhouse sensors are working well."}
+      {"id":"notification-3","app":"Messages","sender":"Mira","timestamp":"2026-11-13T16:05:00+02:00","preview":"The greenhouse sensors are working well.","status":"read"},
+      {"id":"notification-4","app":"Calendar","sender":"Cue demo","timestamp":"2026-11-16T08:10:00+02:00","preview":"Morning team meeting starts at 09:00.","status":"unread"},
+      {"id":"notification-5","app":"Mail","sender":"Elias","timestamp":"2026-11-15T20:25:00+02:00","preview":"The fictional project review notes are ready.","status":"archived"},
+      {"id":"notification-6","app":"Messages","sender":"Nora","timestamp":"2026-11-16T07:45:00+02:00","preview":"Please remember the garden supplies this afternoon.","status":"unread"}
     ]
   },
   "alarm": {
     "items": [
       {"id":"alarm-1","label":"Morning alarm","time":"2026-11-14T07:00:00+02:00","enabled":true},
-      {"id":"alarm-2","label":"Weekend reminder","time":"2026-11-15T08:30:00+02:00","enabled":false}
+      {"id":"alarm-2","label":"Weekend reminder","time":"2026-11-15T08:30:00+02:00","enabled":false},
+      {"id":"alarm-3","label":"Morning run","time":"2026-11-17T06:45:00+02:00","enabled":true},
+      {"id":"alarm-4","label":"Library reminder","time":"2026-11-18T11:45:00+02:00","enabled":true}
     ]
   }
 }

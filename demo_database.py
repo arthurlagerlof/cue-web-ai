@@ -62,6 +62,13 @@ def seed_database(target=DEFAULT_SEED_PATH, manifests_path=None, records_path=No
         try:
             connection.executescript(SCHEMA)
             connection.execute("INSERT INTO settings VALUES(?,?)", ("tool_retrieval", json.dumps(retrieval_config, ensure_ascii=False, sort_keys=True)))
+            demo_clock = os.environ.get("CUE_DEMO_CLOCK", "2026-11-16T08:00:00+02:00")
+            try:
+                parsed_demo_clock = datetime.fromisoformat(demo_clock.replace("Z", "+00:00"))
+            except ValueError as exc:
+                raise ValueError("CUE_DEMO_CLOCK must be an ISO-8601 date-time") from exc
+            demo_day_offset = (parsed_demo_clock.date() - datetime(2026, 11, 16).date()).days
+            connection.execute("INSERT INTO settings VALUES(?,?)", ("demo_clock", json.dumps(demo_clock)))
             provider_by_id = {provider["id"]: provider for provider in provider_manifests}
             if len(provider_by_id) != len(provider_manifests) or any(provider.get("demo") is not True for provider in provider_manifests):
                 raise ValueError("Provider manifests must have unique IDs and be marked as demo providers")
@@ -97,6 +104,19 @@ def seed_database(target=DEFAULT_SEED_PATH, manifests_path=None, records_path=No
                             connection.execute("INSERT INTO assets(id,mime_type,alt,original_ref,width,height,metadata_json) VALUES(?,?,?,?,?,?,?)", (asset["id"], asset["mimeType"], asset["alt"], asset["originalRef"], asset.get("width"), asset.get("height"), json.dumps(asset.get("metadata", {}), ensure_ascii=False, sort_keys=True)))
                         continue
                     for row in rows:
+                        if demo_day_offset and provider_id == "calendar" and record_type == "events":
+                            row = dict(row)
+                            for field in ("start", "end"):
+                                if isinstance(row.get(field), str):
+                                    row[field] = (datetime.fromisoformat(row[field].replace("Z", "+00:00")) + timedelta(days=demo_day_offset)).isoformat()
+                        elif demo_day_offset and provider_id == "notifications" and record_type == "items":
+                            row = dict(row)
+                            if isinstance(row.get("timestamp"), str):
+                                row["timestamp"] = (datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")) + timedelta(days=demo_day_offset)).isoformat()
+                        elif demo_day_offset and provider_id == "alarm" and record_type == "items":
+                            row = dict(row)
+                            if isinstance(row.get("time"), str):
+                                row["time"] = (datetime.fromisoformat(row["time"].replace("Z", "+00:00")) + timedelta(days=demo_day_offset)).isoformat()
                         record_id = str(row["id"])
                         connection.execute("INSERT INTO records VALUES(?,?,?,?)", (provider_id, record_type, record_id, json.dumps(row, ensure_ascii=False, sort_keys=True)))
             vector_file = ROOT / "data" / "seed" / "tool-embeddings.f32"
@@ -550,6 +570,7 @@ def registry(session_id):
             metadata = manifest_by_id.get(item["id"], {})
             item["operationType"] = metadata.get("operationType")
             item["effect"] = metadata.get("effect")
+            item["requiredPermissions"] = metadata.get("requiredPermissions", [])
             if metadata.get("contextSearch"):
                 item["contextSearch"] = metadata["contextSearch"]
             tools.append(item)
@@ -560,13 +581,15 @@ def registry(session_id):
         pending_embeddings = [row[0] for row in connection.execute("SELECT r.id FROM tool_retrieval_records r JOIN embeddings e ON e.owner_type='tool_retrieval' AND e.owner_id=r.id WHERE e.status!='ready' ORDER BY r.id")]
         retrieval_config_row = connection.execute("SELECT value_json FROM settings WHERE key='tool_retrieval'").fetchone()
         retrieval_config = json.loads(retrieval_config_row[0]) if retrieval_config_row else {}
+        demo_clock_row = connection.execute("SELECT value_json FROM settings WHERE key='demo_clock'").fetchone()
+        demo_clock = json.loads(demo_clock_row[0]) if demo_clock_row else None
         assets = [dict(row) for row in connection.execute("SELECT * FROM assets ORDER BY id")]
         for asset in assets:
             asset["mimeType"] = asset.pop("mime_type")
             asset["originalRef"] = asset.pop("original_ref")
             asset["metadata"] = json.loads(asset.pop("metadata_json"))
         data.setdefault("web", {})["assets"] = assets
-        return {"providers": providers, "tools": tools, "data": data, "toolEmbeddingsReady": embedding_state["total"] > 0 and embedding_state["ready"] == embedding_state["total"], "pendingToolEmbeddingIds": pending_embeddings, "pendingProviderDataIds": pending_provider_data, "toolRetrievalConfig": retrieval_config}
+        return {"providers": providers, "tools": tools, "data": data, "demoClock": demo_clock, "toolEmbeddingsReady": embedding_state["total"] > 0 and embedding_state["ready"] == embedding_state["total"], "pendingToolEmbeddingIds": pending_embeddings, "pendingProviderDataIds": pending_provider_data, "toolRetrievalConfig": retrieval_config}
     finally:
         connection.close()
 
@@ -698,11 +721,17 @@ def execute_tool(session_id, tool_id, arguments, operation_id=None):
         connection = sqlite3.connect(path)
         connection.row_factory = sqlite3.Row
         try:
-            row = connection.execute("SELECT t.*,p.status AS provider_status FROM tools t JOIN providers p ON p.id=t.provider_id WHERE t.id=?", (tool_id,)).fetchone()
+            row = connection.execute("SELECT t.*,p.status AS provider_status,p.manifest_json AS provider_manifest FROM tools t JOIN providers p ON p.id=t.provider_id WHERE t.id=?", (tool_id,)).fetchone()
             if row is None:
                 raise LookupError(f"Unknown registered tool: {tool_id}")
             if row["status"] != "available" or row["provider_status"] != "available":
                 raise RuntimeError(f"Provider unavailable: {row['provider_id']}")
+            manifests = json.loads((ROOT / "data" / "seed" / "tool-manifests.json").read_text(encoding="utf-8"))
+            metadata = next((tool for tool in manifests if tool["id"] == tool_id), {})
+            required_permissions = set(metadata.get("requiredPermissions", []))
+            provider_permissions = set(json.loads(row["provider_manifest"]).get("permissions", []))
+            if not required_permissions.issubset(provider_permissions):
+                raise PermissionError(f"Provider lacks execution permission for {tool_id}")
             errors = validate_arguments(json.loads(row["parameters_json"]), arguments)
             if errors:
                 raise ValueError("Invalid arguments: " + "; ".join(errors))

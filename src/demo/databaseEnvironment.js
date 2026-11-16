@@ -1,10 +1,10 @@
 import { ToolDispatcher } from '../intelligence/dispatcher.js';
 import { buildToolExampleIndex, ToolIntelligence } from '../intelligence/toolIntelligence.js';
-import { normalizeArgumentsLocalFirst } from '../intelligence/argumentNormalization.js';
+import { normalizeArgumentsWithModel } from '../intelligence/argumentNormalization.js';
 import { buildProviderDataIndex } from '../intelligence/retrieval/providerData.js';
 import { ToolRegistry } from '../intelligence/toolRegistry.js';
 
-export async function createDatabaseEnvironment({ registryData, embed, rerankTools, onRerankDecision, postApi, normalizeArguments, fallbackNormalizeArguments, onNormalizerFallback, argumentNormalizerEnabled, reasoningMode = () => 'automatic', threshold = undefined, plausibleThreshold = undefined, ambiguityMargin = undefined, initialState }) {
+export async function createDatabaseEnvironment({ registryData, embed, rerankTools, onRerankDecision, postApi, normalizeArguments, argumentNormalizerEnabled, threshold = undefined, plausibleThreshold = undefined, ambiguityMargin = undefined, initialState }) {
   if (!registryData || !Array.isArray(registryData.providers) || !Array.isArray(registryData.tools)) {
     throw new TypeError('The demo registry response is invalid');
   }
@@ -48,7 +48,7 @@ export async function createDatabaseEnvironment({ registryData, embed, rerankToo
       id: provider.id,
       available: provider.status === 'available',
       canExecute: true,
-      permissions: [],
+      permissions: provider.manifest?.permissions ?? [],
       contextSearch: provider.manifest?.contextSearch,
       execute: async (toolId, args, { confirmed, operationId } = {}) => {
         const response = await postApi('/api/demo/execute', { toolId, arguments: args, confirmed: confirmed === true, operationId });
@@ -73,7 +73,7 @@ export async function createDatabaseEnvironment({ registryData, embed, rerankToo
     }
   }
 
-  const dispatcher = new ToolDispatcher(registry);
+  const dispatcher = new ToolDispatcher(registry, { maxOperations: config.maxOperations ?? 8 });
   const intelligence = new ToolIntelligence({
     registry,
     dispatcher,
@@ -92,13 +92,8 @@ export async function createDatabaseEnvironment({ registryData, embed, rerankToo
     maxOperations: config.maxOperations ?? 8,
     initialState,
     argumentNormalizerEnabled,
-    normalizeArguments: fallbackNormalizeArguments
-      ? input => normalizeArgumentsLocalFirst(input, {
-        local: fallbackNormalizeArguments,
-        external: normalizeArguments,
-        allowExternal: reasoningMode() === 'automatic',
-        onFallback: onNormalizerFallback,
-      })
+    normalizeArguments: normalizeArguments
+      ? input => normalizeArgumentsWithModel(input, { generate: normalizeArguments })
       : undefined,
     searchTools: async vector => {
       const response = await postApi('/api/demo/tools/search', { vector, limit: config.topK ?? 5, threshold: plausibleScore, scoring, weights });
@@ -109,5 +104,5 @@ export async function createDatabaseEnvironment({ registryData, embed, rerankToo
       return response.results;
     },
   });
-  return { registry, dispatcher, intelligence, exampleIndex, providerDataIndex, providers: registryData.providers, data: registryData.data };
+  return { registry, dispatcher, intelligence, exampleIndex, providerDataIndex, providers: registryData.providers, data: registryData.data, demoClock: registryData.demoClock };
 }
