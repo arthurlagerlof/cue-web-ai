@@ -29,7 +29,10 @@
       { "type": "object", "required": ["type"], "properties": { "type": { "const": "divider" } }, "additionalProperties": true },
       { "type": "object", "required": ["type", "actionId", "label"], "properties": { "type": { "const": "action" }, "actionId": { "type": "string" }, "label": { "type": "string" } }, "additionalProperties": true }
     ] },
-    "action": { "type": "object", "required": ["id", "toolId", "arguments"], "properties": { "id": { "type": "string", "minLength": 1 }, "toolId": { "type": "string", "minLength": 1 }, "arguments": { "type": "object" }, "label": { "type": "string" } }, "additionalProperties": true },
+    "action": { "oneOf": [
+      { "type": "object", "required": ["id", "kind", "interactionId", "optionId", "label"], "properties": { "id": { "type": "string", "minLength": 1 }, "kind": { "const": "interaction_option" }, "interactionId": { "type": "string", "minLength": 1 }, "optionId": { "type": "string", "minLength": 1 }, "label": { "type": "string", "minLength": 1 } }, "additionalProperties": true },
+      { "type": "object", "required": ["id", "toolId", "arguments"], "properties": { "id": { "type": "string", "minLength": 1 }, "toolId": { "type": "string", "minLength": 1 }, "arguments": { "type": "object" }, "label": { "type": "string" } }, "additionalProperties": true }
+    ] },
     "asset": { "type": "object", "required": ["id", "mimeType", "alt"], "properties": { "id": { "type": "string", "minLength": 1 }, "mimeType": { "type": "string", "pattern": "^[a-zA-Z0-9.+-]+/[a-zA-Z0-9.+-]+$" }, "alt": { "type": "string" }, "originalRef": { "type": "string" }, "width": { "type": "integer", "minimum": 1 }, "height": { "type": "integer", "minimum": 1 } }, "additionalProperties": true }
   },
   "additionalProperties": true

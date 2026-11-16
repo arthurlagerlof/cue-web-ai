@@ -13,7 +13,7 @@ class BackendEnvironmentTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / ".env"
             path.write_text(
-                "# Example\nOPENROUTER_API_KEY='test#key'\nBACKEND_PORT=9000 # custom port\n"
+                "# Example\nOPENROUTER_API_KEY='test#key'\nOPENROUTER_MODEL=dots-studio/custom\nBACKEND_PORT=9000 # custom port\n"
                 'CUE_DEMO_SEED_DB="C:\\test folder\\seed.db"\n'
                 "export CUE_DEMO_RUNTIME_DIR=C:\\runtime\nUNRELATED_SETTING=ignored\n",
                 encoding="utf-8",
@@ -21,6 +21,7 @@ class BackendEnvironmentTests(unittest.TestCase):
             with patch.dict(os.environ, {"BACKEND_PORT": "8001"}, clear=True):
                 load_backend_env(path)
                 self.assertEqual(os.environ["OPENROUTER_API_KEY"], "test#key")
+                self.assertEqual(os.environ["OPENROUTER_MODEL"], "dots-studio/custom")
                 self.assertEqual(os.environ["BACKEND_PORT"], "8001")
                 self.assertEqual(os.environ["CUE_DEMO_SEED_DB"], "C:\\test folder\\seed.db")
                 self.assertEqual(os.environ["CUE_DEMO_RUNTIME_DIR"], "C:\\runtime")

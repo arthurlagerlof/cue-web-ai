@@ -32,10 +32,25 @@ class OpenRouterTests(unittest.TestCase):
         self.assertEqual(openrouter_normalizer.generate("synthetic prompt"), '{"status":"resolved"}')
         request = build_opener.return_value.open.call_args.args[0]
         payload = json.loads(request.data)
-        self.assertEqual(payload["model"], "dots-studio/dots-3-note-preview:free")
+        self.assertEqual(payload["model"], openrouter_normalizer.DEFAULT_MODEL)
         self.assertEqual(payload["messages"], [{"role": "user", "content": "synthetic prompt"}])
         self.assertEqual(request.get_header("Authorization"), "Bearer test-key")
         self.assertEqual(build_opener.return_value.open.call_args.kwargs["timeout"], 30)
+
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key", "OPENROUTER_MODEL": "dots-studio/custom"})
+    @patch("openrouter_normalizer.urllib.request.build_opener")
+    def test_structured_reasoning_uses_configured_model_and_schema(self, build_opener):
+        build_opener.return_value.open.return_value = MockResponse({
+            "choices": [{"message": {"content": '{"kind":"plan"}'}, "finish_reason": "stop"}],
+        })
+        schema = {"type": "object", "properties": {"kind": {"type": "string"}}}
+        self.assertEqual(openrouter_normalizer.generate("synthetic prompt", response_schema=schema), '{"kind":"plan"}')
+        request = build_opener.return_value.open.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(payload["model"], "dots-studio/custom")
+        self.assertEqual(payload["response_format"]["type"], "json_schema")
+        self.assertTrue(payload["response_format"]["json_schema"]["strict"])
+        self.assertEqual(payload["response_format"]["json_schema"]["schema"], schema)
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": ""})
     def test_missing_key_and_invalid_prompt_are_explicit(self):

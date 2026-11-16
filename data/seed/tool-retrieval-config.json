@@ -9,5 +9,9 @@
     "keyword": 0.3,
     "example": 0.35
   },
-  "maxOperations": 4
+  "crossEncoder": {
+    "minimumScore": 0.20,
+    "margin": 0.10
+  },
+  "maxOperations": 8
 }

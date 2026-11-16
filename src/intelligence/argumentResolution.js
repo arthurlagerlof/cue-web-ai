@@ -177,6 +177,10 @@ function queryText(text, toolId) {
   return toolId === 'calendar.find_events' ? result : result || cleaned;
 }
 
+function jsonPointerFromPath(path) {
+  return `/${path.split('.').map(segment => segment.replace(/~/g, '~0').replace(/\//g, '~1')).join('/')}`;
+}
+
 function extractValue(name, rule, text, context) {
   const hint = rule['x-cue'] ?? {};
   if ((hint.role === 'interval_start' || hint.role === 'interval_end') && context.toolId === 'calendar.find_events') {
@@ -199,14 +203,14 @@ function extractValue(name, rule, text, context) {
     if (hasRelation && context.toolResults?.length) {
       for (const result of context.toolResults) for (const path of hint.referencePaths ?? []) {
         const value = path.split('.').reduce((current, key) => current == null ? undefined : current[key], result);
-        if (typeof value === 'string' && !Number.isNaN(Date.parse(value))) return { value, source: 'tool_result', originalText: text.match(/\b(?:before|beforehand|earlier|after|later|ennen|aikaisemmin|jälkeen|jalkeen)\b/i)?.[0], method: 'explicit-reference-derivation' };
+        if (typeof value === 'string' && !Number.isNaN(Date.parse(value))) return { value, source: 'tool_result', sourcePointer: jsonPointerFromPath(path), originalText: text.match(/\b(?:before|beforehand|earlier|after|later|ennen|aikaisemmin|jälkeen|jalkeen)\b/i)?.[0], method: 'explicit-reference-derivation' };
       }
     }
   }
   if (hint.role === 'derived_label' && context.toolResults?.length) {
     for (const result of context.toolResults) for (const path of hint.referencePaths ?? []) {
       const value = path.split('.').reduce((current, key) => current == null ? undefined : current[key], result);
-      if (typeof value === 'string' && value.trim()) return { value, source: 'tool_result', method: 'derived-from-tool-result' };
+      if (typeof value === 'string' && value.trim()) return { value, source: 'tool_result', sourcePointer: jsonPointerFromPath(path), method: 'derived-from-tool-result' };
     }
   }
   if (typeof hint.role === 'string') {
@@ -333,7 +337,7 @@ export function resolveArguments({ request, tool, previous = {}, context = {} })
       continue;
     }
     arguments_[name] = candidate.value;
-    resolved[name] = { value: candidate.value, status: 'resolved', source: candidate.source, originalText: extracted?.originalText ?? extracted?.text ?? candidate.originalText, method: candidate.method };
+    resolved[name] = { value: candidate.value, status: 'resolved', source: candidate.source, ...(candidate.sourcePointer ? { sourcePointer: candidate.sourcePointer } : {}), originalText: extracted?.originalText ?? extracted?.text ?? candidate.originalText, method: candidate.method };
   }
   const requiredValidation = validateArguments(schema, arguments_);
   for (const error of requiredValidation.errors) {

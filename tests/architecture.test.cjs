@@ -13,6 +13,7 @@ const modules = Promise.all([
   import('../src/intelligence/retrieval/providerData.js'),
   import('../src/intelligence/argumentNormalization.js'),
   import('../src/services/gemmaService.js'),
+  import('../src/intelligence/executionPlan.js'),
 ]);
 const fixturePath = path.join(__dirname, '..', 'src', 'display', 'fixtures', 'display-documents.json');
 const fixtures = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
@@ -73,7 +74,7 @@ async function environment(options = {}) {
   const [, , , mock] = await modules;
   return mock.createMockEnvironment({
     manifests, providers: testProviders(), embed: options.embed ?? (async text => fakeEmbed(text)),
-    searchTools: options.searchTools, searchProviderData: options.searchProviderData,
+    searchTools: options.searchTools, searchProviderData: options.searchProviderData, rerankTools: options.rerankTools,
     normalizeArguments: options.normalizeArguments, argumentNormalizerEnabled: options.argumentNormalizerEnabled, initialState: options.initialState,
     threshold: options.threshold ?? 0.2, ambiguityMargin: options.ambiguityMargin ?? 0.02,
   });
@@ -115,6 +116,17 @@ test('display validator checks nested components, assets, action IDs, and regist
   badArgs.actions[0].arguments = { query: 42 };
   assert.equal(display.validateDisplayDocument(badArgs, { registry: runtime.registry }).valid, false);
   assert.equal(registryModule.validateArguments(runtime.registry.get('anki.search_cards').parameters, { query: 'x' }).valid, true);
+  const choiceDocument = display.createDisplayDocument({
+    id: 'tool-choice',
+    title: 'Choose a tool',
+    source: { app: 'cue', name: 'Cue' },
+    state: 'clarification_required',
+    actions: [{ id: 'choice-1', kind: 'interaction_option', interactionId: 'conversation:awaiting_tool_choice:0', optionId: 'calendar.find_events', label: 'Find calendar events' }],
+    elements: [{ type: 'action', actionId: 'choice-1', label: 'Find calendar events' }],
+  });
+  assert.equal(display.validateDisplayDocument(choiceDocument, { registry: runtime.registry }).valid, true);
+  choiceDocument.actions[0].optionId = 'unregistered.fake';
+  assert.equal(display.validateDisplayDocument(choiceDocument, { registry: runtime.registry }).valid, true, 'interaction options are validated against the pending interaction, not the tool registry');
 });
 
 test('retrieval aggregation is source-aware, configurable, and unaffected by weak extra examples', async () => {
@@ -225,6 +237,232 @@ test('semantic retrieval finds expected tools in English and Finnish without mix
   assert.deepEqual(retrieval.discoverTools(fakeEmbed('qzxv plmokn').vector, runtime.exampleIndex, { threshold: 0.99 }), []);
   const status = retrieval.detectAmbiguity([{ toolId: 'a', score: 0.51 }, { toolId: 'b', score: 0.5 }], { minimumScore: 0.3, margin: 0.04 });
   assert.equal(status, 'ambiguous');
+});
+
+test('cross-encoder reranks only uncertain MiniLM results and requires a decisive margin', async () => {
+  const candidates = [
+    { toolId: 'calendar.find_events', score: 0.71, margin: 0.01 },
+    { toolId: 'calendar.create_event', score: 0.70 },
+  ];
+  let calls = 0;
+  const confident = await environment({
+    threshold: 0.5,
+    ambiguityMargin: 0.05,
+    searchTools: async () => [{ toolId: 'calendar.find_events', score: 0.9 }, { toolId: 'calendar.create_event', score: 0.7 }],
+    rerankTools: async () => { calls++; return []; },
+  });
+  assert.equal((await confident.intelligence.retrieve('Find a meeting')).kind, 'selected');
+  assert.equal(calls, 0);
+
+  const reranked = await environment({
+    threshold: 0.5,
+    ambiguityMargin: 0.05,
+    rerankTools: async (_query, inputs) => {
+      calls++;
+      assert.equal(inputs.length, 2);
+      assert.ok(inputs.every(input => input.text.length > 20));
+      return [{ toolId: 'calendar.find_events', score: 0.88 }, { toolId: 'calendar.create_event', score: 0.34 }];
+    },
+    searchTools: async () => candidates,
+  });
+  const selected = await reranked.intelligence.retrieve('Find my meeting');
+  assert.equal(selected.kind, 'selected');
+  assert.equal(selected.definition.id, 'calendar.find_events');
+  assert.equal(selected.retrieval.crossEncoderScore, 0.88);
+  assert.equal(calls, 1);
+
+  const uncertain = await environment({
+    threshold: 0.5,
+    ambiguityMargin: 0.05,
+    rerankTools: async () => [{ toolId: 'calendar.find_events', score: 0.7 }, { toolId: 'calendar.create_event', score: 0.67 }],
+    searchTools: async () => candidates,
+  });
+  const uncertainResult = await uncertain.intelligence.retrieve('Calendar request');
+  assert.equal(uncertainResult.kind, 'ambiguous');
+  assert.deepEqual(uncertainResult.diagnostics.candidates.map(item => item.score), [0.7, 0.67]);
+
+  const lowScore = await environment({
+    threshold: 0.5,
+    ambiguityMargin: 0.05,
+    rerankTools: async () => [{ toolId: 'calendar.find_events', score: 0.19 }, { toolId: 'calendar.create_event', score: 0.01 }],
+    searchTools: async () => candidates,
+  });
+  assert.equal((await lowScore.intelligence.retrieve('Calendar request')).kind, 'ambiguous');
+
+  const unavailable = await environment({
+    threshold: 0.5,
+    ambiguityMargin: 0.05,
+    rerankTools: async () => { throw new Error('wasm download failure'); },
+    searchTools: async () => candidates,
+  });
+  const failedResult = await unavailable.intelligence.retrieve('Calendar request');
+  assert.equal(failedResult.kind, 'ambiguous');
+  assert.equal(failedResult.diagnostics.error, 'wasm download failure');
+});
+
+test('configured cross-encoder thresholds select the decisive calendar result without fallback', async () => {
+  const { createDatabaseEnvironment } = await import('../src/demo/databaseEnvironment.js');
+  const ids = ['calendar.find_events', 'calendar.create_event', 'calendar.update_event', 'calendar.get_event'];
+  const scores = [0.581, 0.016, 0.010, 0.004];
+  const decisions = [];
+  const calls = [];
+  const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'seed', 'tool-retrieval-config.json'), 'utf8'));
+  const runtime = await createDatabaseEnvironment({
+    registryData: {
+      providers: [{ id: 'calendar', status: 'available' }],
+      tools: ids.map(id => manifests.find(tool => tool.id === id)),
+      data: {}, pendingToolEmbeddingIds: [], pendingProviderDataIds: [],
+      toolRetrievalConfig: config,
+    },
+    embed: async text => fakeEmbed(text),
+    rerankTools: async () => ids.map((toolId, index) => ({ toolId, score: scores[index] })).reverse(),
+    onRerankDecision: decision => decisions.push(decision),
+    postApi: async (route, payload) => {
+      calls.push({ route, payload });
+      if (route === '/api/demo/tools/search') return { results: ids.map((toolId, index) => ({ toolId, score: 0.57 - index * 0.01 })) };
+      if (route === '/api/demo/provider-data/search') return { results: {} };
+      if (route === '/api/demo/execute') return { result: { document: sampleDocument('calendar', 'Events', 'Found events'), data: { events: [] } } };
+      throw new Error(`Unexpected API request: ${route}`);
+    },
+  });
+  const outcome = await runtime.intelligence.handle('What events do I have tomorrow?', {
+    context: { now: new Date('2026-11-15T12:00:00Z'), timeZone: 'UTC', locale: 'en' },
+  });
+  assert.equal(outcome.kind, 'document');
+  assert.equal(outcome.state.status, 'completed');
+  assert.equal(calls.find(call => call.route === '/api/demo/execute').payload.toolId, 'calendar.find_events');
+  assert.equal(decisions.length, 1);
+  assert.equal(decisions[0].topScore, 0.581);
+  assert.equal(decisions[0].secondScore, 0.016);
+  assert.ok(Math.abs(decisions[0].margin - 0.565) < 1e-12);
+  assert.equal(decisions[0].minimumScore, 0.20);
+  assert.equal(decisions[0].minimumMargin, 0.10);
+  assert.equal(decisions[0].scorePassed, true);
+  assert.equal(decisions[0].marginPassed, true);
+  assert.equal(decisions[0].decision, 'selected');
+});
+
+test('cross-encoder applies score and margin boundaries including one candidate', async () => {
+  const runtime = await environment({ threshold: 0.7 });
+  runtime.intelligence.plausibleThreshold = 0.3;
+  for (const [scores, expected, scorePassed, marginPassed] of [
+    [[0.199, 0.01], 'ambiguous', false, true],
+    [[0.20, 0.10], 'selected', true, true],
+    [[0.30, 0.20], 'selected', true, true],
+    [[0.20, 0.101], 'ambiguous', true, false],
+    [[0.20], 'selected', true, true],
+    [[0.199], 'ambiguous', false, true],
+  ]) {
+    const ids = ['calendar.find_events', 'calendar.create_event'].slice(0, scores.length);
+    runtime.intelligence.searchTools = async () => ids.map(toolId => ({ toolId, score: 0.6 }));
+    runtime.intelligence.rerankTools = async () => ids.map((toolId, index) => ({ toolId, score: scores[index] }));
+    const result = await runtime.intelligence.retrieve('Calendar request');
+    assert.equal(result.kind, expected, `scores ${scores.join(', ')}`);
+    const decision = expected === 'selected' ? result.retrieval.rerankDiagnostics : result.diagnostics;
+    assert.equal(decision.scorePassed, scorePassed);
+    assert.equal(decision.marginPassed, marginPassed);
+    if (scores.length === 1) {
+      assert.equal(decision.secondScore, null);
+      assert.equal(decision.margin, null);
+    }
+  }
+});
+
+test('cross-encoder logits map monotonically to bounded routing scores', async () => {
+  const { crossEncoderScoreFromLogit } = await import('../src/intelligence/retrieval/crossEncoderScore.js');
+  const lower = crossEncoderScoreFromLogit(-2);
+  const neutral = crossEncoderScoreFromLogit(0);
+  const higher = crossEncoderScoreFromLogit(2);
+  assert.ok(lower >= 0 && lower < neutral && neutral < higher && higher <= 1);
+  assert.equal(neutral, 0.5);
+  assert.equal(higher, 1 / (1 + Math.exp(-2)));
+  assert.throws(() => crossEncoderScoreFromLogit(Number.NaN), /must be finite/);
+});
+
+async function crossEncoderWorker({ gpu = true, loadError, inferenceError } = {}) {
+  const vm = require('node:vm');
+  const ts = require('typescript');
+  const { crossEncoderScoreFromLogit } = await import('../src/intelligence/retrieval/crossEncoderScore.js');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', 'model.worker.ts'), 'utf8');
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const messages = [];
+  const loads = [];
+  const runs = [];
+  const disposals = [];
+  const self = {};
+  const pipeline = async (_task, _modelId, options) => {
+    loads.push({ device: options.device, dtype: options.dtype });
+    options.progress_callback({ status: 'progress', file: 'onnx/model_quantized.onnx', progress: 50 });
+    if (loadError?.[options.device]) throw new Error(loadError[options.device]);
+    const model = async () => {
+      runs.push(options.device);
+      if (inferenceError?.[options.device]) throw new Error(inferenceError[options.device]);
+      return { logits: { data: [1] } };
+    };
+    model.dispose = async () => { disposals.push(options.device); };
+    return { tokenizer: () => ({}), model };
+  };
+  const context = {
+    exports: {}, self, Error,
+    navigator: gpu ? { gpu: { requestAdapter: async () => ({}) } } : {},
+    postMessage: message => messages.push(message),
+    require: name => {
+      if (name === '@huggingface/transformers') return { pipeline, env: {} };
+      if (name === './asrModels') return { ASR_MODELS: {} };
+      if (name.endsWith('crossEncoderScore.js')) return { crossEncoderScoreFromLogit };
+      throw new Error(`Unexpected import: ${name}`);
+    },
+  };
+  vm.runInNewContext(compiled, context);
+  const send = async (id = 1) => self.onmessage({ data: { id, stage: 'rerank', text: 'query', candidates: [{ toolId: 'a', text: 'candidate' }, { toolId: 'b', text: 'candidate' }] } });
+  return { send, messages, loads, runs, disposals };
+}
+
+test('cross-encoder lazily loads q8 on WebGPU and reports progress and success', async () => {
+  const worker = await crossEncoderWorker();
+  assert.equal(worker.loads.length, 0);
+  await worker.send();
+  await worker.send(2);
+  assert.deepEqual(worker.loads, [{ device: 'webgpu', dtype: 'q8' }]);
+  assert.equal(worker.runs.length, 4);
+  assert.ok(worker.messages.some(message => /loading started \(webgpu/.test(message.message) && message.statusOnly));
+  assert.ok(worker.messages.some(message => /download progress.*model_quantized\.onnx 50%/.test(message.message) && message.statusOnly));
+  assert.ok(worker.messages.some(message => /loading completed \(webgpu\)/.test(message.message) && message.statusOnly));
+  assert.ok(worker.messages.some(message => /reranking succeeded \(webgpu/.test(message.message) && !message.statusOnly));
+  assert.equal(worker.messages.filter(message => message.status === 'complete').length, 2);
+  assert.equal(worker.messages.find(message => message.status === 'complete').result[0].score, 1 / (1 + Math.exp(-1)));
+});
+
+test('cross-encoder falls back to WASM on unavailable GPU, initialization and inference failure', async () => {
+  const noGpu = await crossEncoderWorker({ gpu: false });
+  await noGpu.send();
+  assert.deepEqual(noGpu.loads, [{ device: 'wasm', dtype: 'q8' }]);
+  const loadFailure = await crossEncoderWorker({ loadError: { webgpu: 'Unsupported operator' } });
+  await loadFailure.send();
+  assert.deepEqual(loadFailure.loads.map(load => load.device), ['webgpu', 'wasm']);
+  assert.ok(loadFailure.messages.some(message => /webgpu loading error.*retrying with WASM/.test(message.message)));
+  const inferenceFailure = await crossEncoderWorker({ inferenceError: { webgpu: 'GPU device lost' } });
+  await inferenceFailure.send();
+  await inferenceFailure.send(2);
+  assert.deepEqual(inferenceFailure.loads.map(load => load.device), ['webgpu', 'wasm']);
+  assert.deepEqual(inferenceFailure.runs, ['webgpu', 'wasm', 'wasm', 'wasm', 'wasm']);
+  assert.deepEqual(inferenceFailure.disposals, ['webgpu']);
+  assert.ok(inferenceFailure.messages.some(message => /WebGPU inference error.*retrying with WASM/.test(message.message)));
+});
+
+test('cross-encoder reports download, loading and inference timeouts or failures', async () => {
+  for (const [options, expected] of [
+    [{ loadError: { wasm: 'Failed to fetch model' } }, /download failure/],
+    [{ loadError: { wasm: 'Invalid ONNX graph' } }, /loading error/],
+    [{ loadError: { wasm: 'request timed out' } }, /loading timeout/],
+    [{ inferenceError: { wasm: 'inference timed out' } }, /inference timeout/],
+    [{ inferenceError: { wasm: 'bad logits' } }, /inference error/],
+  ]) {
+    const worker = await crossEncoderWorker({ gpu: false, ...options });
+    await worker.send();
+    assert.match(worker.messages.find(message => message.status === 'error').error, expected);
+    assert.ok(worker.messages.some(message => /Cross-encoder failed:/.test(message.message)));
+  }
 });
 
 test('end-to-end request uses registered tools and returns a validated display document', async () => {
@@ -361,6 +599,49 @@ test('hosted argument normalization uses Gemma only after failure or invalid out
   const response = JSON.stringify({
     status: 'resolved', arguments: { front: 'Question?', back: 'Answer.' }, missing: [], ambiguous: [],
     provenance: { front: 'model_generated', back: 'model_generated' },
+  });
+
+  test('local-first normalization uses Dots 3 only when automatic mode permits fallback', async () => {
+    const normalizer = await import('../src/intelligence/argumentNormalization.js');
+    const tool = manifests.find(item => item.id === 'anki.create_card');
+    const input = {
+      originalRequest: 'Create a flashcard about photosynthesis',
+      request: 'Create a flashcard about photosynthesis',
+      tool,
+      deterministicArguments: {},
+      missing: ['front', 'back'],
+      ambiguous: [],
+      providerEvidence: [],
+    };
+    const validOutput = JSON.stringify({
+      status: 'resolved',
+      arguments: { front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.' },
+      missing: [],
+      ambiguous: [],
+      provenance: { front: 'model_generated', back: 'model_generated' },
+    });
+    let externalCalls = 0;
+    const localResult = await normalizer.normalizeArgumentsLocalFirst(input, {
+      local: async () => validOutput,
+      external: async () => { externalCalls++; return validOutput; },
+      allowExternal: true,
+    });
+    assert.equal(localResult.model, 'gemma-4-e2b');
+    assert.equal(externalCalls, 0);
+
+    const automaticResult = await normalizer.normalizeArgumentsLocalFirst(input, {
+      local: async () => { throw new Error('local model unavailable'); },
+      external: async () => { externalCalls++; return validOutput; },
+      allowExternal: true,
+    });
+    assert.equal(automaticResult.model, 'openrouter-dots3-note');
+    assert.equal(externalCalls, 1);
+    await assert.rejects(normalizer.normalizeArgumentsLocalFirst(input, {
+      local: async () => { throw new Error('local model unavailable'); },
+      external: async () => { externalCalls++; return validOutput; },
+      allowExternal: false,
+    }), /local model unavailable/);
+    assert.equal(externalCalls, 1);
   });
   let localCalls = 0;
   let fallbackReason;
@@ -532,6 +813,19 @@ test('semantic multi-step requests use actual prior results and confirm only the
   assert.equal(result.pendingCall.arguments.time, '2026-11-14T09:30:00+02:00');
   assert.equal(result.pendingCall.arguments.offsetMinutes, -30);
   assert.equal(result.completedOperations[0].toolId, 'calendar.find_events');
+  assert.equal(result.state.executionPlan.schema, 'cue.execution-plan');
+  assert.equal(result.state.executionPlan.status, 'waiting_for_confirmation');
+  assert.equal(result.state.executionPlan.operations[0].status, 'succeeded');
+  assert.equal(result.state.executionPlan.operations[1].status, 'waiting_for_confirmation');
+  assert.deepEqual(result.state.executionPlan.operations[1].inputBindings, [{
+    targetArgument: 'time',
+    sourceOperation: result.state.executionPlan.operations[0].id,
+    sourcePointer: '/firstEvent/start',
+  }, {
+    targetArgument: 'label',
+    sourceOperation: result.state.executionPlan.operations[0].id,
+    sourcePointer: '/firstEvent/title',
+  }]);
 });
 
 test('multi-step clarification, confirmation correction, cancellation, and empty meeting results resume safely', async () => {
@@ -594,16 +888,88 @@ test('side effects require confirmation, and invalid or unknown calls are reject
 
 test('multi-tool plan uses a returned event time before creating the dependent alarm', async () => {
   const runtime = await environment();
-  const plan = { operations: [
-    { id: 'events', toolId: 'calendar.find_events', arguments: { date: '2026-11-14' } },
-    { id: 'alarm', toolId: 'alarm.create', dependsOn: ['events'], arguments: { time: { $from: { operationId: 'events', path: 'firstEvent.start' } }, offsetMinutes: -15, label: 'Meeting alarm' } },
-  ] };
+  const plan = {
+    schema: 'cue.execution-plan', version: 1, id: 'plan-meeting-alarm', conversationId: 'conversation-meeting-alarm',
+    originalRequest: 'Find my first meeting and set an alarm 15 minutes beforehand', status: 'ready',
+    operations: [
+      { id: 'events', toolId: 'calendar.find_events', purpose: 'Find the first meeting', arguments: { date: '2026-11-14' }, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false },
+      {
+        id: 'alarm', toolId: 'alarm.create', purpose: 'Set a meeting alarm',
+        arguments: { offsetMinutes: -15, label: 'Meeting alarm' },
+        inputBindings: [{ targetArgument: 'time', sourceOperation: 'events', sourcePointer: '/firstEvent/start', transform: { type: 'format_datetime' } }],
+        dependsOn: ['events'], conditions: [{ type: 'json_pointer_exists', operation: 'events', pointer: '/firstEvent/start' }],
+        status: 'pending', requiresConfirmation: true,
+      },
+    ],
+  };
   const pending = await runtime.dispatcher.dispatchPlan(plan);
   assert.equal(pending.state, 'confirmation_required');
   assert.equal(pending.operations[0].toolId, 'alarm.create');
-  const result = await runtime.dispatcher.dispatchPlan(plan, { confirmed: true });
+  assert.equal(pending.executionState.plan.operations[0].status, 'succeeded');
+  assert.equal(pending.executionState.plan.operations[1].status, 'waiting_for_confirmation');
+  const result = await runtime.dispatcher.dispatchPlan(plan, {
+    confirmed: true,
+    confirmedOperationId: 'alarm',
+    executionState: pending.executionState,
+  });
   assert.equal(result.document.id, 'alarm-success');
+  assert.equal(result.plan.status, 'completed');
   assert.ok(JSON.stringify(result.document).includes('2026-11-14T07:15:00.000Z'));
+});
+
+test('execution plans validate bindings, deterministic transforms, conditions, and operation limits', async () => {
+  const planModule = await import('../src/intelligence/executionPlan.js');
+  const runtime = await environment();
+  const valid = {
+    schema: 'cue.execution-plan', version: 1, id: 'plan-valid', conversationId: 'conversation-valid',
+    originalRequest: 'Find a meeting and set an alarm', status: 'ready',
+    operations: [
+      { id: 'search', toolId: 'calendar.find_events', purpose: 'Search meetings', arguments: {}, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false },
+      { id: 'alarm', toolId: 'alarm.create', purpose: 'Create alarm', arguments: { offsetMinutes: -15, label: 'Reminder' }, dependsOn: ['search'], inputBindings: [{ targetArgument: 'time', sourceOperation: 'search', sourcePointer: '/firstEvent/start', transform: { type: 'subtract_duration', duration: 'PT15M' } }], conditions: [], status: 'pending', requiresConfirmation: true },
+    ],
+  };
+  assert.equal(planModule.validateExecutionPlan(valid, runtime.registry).valid, true);
+  const invalid = structuredClone(valid);
+  invalid.operations[1].inputBindings[0].sourceOperation = 'missing';
+  assert.match(planModule.validateExecutionPlan(invalid, runtime.registry).errors.join(' '), /unknown operation/);
+  assert.equal(planModule.applyBindingTransform('2026-11-14T10:00:00+02:00', { type: 'subtract_duration', duration: 'PT15M' }), '2026-11-14T07:45:00.000Z');
+  assert.equal(planModule.applyBindingTransform('2026-11-14T10:00:00+02:00', { type: 'add_duration', duration: 'PT15M' }), '2026-11-14T08:15:00.000Z');
+  assert.equal(planModule.applyBindingTransform([{ id: 'first' }], { type: 'select_first' }).id, 'first');
+});
+
+test('execution controller skips a dependent operation when its source value is absent', async () => {
+  const runtime = await environment();
+  const plan = {
+    schema: 'cue.execution-plan', version: 1, id: 'plan-empty-meeting', conversationId: 'conversation-empty-meeting',
+    originalRequest: 'Find a meeting and set an alarm', status: 'ready',
+    operations: [
+      { id: 'search', toolId: 'calendar.find_events', purpose: 'Find meeting', arguments: { date: '2026-11-14', event_type: 'meeting', query: 'not-a-meeting' }, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false },
+      { id: 'alarm', toolId: 'alarm.create', purpose: 'Set alarm', arguments: { offsetMinutes: -15, label: 'Reminder' }, dependsOn: ['search'], inputBindings: [{ targetArgument: 'time', sourceOperation: 'search', sourcePointer: '/events/0/start' }], conditions: [{ type: 'json_pointer_exists', operation: 'search', pointer: '/events/0/start' }], status: 'pending', requiresConfirmation: true },
+    ],
+  };
+  const result = await runtime.dispatcher.dispatchPlan(plan);
+  assert.equal(result.state, 'completed');
+  assert.equal(result.plan.operations[1].status, 'skipped');
+  assert.equal(result.plan.status, 'completed');
+  assert.equal(result.executionState.results.alarm, undefined);
+});
+
+test('execution controller persists failed status when bound arguments are invalid', async () => {
+  const runtime = await environment();
+  const plan = {
+    schema: 'cue.execution-plan', version: 1, id: 'plan-invalid-arguments', conversationId: 'conversation-invalid-arguments',
+    originalRequest: 'Find my calendar events', status: 'ready',
+    operations: [{
+      id: 'events', toolId: 'calendar.find_events', purpose: 'Find calendar events',
+      arguments: {}, dependsOn: [], inputBindings: [], conditions: [], status: 'pending', requiresConfirmation: false,
+    }],
+  };
+  const savedStates = [];
+  await assert.rejects(runtime.dispatcher.dispatchPlan(plan, {
+    onStateChange: state => savedStates.push(state),
+  }), /Invalid bound arguments/);
+  assert.equal(savedStates.at(-1).plan.status, 'failed');
+  assert.equal(savedStates.at(-1).plan.operations[0].status, 'failed');
 });
 
 test('mock providers cover empty, error, image, and independent knowledge retrieval', async () => {

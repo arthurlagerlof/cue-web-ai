@@ -1,12 +1,5 @@
 [
   {
-    "id": "alarm.create:0",
-    "sourceType": "description",
-    "text": "Create a synthetic alarm at a requested ISO-8601 time with a label and optional time offset.",
-    "locale": null,
-    "contentHash": "80572777337edae63dcf0f18d8cfaaf2adff33844475dcd6ef7ac2f6a947114f"
-  },
-  {
     "id": "alarm.create:1",
     "sourceType": "example",
     "text": "Set an alarm for my first meeting",
@@ -19,20 +12,6 @@
     "text": "Wake me up at seven tomorrow",
     "locale": "en",
     "contentHash": "e7626717b8da3ae001e22fa5ef41b838ae0161b6d0fd8e1c78e26e1b5515cfe3"
-  },
-  {
-    "id": "alarm.create:3",
-    "sourceType": "example",
-    "text": "Aseta herätys ensimmäistä kokoustani varten",
-    "locale": "fi",
-    "contentHash": "597d4355c5f027f829f32b807697c9475d6d5afe7e3ca3fca7f1f86986db62ee"
-  },
-  {
-    "id": "alarm.create:4",
-    "sourceType": "example",
-    "text": "Aseta herätys huomiseksi seitsemäksi",
-    "locale": "fi",
-    "contentHash": "b38beb15468fa119551e8f9e91dc26fdcccb7e3d61add944bfdfd1d3a0185f1d"
   },
   {
     "id": "alarm.find:0",
@@ -231,39 +210,11 @@
     "contentHash": "7995c10175ce107166a3b22150e0e6dc73513a99894a0f9165e6fe2919d6bec2"
   },
   {
-    "id": "calendar.find_events:0",
-    "sourceType": "description",
-    "text": "Find synthetic calendar events on a selected date.",
-    "locale": null,
-    "contentHash": "9cd1a69cd14354a35d9eff6557d39ccd996a74c9b05135d2b8106e53592247f0"
-  },
-  {
     "id": "calendar.find_events:1",
     "sourceType": "example",
     "text": "What events do I have tomorrow?",
     "locale": "en",
     "contentHash": "4ad53ff2c5d3ea325c33c7ae0a1f40ca8fb77bb63606dd98238725e2c3e0d421"
-  },
-  {
-    "id": "calendar.find_events:2",
-    "sourceType": "example",
-    "text": "Find my first meeting tomorrow",
-    "locale": "en",
-    "contentHash": "762c50967817880abe74f9dc6687f2c4bc6f3f661d0cc349d389cf5f3cbbb3b0"
-  },
-  {
-    "id": "calendar.find_events:3",
-    "sourceType": "example",
-    "text": "Etsi huomisen kalenteritapahtumat",
-    "locale": "fi",
-    "contentHash": "2a6c8f61bb41156f8728ae7226e77bc963beea88da0ed7175f2c6684cd3bfcd5"
-  },
-  {
-    "id": "calendar.find_events:4",
-    "sourceType": "example",
-    "text": "Mikä on huomisen ensimmäinen kokoukseni?",
-    "locale": "fi",
-    "contentHash": "4c9c1e5224f9d00e17caffb0f6ad95eff0004ab0a3ee9c99c077095efd65a039"
   },
   {
     "id": "calendar.get_event:0",

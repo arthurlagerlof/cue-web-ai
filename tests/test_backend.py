@@ -285,7 +285,7 @@ class BackendTests(unittest.TestCase):
             self.assertEqual(len(registry["providers"]), 6)
             self.assertEqual(len(registry["tools"]), 18)
             self.assertEqual(registry["toolRetrievalConfig"]["scoring"], "weighted-max")
-            self.assertEqual(registry["toolRetrievalConfig"]["maxOperations"], 4)
+            self.assertEqual(registry["toolRetrievalConfig"]["maxOperations"], 8)
             self.assertEqual(len(registry["data"]["anki"]["cards"]), 12)
             connection.request("GET", "/api/demo/conversation", headers={"Origin": "http://localhost:5173", "Cookie": cookie})
             response = connection.getresponse()
@@ -303,6 +303,65 @@ class BackendTests(unittest.TestCase):
                 self.assertEqual(response.status, 200)
                 self.assertEqual(json.loads(response.read())["text"], "Direct answer.")
                 generate.assert_called_once_with("What is a comet?")
+            plan_response = {
+                "kind": "plan",
+                "question": None,
+                "text": None,
+                "operations": [
+                    {
+                        "id": "find-events",
+                        "toolId": "calendar.find_events",
+                        "purpose": "Find today's first meeting",
+                        "arguments": {"date": "2026-11-15", "event_type": "meeting", "sort": "start_ascending"},
+                        "dependsOn": [],
+                        "inputBindings": [],
+                        "conditions": [],
+                    },
+                    {
+                        "id": "create-alarm",
+                        "toolId": "alarm.create",
+                        "purpose": "Set an alarm 15 minutes before the meeting",
+                        "arguments": {"label": "Meeting reminder"},
+                        "dependsOn": ["find-events"],
+                        "inputBindings": [{
+                            "targetArgument": "time",
+                            "sourceOperation": "find-events",
+                            "sourcePointer": "/firstEvent/start",
+                            "transform": {"type": "subtract_duration", "duration": "PT15M"},
+                        }],
+                        "conditions": [{
+                            "type": "json_pointer_exists",
+                            "operation": "find-events",
+                            "pointer": "/firstEvent/start",
+                        }],
+                    },
+                ],
+            }
+            provider_hits = {"calendar": {"hits": [{
+                "recordId": "event-synthetic",
+                "recordType": "event",
+                "record": {"title": "Synthetic dentist appointment"},
+                "similarity": 0.91,
+            }]}}
+            with patch("backend.generate_normalization", return_value=json.dumps(plan_response)) as generate, \
+                    patch("backend.search_provider_data", return_value=provider_hits) as search_provider_data:
+                connection.request("POST", "/api/demo/reason", body=json.dumps({
+                    "request": "Find my first meeting today",
+                    "vector": [1.0] + [0.0] * 383,
+                }), headers=headers)
+                response = connection.getresponse()
+                planned = json.loads(response.read())
+                self.assertEqual(response.status, 200, planned)
+                self.assertEqual(planned["kind"], "plan")
+                self.assertEqual(planned["plan"]["schema"], "cue.execution-plan")
+                self.assertEqual(planned["plan"]["operations"][0]["toolId"], "calendar.find_events")
+                self.assertFalse(planned["plan"]["operations"][0]["requiresConfirmation"])
+                self.assertEqual(planned["plan"]["operations"][1]["inputBindings"][0]["sourceOperation"], "op_1")
+                self.assertTrue(planned["plan"]["operations"][1]["requiresConfirmation"])
+                self.assertEqual(generate.call_args.kwargs["response_schema"]["properties"]["operations"]["maxItems"], 8)
+                self.assertEqual(search_provider_data.call_args.args[1], [1.0] + [0.0] * 383)
+                self.assertIn("Synthetic dentist appointment", generate.call_args.args[0])
+                self.assertNotIn("Authorization", json.dumps(planned))
             connection.request("POST", "/api/demo/normalize", body=json.dumps({"prompt": "synthetic prompt"}), headers={"Origin": "http://localhost:5173", "Cookie": cookie, "Content-Type": "application/json"})
             response = connection.getresponse()
             self.assertEqual(response.status, 403)
@@ -338,8 +397,8 @@ class BackendTests(unittest.TestCase):
     def test_backend_has_no_hosted_execution_route_or_personal_database_dependency(self):
         source = Path(backend.__file__).read_text(encoding="utf-8")
         self.assertNotIn("/api/interpret", source)
-        self.assertNotIn("urllib.request", source)
-        self.assertNotIn("LLM_API_KEY", source)
+        self.assertIn("/api/demo/reason", source)
+        self.assertNotIn("OPENROUTER_API_KEY", source)
         self.assertNotIn("memory_db", source)
         self.assertNotIn("semantic_mastery.db", source)
 

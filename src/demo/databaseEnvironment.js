@@ -1,10 +1,10 @@
 import { ToolDispatcher } from '../intelligence/dispatcher.js';
 import { buildToolExampleIndex, ToolIntelligence } from '../intelligence/toolIntelligence.js';
-import { normalizeArgumentsWithFallback } from '../intelligence/argumentNormalization.js';
+import { normalizeArgumentsLocalFirst } from '../intelligence/argumentNormalization.js';
 import { buildProviderDataIndex } from '../intelligence/retrieval/providerData.js';
 import { ToolRegistry } from '../intelligence/toolRegistry.js';
 
-export async function createDatabaseEnvironment({ registryData, embed, postApi, normalizeArguments, fallbackNormalizeArguments, onNormalizerFallback, argumentNormalizerEnabled, threshold = undefined, plausibleThreshold = undefined, ambiguityMargin = undefined, initialState }) {
+export async function createDatabaseEnvironment({ registryData, embed, rerankTools, onRerankDecision, postApi, normalizeArguments, fallbackNormalizeArguments, onNormalizerFallback, argumentNormalizerEnabled, reasoningMode = () => 'automatic', threshold = undefined, plausibleThreshold = undefined, ambiguityMargin = undefined, initialState }) {
   if (!registryData || !Array.isArray(registryData.providers) || !Array.isArray(registryData.tools)) {
     throw new TypeError('The demo registry response is invalid');
   }
@@ -14,6 +14,7 @@ export async function createDatabaseEnvironment({ registryData, embed, postApi, 
   const candidateMargin = ambiguityMargin ?? config.ambiguityMargin ?? 0.08;
   const scoring = config.scoring ?? 'weighted-max';
   const weights = config.weights ?? { description: 0.35, keyword: 0.3, example: 0.35 };
+  const crossEncoder = config.crossEncoder ?? {};
   const registry = new ToolRegistry();
   let providerDataIndex = [];
   async function indexPendingProviderData(sourceRegistry) {
@@ -78,17 +79,26 @@ export async function createDatabaseEnvironment({ registryData, embed, postApi, 
     dispatcher,
     embed,
     examples: exampleIndex,
+    rerankTools,
+    onRerankDecision,
+    rerankMinimumScore: crossEncoder.minimumScore ?? 0.20,
+    rerankMargin: crossEncoder.margin ?? 0.10,
     threshold: minimumScore,
     plausibleThreshold: plausibleScore,
     ambiguityMargin: candidateMargin,
     scoring,
     weights,
     topK: config.topK ?? 5,
-    maxOperations: config.maxOperations ?? 4,
+    maxOperations: config.maxOperations ?? 8,
     initialState,
     argumentNormalizerEnabled,
-    normalizeArguments: normalizeArguments
-      ? input => normalizeArgumentsWithFallback(input, { primary: normalizeArguments, fallback: fallbackNormalizeArguments, onFallback: onNormalizerFallback })
+    normalizeArguments: fallbackNormalizeArguments
+      ? input => normalizeArgumentsLocalFirst(input, {
+        local: fallbackNormalizeArguments,
+        external: normalizeArguments,
+        allowExternal: reasoningMode() === 'automatic',
+        onFallback: onNormalizerFallback,
+      })
       : undefined,
     searchTools: async vector => {
       const response = await postApi('/api/demo/tools/search', { vector, limit: config.topK ?? 5, threshold: plausibleScore, scoring, weights });

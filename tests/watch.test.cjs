@@ -296,6 +296,28 @@ test('result actions, confirmation buttons, and logo navigation remain explicit'
   assert.equal(new TextDecoder().decode(Uint8Array.from(confirmFrame.slice(9), character => character.charCodeAt(0))), '__cue_confirm');
 });
 
+test('clarification option actions send their stable action ID from the watch', () => {
+  const watch = loadWatch();
+  sendDocument(watch, {
+    schema: 'cue.display', version: 1, id: 'tool-choice', title: 'Choose a calendar action',
+    source: { app: 'cue', name: 'Cue' }, state: 'clarification_required',
+    pages: [{ id: 'choices', elements: [{ type: 'action', actionId: 'choice-find-events', label: 'Find calendar events' }] }],
+    actions: [{
+      id: 'choice-find-events',
+      kind: 'interaction_option',
+      interactionId: 'conversation:awaiting_tool_choice:0',
+      optionId: 'calendar.find_events',
+      label: 'Find calendar events',
+    }],
+    assets: [],
+  }, 65);
+  watch.writes.length = 0;
+  watch.listeners.touch[0](1, { x: 50, y: 40 });
+  const actionFrame = watch.writes.find(value => value.charCodeAt(3) === 4);
+  assert.ok(actionFrame);
+  assert.equal(new TextDecoder().decode(Uint8Array.from(actionFrame.slice(9), character => character.charCodeAt(0))), 'choice-find-events');
+});
+
 test('empty, error, and success Display Document states have consistent screens', () => {
   const watch = loadWatch();
   let id = 100;
@@ -310,7 +332,7 @@ test('empty, error, and success Display Document states have consistent screens'
   }
 });
 
-test('clarification screen offers tap-to-answer using the recording trigger', () => {
+test('clarification screen offers Speak instead using the recording trigger', () => {
   const watch = loadWatch();
   sendDocument(watch, {
     schema: 'cue.display', version: 1, id: 'clarification-test', title: 'Clarification needed',
@@ -318,7 +340,7 @@ test('clarification screen offers tap-to-answer using the recording trigger', ()
     pages: [{ id: 'clarification', elements: [{ type: 'text', text: 'Which card should I use?' }] }],
     actions: [], assets: [],
   }, 110);
-  assert.ok(watch.drawings.includes('Tap to answer'));
+  assert.ok(watch.drawings.includes('Speak instead'));
   watch.writes.length = 0;
   watch.listeners.touch[0](1, { x: 88, y: 80 });
   assert.equal(watch.writes.length, 1);

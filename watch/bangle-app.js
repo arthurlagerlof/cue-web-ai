@@ -423,7 +423,7 @@
       bmDrawResult();
       g.setFont('Vector', 9);
       g.setFontAlign(0, -1);
-      g.drawString('Tap to answer', BM_SCREEN_WIDTH / 2, BM_SCREEN_HEIGHT - 25);
+      g.drawString('Speak instead', BM_SCREEN_WIDTH / 2, BM_SCREEN_HEIGHT - 25);
     }
     else if (BM_STATE === 'empty') bmDrawState('NO RESULTS', BM_CONTEXT);
     else if (BM_STATE === 'error') bmDrawState('ERROR', BM_CONTEXT);
@@ -500,6 +500,13 @@
       return;
     }
     if (BM_STATE === 'clarification') {
+      for (var optionIndex = 0; optionIndex < BM_ACTION_ROWS.length; optionIndex++) {
+        var optionRow = BM_ACTION_ROWS[optionIndex];
+        if (xy.x >= optionRow.x1 && xy.x <= optionRow.x2 && xy.y >= optionRow.y1 && xy.y <= optionRow.y2) {
+          bmSendAction(optionRow.actionId);
+          return;
+        }
+      }
       bmSendTrigger();
       return;
     }

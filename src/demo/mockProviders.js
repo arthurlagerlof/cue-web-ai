@@ -3,14 +3,14 @@ import { normalizeArgumentsWithModel } from '../intelligence/argumentNormalizati
 import { buildToolExampleIndex, ToolIntelligence } from '../intelligence/toolIntelligence.js';
 import { ToolRegistry } from '../intelligence/toolRegistry.js';
 
-export async function createMockEnvironment({ manifests = [], providers = [], embed, searchTools, searchProviderData, normalizeArguments, argumentNormalizerEnabled, initialState, threshold = 0.35, ambiguityMargin = 0.04 }) {
+export async function createMockEnvironment({ manifests = [], providers = [], embed, searchTools, searchProviderData, rerankTools, normalizeArguments, argumentNormalizerEnabled, initialState, threshold = 0.35, ambiguityMargin = 0.04 }) {
   const registry = new ToolRegistry();
   for (const provider of providers) registry.registerProvider(provider);
   for (const tool of manifests) registry.registerTool(tool);
   const exampleIndex = await buildToolExampleIndex(registry.list(), embed);
   const dispatcher = new ToolDispatcher(registry);
   const intelligence = new ToolIntelligence({
-    registry, dispatcher, embed, examples: exampleIndex, searchTools, searchProviderData, initialState, threshold, ambiguityMargin,
+    registry, dispatcher, embed, examples: exampleIndex, searchTools, searchProviderData, rerankTools, initialState, threshold, ambiguityMargin,
     argumentNormalizerEnabled,
     normalizeArguments: normalizeArguments
       ? input => normalizeArgumentsWithModel(input, { generate: normalizeArguments })

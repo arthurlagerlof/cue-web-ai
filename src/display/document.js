@@ -62,7 +62,14 @@ export function validateDisplayDocument(document, { registry } = {}) {
   if (!Array.isArray(document.assets)) add(errors, '$.assets', 'expected an array');
   const actionIds = new Set();
   if (Array.isArray(document.actions)) document.actions.forEach((action, index) => {
-    if (!action || typeof action.id !== 'string' || !action.id || typeof action.toolId !== 'string' || !action.toolId || !action.arguments || typeof action.arguments !== 'object' || Array.isArray(action.arguments)) add(errors, `$.actions[${index}]`, 'requires id, toolId, and object arguments');
+    if (!action || typeof action.id !== 'string' || !action.id) add(errors, `$.actions[${index}]`, 'requires a non-empty id');
+    else if (action.kind === 'interaction_option') {
+      if (typeof action.interactionId !== 'string' || !action.interactionId
+        || typeof action.optionId !== 'string' || !action.optionId
+        || typeof action.label !== 'string' || !action.label) add(errors, `$.actions[${index}]`, 'interaction options require interactionId, optionId, and label');
+      else if (actionIds.has(action.id)) add(errors, `$.actions[${index}].id`, 'duplicate action id');
+      else actionIds.add(action.id);
+    } else if (typeof action.toolId !== 'string' || !action.toolId || !action.arguments || typeof action.arguments !== 'object' || Array.isArray(action.arguments)) add(errors, `$.actions[${index}]`, 'requires toolId and object arguments');
     else if (actionIds.has(action.id)) add(errors, `$.actions[${index}].id`, 'duplicate action id');
     else {
       actionIds.add(action.id);

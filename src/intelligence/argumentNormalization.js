@@ -172,3 +172,16 @@ export async function normalizeArgumentsWithFallback(input, { primary, fallback,
     }
   }
 }
+
+export async function normalizeArgumentsLocalFirst(input, { local, external, allowExternal = false, onFallback = () => {} }) {
+  try {
+    const result = await normalizeArgumentsWithModel(input, { generate: local });
+    return { ...result, model: 'gemma-4-e2b' };
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    if (!allowExternal || typeof external !== 'function') throw error;
+    onFallback(reason);
+    const result = await normalizeArgumentsWithModel(input, { generate: external });
+    return { ...result, model: 'openrouter-dots3-note' };
+  }
+}

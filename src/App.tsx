@@ -8,8 +8,16 @@ import { DisplayDocumentView } from './display/DisplayDocumentView';
 import { createDatabaseEnvironment } from './demo/databaseEnvironment.js';
 import watchAppSource from '../watch/bangle-app.js?raw';
 
-type Stage = 'transcribe' | 'embed';
-type WorkerReply = { id: number; stage: Stage; status: string; model?: string; result?: any; error?: string };
+type Stage = 'transcribe' | 'embed' | 'rerank';
+type WorkerReply = { id: number; stage: Stage; status: string; model?: string; result?: any; error?: string; message?: string; statusOnly?: boolean };
+type RerankDecision = { topScore: number; secondScore: number | null; margin: number | null; minimumScore: number; minimumMargin: number; scorePassed: boolean; marginPassed: boolean; decision: 'selected' | 'ambiguous' };
+type AiMode = 'web_ai' | 'automatic' | 'dots3_always';
+type PlanExecutionState = {
+  plan: { conversationId: string; originalRequest: string; status: string; operations: Array<{ id: string; toolId: string; status: string }> };
+  pendingConfirmation?: { operationId: string; toolId: string; arguments: Record<string, unknown> };
+  results: Record<string, unknown>;
+  documents: Record<string, unknown>;
+};
 const workers = new Map<Stage, Worker>();
 function createWorker(stage: Stage) {
   const instance = new Worker(new URL('./services/model.worker.ts', import.meta.url), { type: 'module' });
@@ -64,6 +72,41 @@ async function getConversationState() {
   return result.state;
 }
 
+function interactionIdForState(state: any) {
+  return `${state.conversationId}:${state.status}:${state.currentIndex ?? 0}`;
+}
+
+function createClarificationDocument(state: any, message: string) {
+  const choices = state?.status === 'awaiting_tool_choice'
+    ? (state.candidateTools ?? []).map((candidate: any) => ({ optionId: candidate.toolId, label: candidate.name }))
+    : state?.status === 'awaiting_entity_choice'
+      ? (state.pendingEntityOptions ?? []).map((option: any) => ({ optionId: option.id, label: option.label }))
+      : [];
+  const interactionId = interactionIdForState(state);
+  const actions = choices.length >= 2 && choices.length <= 3
+    ? choices.map((choice: any, index: number) => ({
+      id: `cue-choice-${index}`,
+      kind: 'interaction_option',
+      interactionId,
+      optionId: choice.optionId,
+      label: choice.label,
+    }))
+    : [];
+  const elements: any[] = [{ type: 'text', text: message, role: 'body' }];
+  for (const action of actions) {
+    elements.push({ type: 'action', actionId: action.id, label: action.label });
+  }
+  return createDisplayDocument({
+    id: 'cue-clarification',
+    title: 'Clarification needed',
+    source: { app: 'cue', name: 'Cue' },
+    state: 'clarification_required',
+    message,
+    elements,
+    actions,
+  });
+}
+
 async function postApi(path: string, data: unknown) {
   for (let attempt = 0; attempt < 2; attempt++) {
     const session = await getSession(attempt === 1);
@@ -88,16 +131,15 @@ export default function App() {
   const [buffer, setBuffer] = useState(0);
   const [asrModel, setAsrModel] = useState<ASRModelSize>('tiny');
   const asrModelRef = useRef<ASRModelSize>('tiny');
-  const [status, setStatus] = useState<Record<Stage, string>>({ transcribe: 'Not started', embed: 'Not started' });
-  const [gemmaMode, setGemmaMode] = useState<'automatic' | 'enabled' | 'disabled'>(() => {
+  const [status, setStatus] = useState<Record<Stage, string>>({ transcribe: 'Not started', embed: 'Not started', rerank: 'Not started' });
+  const [aiMode, setAiMode] = useState<AiMode>(() => {
     try {
-      const savedMode = window.localStorage.getItem('cue.gemma.mode');
-      if (savedMode === 'automatic' || savedMode === 'enabled' || savedMode === 'disabled') return savedMode;
-      const legacyPreference = window.localStorage.getItem('cue.gemma.enabled');
-      return legacyPreference === null ? 'automatic' : legacyPreference === 'true' ? 'enabled' : 'disabled';
+      const savedMode = window.localStorage.getItem('cue.ai.mode');
+      if (savedMode === 'web_ai' || savedMode === 'automatic' || savedMode === 'dots3_always') return savedMode;
+      return 'automatic';
     } catch { return 'automatic'; }
   });
-  const gemmaModeRef = useRef(gemmaMode);
+  const aiModeRef = useRef(aiMode);
   const [weekStartsOn, setWeekStartsOn] = useState(() => {
     try { return window.localStorage.getItem('cue.calendar.weekStartsOn') === '0' ? 0 : 1; }
     catch { return 1; }
@@ -126,6 +168,7 @@ export default function App() {
   const pendingConfirmationRef = useRef<any>();
   const watchConfirmationRef = useRef(false);
   const pending = useRef(new Map<number, { stage: Stage; resolve: (reply: WorkerReply) => void }>());
+  const resolvingInteractions = useRef(new Set<string>());
 
   const log = (message: string) => setLogs(old => [`${new Date().toLocaleTimeString()} ${message}`, ...old].slice(0, 30));
   const updatePendingConfirmation = (pending: any) => {
@@ -138,17 +181,26 @@ export default function App() {
       .then(() => getConversationState())
       .then(state => {
         if (state?.status === 'awaiting_confirmation' && state.pendingConfirmation?.call) updatePendingConfirmation({ call: state.pendingConfirmation.call, fromWorkflow: true });
+        if (state?.status === 'awaiting_confirmation' && state.executionState?.pendingConfirmation) {
+          updatePendingConfirmation({ plan: state.executionState.plan, executionState: state.executionState, externalPlan: true });
+        }
         if (state && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(state.status)) setPendingClarification(true);
         if (state && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice', 'awaiting_confirmation'].includes(state.status)) {
-          const message = state.pendingQuestion ?? 'Continue the pending local operation.';
-          void showDocument(createDisplayDocument({
-            id: `cue-restored-${state.status}`,
-            title: state.status === 'awaiting_confirmation' ? 'Confirmation required' : 'Clarification needed',
-            source: { app: 'cue', name: 'Cue' },
-            state: state.status === 'awaiting_confirmation' ? 'confirmation_required' : 'clarification_required',
-            message,
-            elements: [{ type: 'text', text: message, role: 'body' }],
-          })).catch(error => log(`Could not restore pending request display: ${error instanceof Error ? error.message : String(error)}`));
+          const pending = state.executionState?.pendingConfirmation;
+          const message = pending
+            ? `Confirm ${pending.toolId} with these arguments: ${JSON.stringify(pending.arguments)}`
+            : state.pendingQuestion ?? 'Continue the pending local operation.';
+          const document = state.status === 'awaiting_confirmation'
+            ? createDisplayDocument({
+              id: `cue-restored-${state.status}`,
+              title: 'Confirmation required',
+              source: { app: 'cue', name: 'Cue' },
+              state: 'confirmation_required',
+              message,
+              elements: [{ type: 'text', text: message, role: 'body' }],
+            })
+            : createClarificationDocument(state, message);
+          void showDocument(document).catch(error => log(`Could not restore pending request display: ${error instanceof Error ? error.message : String(error)}`));
         }
       })
       .catch(error => log(`Backend session unavailable: ${error instanceof Error ? error.message : 'initialization failed'}`));
@@ -173,7 +225,7 @@ export default function App() {
           log('Ignored watch cancellation without a pending action');
           return;
         }
-        cancelPendingOperation();
+        void cancelPendingOperation().catch(error => log(`Could not cancel pending operation: ${error instanceof Error ? error.message : String(error)}`));
         void watch.sendDisplayDocument(createDisplayDocument({
           id: 'cue-watch-cancelled',
           title: 'Cancelled',
@@ -192,14 +244,11 @@ export default function App() {
     return () => { unsubscribe(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); gemmaService.dispose(); watch.disconnect(); audio.stop(); };
   }, []);
 
-  function setGemmaPreference(mode: 'automatic' | 'enabled' | 'disabled') {
-    gemmaModeRef.current = mode;
-    setGemmaMode(mode);
-    try { window.localStorage.setItem('cue.gemma.mode', mode); }
-    catch (error) { log(`Could not save local normalizer preference: ${error instanceof Error ? error.message : String(error)}`); }
-    if (mode === 'disabled') {
-      gemmaService.dispose();
-    }
+  function setAiPreference(mode: AiMode) {
+    aiModeRef.current = mode;
+    setAiMode(mode);
+    try { window.localStorage.setItem('cue.ai.mode', mode); }
+    catch (error) { log(`Could not save AI mode: ${error instanceof Error ? error.message : String(error)}`); }
   }
 
   function setCalendarWeekStart(value: number) {
@@ -208,13 +257,18 @@ export default function App() {
     catch (error) { log(`Could not save calendar week-start preference: ${error instanceof Error ? error.message : String(error)}`); }
   }
 
-  function runModel(stage: Stage, data: { text?: string; asrModel?: ASRModelSize; audio?: Float32Array; sampleRate?: number }): Promise<WorkerReply> {
+  function runModel(stage: Stage, data: { text?: string; candidates?: Array<{ toolId: string; text: string }>; asrModel?: ASRModelSize; audio?: Float32Array; sampleRate?: number }): Promise<WorkerReply> {
     const id = ++sequence.current;
     let instance = workers.get(stage);
     if (!instance) {
         instance = createWorker(stage);
         instance.onmessage = (event: MessageEvent<WorkerReply>) => {
           const reply = event.data;
+          if (reply.status === 'notice' && reply.message) {
+            setStatus(old => ({ ...old, [stage]: reply.message! }));
+            if (!reply.statusOnly) log(reply.message);
+            return;
+          }
           if (reply.status !== 'complete' && reply.status !== 'error') {
             setStatus(old => ({ ...old, [stage]: `${reply.status}${reply.model ? ` — ${reply.model}` : ''}` })); return;
           }
@@ -241,6 +295,11 @@ export default function App() {
       setEmbedding({ ...reply.result, model: reply.model });
       return reply.result;
     };
+    const rerankTools = async (text: string, candidates: Array<{ toolId: string; text: string }>) => {
+      const reply = await runModel('rerank', { text, candidates });
+      if (reply.status === 'error') throw new Error(reply.error);
+      return reply.result;
+    };
     const response = await fetch('/api/demo/registry', { credentials: 'same-origin', cache: 'no-store' });
     const registryData = await response.json();
     if (!response.ok) throw new Error(registryData.error ?? `Demo registry request failed (${response.status})`);
@@ -249,7 +308,8 @@ export default function App() {
       registryData,
       embed,
       postApi,
-      argumentNormalizerEnabled: () => gemmaModeRef.current !== 'disabled',
+      argumentNormalizerEnabled: () => true,
+      reasoningMode: () => aiModeRef.current,
       normalizeArguments: async (prompt: string) => {
         const result = await postApi('/api/demo/normalize', { prompt });
         if (typeof result.text !== 'string' || !result.text.trim()) throw new Error('OpenRouter returned an empty response.');
@@ -263,9 +323,14 @@ export default function App() {
         }
         return gemmaService.generate(prompt);
       },
-      initialState: initialState?.status === 'idle' ? undefined : initialState,
+      rerankTools,
+      onRerankDecision: (decision: RerankDecision) => log(`Cross-encoder decision: top ${decision.topScore}, second ${decision.secondScore ?? 'none'}, margin ${decision.margin ?? 'n/a'}; score >= ${decision.minimumScore}: ${decision.scorePassed ? 'pass' : 'fail'}; margin >= ${decision.minimumMargin}: ${decision.margin === null ? 'not applicable' : decision.marginPassed ? 'pass' : 'fail'}; ${decision.decision}`),
+      initialState: Array.isArray(initialState?.segments) ? initialState : undefined,
     });
     if (initialState?.status === 'awaiting_confirmation' && initialState.pendingConfirmation?.call) updatePendingConfirmation({ call: initialState.pendingConfirmation.call, fromWorkflow: true });
+    if (initialState?.status === 'awaiting_confirmation' && initialState.executionState?.pendingConfirmation) {
+      updatePendingConfirmation({ plan: initialState.executionState.plan, executionState: initialState.executionState, externalPlan: true });
+    }
     if (initialState && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(initialState.status)) setPendingClarification(true);
     log(`Loaded ${registryData.tools.length} provider-owned tools from the SQLite demo registry`);
     return environment.current;
@@ -296,15 +361,173 @@ export default function App() {
     }
   }
 
-  async function processTranscript(text: string) {
+  async function processDots3Request(request: string, runtime: any, context: any) {
+    const embedded = await runtime.intelligence.embed(request);
+    const vector = Array.isArray(embedded) ? embedded : embedded.vector;
+    const response = await postApi('/api/demo/reason', { request, context, vector });
+    if (response.kind === 'clarification') {
+      updatePendingConfirmation(undefined);
+      await postApi('/api/demo/conversation', { state: response.state });
+      setPendingClarification(true);
+      await showDocument(createDisplayDocument({
+        id: 'cue-dots3-clarification',
+        title: 'Clarification needed',
+        source: { app: 'cue', name: 'Cue' },
+        state: 'clarification_required',
+        message: response.question,
+        elements: [{ type: 'text', text: response.question, role: 'body' }],
+      }));
+      return;
+    }
+    if (response.kind === 'no_tool') {
+      updatePendingConfirmation(undefined);
+      setPendingClarification(false);
+      await showDocument(createDisplayDocument({
+        id: 'cue-dots3-no-tool',
+        title: 'Dots 3 response',
+        source: { app: 'openrouter', name: 'Dots3' },
+        state: 'ready',
+        message: response.text,
+        elements: [{ type: 'text', text: response.text, role: 'body' }],
+      }));
+      return;
+    }
+    if (response.kind !== 'plan' || !response.plan) throw new TypeError('Dots 3 returned an unsupported reasoning outcome.');
+
+    const saveExecutionState = async (executionState: any) => {
+      const state = executionState.plan.status === 'waiting_for_confirmation' ? 'awaiting_confirmation'
+        : executionState.plan.status === 'completed' ? 'completed'
+          : executionState.plan.status === 'failed' ? 'failed' : 'executing';
+      await postApi('/api/demo/conversation', {
+        state: {
+          conversationId: executionState.plan.conversationId,
+          status: state,
+          originalRequest: executionState.plan.originalRequest,
+          pendingQuestion: executionState.pendingConfirmation ? `Confirm ${executionState.pendingConfirmation.toolId}?` : undefined,
+          executionState,
+        },
+      });
+    };
+    const outcome = await runtime.dispatcher.dispatchPlan(response.plan, { onStateChange: saveExecutionState });
+    if (outcome.state === 'confirmation_required') {
+      updatePendingConfirmation({ plan: outcome.plan, executionState: outcome.executionState, externalPlan: true });
+      setPendingClarification(false);
+      const pending = outcome.pendingConfirmation;
+      const tool = runtime.registry.get(pending.toolId);
+      await showDocument(createDisplayDocument({
+        id: 'cue-dots3-confirmation',
+        title: 'Confirmation required',
+        source: { app: 'cue', name: 'Cue' },
+        state: 'confirmation_required',
+        message: `Confirm ${tool?.name ?? pending.toolId}?`,
+        elements: [{ type: 'text', text: JSON.stringify(pending.arguments), role: 'body' }],
+      }));
+      return;
+    }
+    updatePendingConfirmation(undefined);
+    setPendingClarification(false);
+    await postApi('/api/demo/conversation', {
+      state: {
+        conversationId: outcome.plan.conversationId,
+        status: outcome.plan.status,
+        originalRequest: outcome.plan.originalRequest,
+        executionState: outcome.executionState,
+      },
+    });
+    if (outcome.document) await showDocument(outcome.document);
+    else await showDocument(createDisplayDocument({
+      id: 'cue-dots3-completed',
+      title: 'Plan completed',
+      source: { app: 'cue', name: 'Cue' },
+      state: 'success',
+      message: 'All required operations completed or were safely skipped.',
+    }));
+    log('Dots 3 plan completed under Cue validation and execution control');
+  }
+
+  async function processTranscript(text: string, continuePendingLocally = false) {
     const clean = text.trim();
     if (!clean) throw new Error('Enter transcript text first.');
+    const pendingAction = pendingConfirmationRef.current;
+    if (pendingAction?.externalPlan && /^(?:yes|yeah|yep|sure|ok|okay|confirm|confirmed|do it|go ahead)$/i.test(clean)) {
+      setTranscriptInput('');
+      await confirmPendingAction(pendingAction, true);
+      return;
+    }
+    if (pendingAction?.externalPlan && /^(?:cancel|stop|never mind|nevermind|no|don't|do not)$/i.test(clean)) {
+      setTranscriptInput('');
+      await cancelPendingOperation();
+      return;
+    }
+    if (pendingAction?.externalPlan) {
+      setTranscriptInput('');
+      const pending = pendingAction.executionState?.pendingConfirmation;
+      const message = `This Dots 3 plan is awaiting confirmation with exact arguments${pending ? `: ${JSON.stringify(pending.arguments)}` : ''}. Confirm it as shown, or cancel it and submit a new request to make changes.`;
+      await showDocument(createDisplayDocument({
+        id: 'cue-dots3-confirmation-unchanged',
+        title: 'Confirmation unchanged',
+        source: { app: 'cue', name: 'Cue' },
+        state: 'confirmation_required',
+        message,
+        elements: [{ type: 'text', text: message, role: 'body' }],
+      }));
+      return;
+    }
     setTranscription(clean); setTranscriptInput(clean); setBusy(true);
     try {
       await showDocument(createDisplayDocument({ id: 'cue-loading', title: 'Working', source: { app: 'cue', name: 'Cue' }, state: 'loading', message: 'Discovering provider tools and preparing a local response.', elements: [{ type: 'text', text: clean, role: 'body' }] }));
       const runtime = await getEnvironment();
+      const context = { now: new Date(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn };
+      const savedState = await getConversationState();
+      if (savedState?.executionState?.pendingConfirmation) {
+        const restoredPending = pendingAction?.externalPlan ? pendingAction : {
+          plan: savedState.executionState.plan,
+          executionState: savedState.executionState,
+          externalPlan: true,
+        };
+        if (/^(?:yes|yeah|yep|sure|ok|okay|confirm|confirmed|do it|go ahead)$/i.test(clean)) {
+          setTranscriptInput('');
+          await confirmPendingAction(restoredPending, true);
+          return;
+        }
+        if (/^(?:cancel|stop|never mind|nevermind|no|don't|do not)$/i.test(clean)) {
+          setTranscriptInput('');
+          await cancelPendingOperation();
+          return;
+        }
+        setTranscriptInput('');
+        const pending = savedState.executionState.pendingConfirmation;
+        const message = `This Dots 3 plan is awaiting confirmation with exact arguments: ${JSON.stringify(pending.arguments)}. Confirm it as shown, or cancel it and submit a new request to make changes.`;
+        await showDocument(createDisplayDocument({
+          id: 'cue-dots3-confirmation-unchanged',
+          title: 'Confirmation unchanged',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'confirmation_required',
+          message,
+          elements: [{ type: 'text', text: message, role: 'body' }],
+        }));
+        return;
+      }
+      if (!continuePendingLocally && (aiModeRef.current === 'dots3_always' || savedState?.pendingReasoning
+        || (savedState?.executionState && ['awaiting_confirmation', 'executing'].includes(savedState.status)))) {
+        await processDots3Request(clean, runtime, context);
+        return;
+      }
       const outcome = await runtime.intelligence.handle(clean, { context: { now: new Date(), timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn } });
       if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
+      const rerankDiagnostics = outcome.diagnostics?.rerank ?? outcome.retrieval?.rerankDiagnostics;
+      if (rerankDiagnostics?.candidates) {
+        log(`Cross-encoder ranking: ${rerankDiagnostics.candidates.map((item: any) => `${item.toolId} ${item.score.toFixed(3)}`).join(', ')}`);
+      }
+      if (!continuePendingLocally && aiModeRef.current === 'automatic' && outcome.state?.status === 'awaiting_tool_choice') {
+        log(rerankDiagnostics?.error
+          ? `Cross-encoder unavailable: ${rerankDiagnostics.error}; trying the configured Dots 3 fallback`
+          : rerankDiagnostics?.candidates
+            ? 'Cross-encoder scores or margin below routing thresholds; trying the configured Dots 3 fallback'
+            : 'Tool choice remains uncertain; cross-encoder result unavailable for this outcome; trying the configured Dots 3 fallback');
+        await processDots3Request(clean, runtime, context);
+        return;
+      }
       if (outcome.normalizationError) log(`Argument normalization failed: ${outcome.normalizationError}`);
       if (outcome.kind !== 'confirmation_required') updatePendingConfirmation(undefined);
       setPendingClarification(outcome.kind === 'clarification' || ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(outcome.state?.status));
@@ -326,22 +549,24 @@ export default function App() {
         await showDocument(outcome.document);
         log('Local tool completed and returned a validated Cue Display Document');
       } else if (outcome.kind === 'no_tool') {
-        const response = await postApi('/api/demo/respond', { prompt: clean });
-        if (typeof response.text !== 'string' || !response.text.trim()) throw new Error('OpenRouter returned an empty response.');
+        const message = 'No matching registered tool was found. Try rephrasing the request or choose a supported provider action.';
         await showDocument(createDisplayDocument({
-          id: 'cue-openrouter-response',
-          title: 'Dots3 response',
-          source: { app: 'openrouter', name: 'Dots3' },
+          id: 'cue-no-tool',
+          title: 'No matching tool',
+          source: { app: 'cue', name: 'Cue' },
           state: 'ready',
-          elements: [{ type: 'text', text: response.text, role: 'body' }],
+          message,
+          elements: [{ type: 'text', text: message, role: 'body' }],
         }));
-        log('No local tool matched; displayed the direct OpenRouter Dots3 response');
+        log('No local tool matched; no external request was made');
       } else {
         if (outcome.kind === 'clarification' && outcome.toolId) setTranscriptInput('');
         const message = outcome.kind === 'answer' ? outcome.text : outcome.kind === 'clarification' ? outcome.question : outcome.text;
         const state = outcome.kind === 'clarification' ? 'clarification_required' : outcome.kind === 'partial_failure' ? 'error' : 'ready';
         const title = outcome.kind === 'clarification' ? 'Clarification needed' : outcome.kind === 'no_tool' ? 'No matching tool' : outcome.kind === 'partial_failure' ? 'Operation partially failed' : 'Cue';
-        const document = createDisplayDocument({ id: `cue-${outcome.kind}`, title, source: { app: 'cue', name: 'Cue' }, state, message, elements: [{ type: 'text', text: message ?? 'Please clarify your request.', role: 'body' }] });
+        const document = outcome.kind === 'clarification' && outcome.state
+          ? createClarificationDocument(outcome.state, message ?? 'Please clarify your request.')
+          : createDisplayDocument({ id: `cue-${outcome.kind}`, title, source: { app: 'cue', name: 'Cue' }, state, message, elements: [{ type: 'text', text: message ?? 'Please clarify your request.', role: 'body' }] });
         await showDocument(document);
         log(`Tool intelligence outcome: ${outcome.kind}`);
       }
@@ -366,11 +591,15 @@ export default function App() {
   }
 
   async function confirmPendingAction(pendingActionOverride?: any, confirmedOnWatch = false) {
-    const pendingAction = pendingActionOverride ?? pendingConfirmation;
-    if (!pendingAction || !environment.current) return;
+    const pendingAction = pendingActionOverride ?? pendingConfirmationRef.current;
+    if (!pendingAction) return;
+    const runtime = environment.current ?? await getEnvironment();
     const toolNames = pendingAction.call ? [pendingAction.call.toolId] : pendingAction.plan.operations.map((operation: any) => operation.toolId);
-    const labels = toolNames.map((id: string) => environment.current.registry.get(id)?.name ?? id).join(', ');
-    if (!confirmedOnWatch && !window.confirm(`Run the following local mock action(s)? ${labels}`)) {
+    const labels = toolNames.map((id: string) => runtime.registry.get(id)?.name ?? id).join(', ');
+    const proposedArguments = pendingAction.executionState?.pendingConfirmation?.arguments
+      ?? pendingAction.call?.arguments;
+    const details = proposedArguments ? ` Proposed arguments: ${JSON.stringify(proposedArguments)}` : '';
+    if (!confirmedOnWatch && !window.confirm(`Run the following local mock action(s)? ${labels}.${details}`)) {
       if (watch.connected) watchConfirmationRef.current = true;
       return;
     }
@@ -389,7 +618,7 @@ export default function App() {
     try {
       let document;
       if (pendingAction.fromWorkflow) {
-        const outcome = await environment.current.intelligence.handle('yes', { confirmed: true, context: { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn } });
+        const outcome = await runtime.intelligence.handle('yes', { confirmed: true, context: { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn } });
         if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
         if (outcome.kind === 'confirmation_required') {
           updatePendingConfirmation({ call: outcome.pendingCall, fromWorkflow: true });
@@ -408,10 +637,48 @@ export default function App() {
         }
         if (outcome.kind !== 'document') throw new Error(outcome.text ?? outcome.question ?? 'The confirmed workflow did not complete.');
         document = outcome.document;
+      } else if (pendingAction.executionState) {
+        const executionState = pendingAction.executionState;
+        const outcome = await runtime.dispatcher.dispatchPlan(executionState.plan, {
+          confirmed: true,
+          confirmedOperationId: executionState.pendingConfirmation?.operationId,
+          executionState,
+          onStateChange: async (state: PlanExecutionState) => postApi('/api/demo/conversation', {
+            state: {
+              conversationId: state.plan.conversationId,
+              status: state.plan.status === 'waiting_for_confirmation' ? 'awaiting_confirmation'
+                : state.plan.status === 'completed' ? 'completed'
+                  : state.plan.status === 'failed' ? 'failed' : 'executing',
+              originalRequest: state.plan.originalRequest,
+              pendingQuestion: state.pendingConfirmation ? `Confirm ${state.pendingConfirmation.toolId}?` : undefined,
+              executionState: state,
+            },
+          }),
+        });
+        if (outcome.state === 'confirmation_required') {
+          updatePendingConfirmation({ plan: outcome.plan, executionState: outcome.executionState, externalPlan: true });
+          watchConfirmationRef.current = true;
+          await showDocument(createDisplayDocument({
+            id: 'cue-confirm-next-plan-operation',
+            title: 'Confirmation required',
+            source: { app: 'cue', name: 'Cue' },
+            state: 'confirmation_required',
+            message: `Confirm ${runtime.registry.get(outcome.pendingConfirmation.toolId)?.name ?? outcome.pendingConfirmation.toolId}?`,
+            elements: [{ type: 'text', text: JSON.stringify(outcome.pendingConfirmation.arguments), role: 'body' }],
+          }));
+          return;
+        }
+        document = outcome.document ?? createDisplayDocument({
+          id: 'cue-plan-completed',
+          title: 'Plan completed',
+          source: { app: 'cue', name: 'Cue' },
+          state: 'success',
+          message: 'All required operations completed or were safely skipped.',
+        });
       } else {
         const result = pendingAction.call
-          ? await environment.current.dispatcher.dispatch(pendingAction.call, { confirmed: true })
-          : await environment.current.dispatcher.dispatchPlan(pendingAction.plan, { confirmed: true });
+          ? await runtime.dispatcher.dispatch(pendingAction.call, { confirmed: true })
+          : await runtime.dispatcher.dispatchPlan(pendingAction.plan, { confirmed: true });
         document = result.document;
       }
       updatePendingConfirmation(undefined);
@@ -434,12 +701,37 @@ export default function App() {
     finally { setBusy(false); }
   }
 
-  function cancelPendingOperation() {
-    environment.current?.intelligence.cancelPendingOperation();
+  async function cancelPendingOperation() {
+    const savedState = await getConversationState().catch(error => {
+      log(`Could not load pending state for cancellation: ${error instanceof Error ? error.message : String(error)}`);
+      return undefined;
+    });
+    const pendingExecution = pendingConfirmationRef.current?.executionState ?? savedState?.executionState;
+    if (pendingExecution) {
+      const cancelled = structuredClone(pendingExecution);
+      cancelled.plan.status = 'cancelled';
+      if (cancelled.pendingConfirmation) {
+        const operation = cancelled.plan.operations.find((item: any) => item.id === cancelled.pendingConfirmation.operationId);
+        if (operation) operation.status = 'skipped';
+      }
+      cancelled.pendingConfirmation = undefined;
+      await postApi('/api/demo/conversation', {
+        state: {
+          conversationId: cancelled.plan.conversationId,
+          status: 'cancelled',
+          originalRequest: cancelled.plan.originalRequest,
+          executionState: cancelled,
+        },
+      });
+    } else if (savedState?.pendingReasoning) {
+      await postApi('/api/demo/conversation', { state: { ...savedState, status: 'cancelled', pendingReasoning: false } });
+    } else {
+      environment.current?.intelligence.cancelPendingOperation();
+      if (environment.current) await postApi('/api/demo/conversation', { state: environment.current.intelligence.getState() });
+    }
     updatePendingConfirmation(undefined);
     watchConfirmationRef.current = false;
     setPendingClarification(false);
-    if (environment.current) void postApi('/api/demo/conversation', { state: environment.current.intelligence.getState() }).catch(error => log(`Could not persist cancellation: ${error instanceof Error ? error.message : String(error)}`));
     log('Pending operation cancelled');
   }
 
@@ -461,8 +753,28 @@ export default function App() {
   }
 
   async function dispatchDocumentAction(action: any) {
-    if (!environment.current) return;
     try {
+      if (action?.kind === 'interaction_option') {
+        const key = `${action.interactionId}:${action.optionId}`;
+        if (resolvingInteractions.current.has(key)) return;
+        resolvingInteractions.current.add(key);
+        try {
+          const state = await getConversationState();
+          if (!state || action.interactionId !== interactionIdForState(state)) throw new Error('This clarification choice has expired.');
+          const options = state.status === 'awaiting_tool_choice'
+            ? (state.candidateTools ?? []).map((candidate: any) => candidate.toolId)
+            : state.status === 'awaiting_entity_choice'
+              ? (state.pendingEntityOptions ?? []).map((option: any) => option.id)
+              : [];
+          if (!options.includes(action.optionId)) throw new Error('This clarification choice is not valid for the pending interaction.');
+          await processTranscript(action.optionId, true);
+          setTranscriptInput('');
+        } finally {
+          resolvingInteractions.current.delete(key);
+        }
+        return;
+      }
+      if (!environment.current) return;
       if (watch.connected) {
         await watch.sendDisplayDocument(createDisplayDocument({
           id: 'cue-action-working',
@@ -618,17 +930,20 @@ export default function App() {
 
   return <main>
     <h1>Cue</h1>
-    <p>Enter a request for local tool discovery, argument resolution, and mock-provider execution. AI inference runs in your browser.</p>
+    <p>Enter a request for tool discovery, argument resolution, and provider execution. Cue validates and controls every operation.</p>
     <section><h2>Devices</h2><button onClick={() => watch.connected ? watch.disconnect() : void connectWatch()}>{watch.connected ? 'Disconnect watch' : 'Connect Bangle.js'}</button> <span>{watchName}</span> <button disabled={!watch.connected || testSending} onClick={() => void sendWatchTest()}>{testSending ? 'Sending raw test…' : 'Send raw TEST to watch'}</button><p><button disabled={installing} onClick={() => void installOnWatch()}>{installing ? 'Installing…' : 'Install on watch'}</button></p>{installStatus && <p role="status">{installStatus}</p>}<details><summary>Manual downloads</summary><p>These files can also be installed with the Espruino Web IDE.</p><button onClick={() => downloadWatchFile('cue.app.js', watchAppSource)}>Download watch display app</button> <a href="https://www.espruino.com/ide/" target="_blank" rel="noreferrer">Open Espruino Web IDE</a></details><br /><button onClick={() => void toggleMicrophone()}>{recording ? 'Stop microphone' : 'Start microphone'}</button><button disabled={!recording || buffer < 0.2} onClick={freezeBuffer}>Freeze rolling buffer</button> <strong style={{ color: recording ? '#16803c' : '#777' }}>{recording ? '● Recording' : 'Microphone off'}</strong><p>Rolling buffer: {buffer.toFixed(1)} / 10.0 seconds (sample rate {audio.sampleRate || '—'} Hz)</p></section>
     <section><h2>Processing</h2>
-      <fieldset disabled={busy}><legend>Argument normalizer</legend><div role="group" aria-label="Normalizer mode">
-        <button type="button" aria-pressed={gemmaMode === 'automatic'} onClick={() => setGemmaPreference('automatic')}>Automatic</button>
-        <button type="button" aria-pressed={gemmaMode === 'enabled'} onClick={() => setGemmaPreference('enabled')}>Enabled</button>
-        <button type="button" aria-pressed={gemmaMode === 'disabled'} onClick={() => setGemmaPreference('disabled')}>Disabled</button>
-      </div></fieldset>
-      <p>Automatic and Enabled use OpenRouter for suitable requests, falling back to local Gemma if needed. Disabled skips model normalization. Requests, conversation context and matching provider records may be sent to OpenRouter; do not enter sensitive information.</p>
-      <p role="status">Gemma fallback: {gemmaState.status}{gemmaState.progress?.reason ? ` — ${gemmaState.progress.reason}` : ''}{gemmaState.progress?.message ? ` — ${gemmaState.progress.message}` : ''}{gemmaState.progress?.generatedCharacters ? ` — ${gemmaState.progress.generatedCharacters} generated characters` : ''}</p>
-      <label>Calendar week starts<select value={weekStartsOn} onChange={event => setCalendarWeekStart(Number(event.target.value))}><option value={1}>Monday</option><option value={0}>Sunday</option></select></label><label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label><button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button><button disabled={busy || !recording || buffer < 0.2} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); void startHoldCapture(); }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()}>{holding ? 'Release to transcribe…' : 'Hold to transcribe (max 5 min)'}</button>{(['transcribe', 'embed'] as Stage[]).map(stage => <p key={stage}>{stage}: {status[stage]}{busy && <button onClick={() => stopStage(stage)}>Stop {stage}</button>}</p>)}<p>Tools and provider availability are loaded dynamically from the session's SQLite registry. MiniLM retrieval and deterministic argument resolution run in your browser.</p><label>Demo scenario<select value={scenario} onChange={event => { setScenario(event.target.value); setTranscriptInput(event.target.value); }}><option value="">Choose an example request</option>{DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}</select></label><label>{pendingClarification ? 'Clarification' : 'Transcript text'}<textarea value={transcriptInput} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder={pendingClarification ? 'Enter the missing details or a correction' : 'Enter sample transcript text'} /></label>{pendingClarification && <p role="status">Reply here to continue the pending request. Your message will go directly to that request.</p>}<button disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>{busy ? 'Processing…' : pendingClarification ? 'Send clarification' : 'Process transcript'}</button> <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button><label>Transcription (audio capture only)<textarea readOnly value={transcription} /></label><p>Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>{displayDocument && <><DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />{pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}{pendingClarification && <button disabled={busy} onClick={cancelPendingOperation}>Cancel pending operation</button>}</>}</section>
+      <label>AI mode<select value={aiMode} disabled={busy} onChange={event => {
+        const value = event.target.value;
+        if (value === 'web_ai' || value === 'automatic' || value === 'dots3_always') setAiPreference(value);
+      }}>
+        <option value="web_ai">Web AI</option>
+        <option value="automatic">Automatic</option>
+        <option value="dots3_always">Always Dots 3</option>
+      </select></label>
+      <p>Web AI uses browser-side MiniLM, deterministic logic, and local Gemma when available; it never calls OpenRouter. Automatic tries local reasoning first and uses Dots 3 through OpenRouter only when local tool selection is ambiguous. Always Dots 3 sends the current request, relevant schemas, and necessary pending context to OpenRouter for reasoning. Requests still reach Cue’s backend for registered provider operations; do not enter sensitive information in external modes.</p>
+      <p role="status">Local Gemma: {gemmaState.status}{gemmaState.progress?.reason ? ` — ${gemmaState.progress.reason}` : ''}{gemmaState.progress?.message ? ` — ${gemmaState.progress.message}` : ''}{gemmaState.progress?.generatedCharacters ? ` — ${gemmaState.progress.generatedCharacters} generated characters` : ''}</p>
+      <label>Calendar week starts<select value={weekStartsOn} onChange={event => setCalendarWeekStart(Number(event.target.value))}><option value={1}>Monday</option><option value={0}>Sunday</option></select></label><label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label><button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button><button disabled={busy || !recording || buffer < 0.2} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); void startHoldCapture(); }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()}>{holding ? 'Release to transcribe…' : 'Hold to transcribe (max 5 min)'}</button>{(['transcribe', 'embed', 'rerank'] as Stage[]).map(stage => <p key={stage}>{stage === 'rerank' ? 'cross-encoder' : stage}: {status[stage]}{busy && <button onClick={() => stopStage(stage)}>Stop {stage === 'rerank' ? 'cross-encoder' : stage}</button>}</p>)}<p>Tools and provider availability are loaded dynamically from the session's SQLite registry. MiniLM retrieval and deterministic argument resolution run in your browser.</p><label>Demo scenario<select value={scenario} onChange={event => { setScenario(event.target.value); setTranscriptInput(event.target.value); }}><option value="">Choose an example request</option>{DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}</select></label><label>{pendingClarification ? 'Clarification' : 'Transcript text'}<textarea value={transcriptInput} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder={pendingClarification ? 'Enter the missing details or a correction' : 'Enter sample transcript text'} /></label>{pendingClarification && <p role="status">Reply here to continue the pending request. Your message will go directly to that request.</p>}<button disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>{busy ? 'Processing…' : pendingClarification ? 'Send clarification' : 'Process transcript'}</button> <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button><label>Transcription (audio capture only)<textarea readOnly value={transcription} /></label><p>Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>{displayDocument && <><DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />{pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}{pendingClarification && <button disabled={busy} onClick={() => void cancelPendingOperation().catch(error => log(`Could not cancel pending operation: ${error instanceof Error ? error.message : String(error)}`))}>Cancel pending operation</button>}</>}</section>
     <section><h2>Status log</h2><pre>{logs.join('\n')}</pre></section>
   </main>;
 }
