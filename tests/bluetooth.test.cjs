@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const ts = require('typescript');
 
-function createConnection(onWrite) {
+function createConnection(onWrite, { connectGatt } = {}) {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', 'bluetooth.ts'), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const timers = new Map();
@@ -13,6 +13,8 @@ function createConnection(onWrite) {
   let time = 0;
   let nextTimer = 1;
   let listener;
+  let requestDeviceCount = 0;
+  const deviceListeners = new Map();
   const clock = {
     setTimeout(callback, delay) {
       const id = nextTimer++;
@@ -28,6 +30,7 @@ function createConnection(onWrite) {
   const tx = {
     startNotifications: async () => tx,
     addEventListener: (type, callback) => { listener = callback; },
+    removeEventListener: (type, callback) => { if (listener === callback) listener = undefined; },
   };
   const rx = {
     writeValueWithoutResponse: async data => {
@@ -39,11 +42,16 @@ function createConnection(onWrite) {
   };
   const service = { getCharacteristic: async uuid => uuid.includes('0002-') ? rx : tx };
   const server = { getPrimaryService: async () => service };
-  const device = { name: 'Bangle.js test', gatt: { connected: true, connect: async () => server }, addEventListener: () => {} };
+  const device = {
+    name: 'Bangle.js test',
+    gatt: { connected: true, connect: connectGatt ?? (async () => server), disconnect: () => {} },
+    addEventListener: (type, callback) => deviceListeners.set(type, callback),
+    removeEventListener: (type, callback) => { if (deviceListeners.get(type) === callback) deviceListeners.delete(type); },
+  };
   const exports = {};
   vm.runInNewContext(compiled, {
     exports, TextEncoder, TextDecoder, Uint8Array, DataView, Map, Set,
-    navigator: { bluetooth: { requestDevice: async () => device } },
+    navigator: { bluetooth: { requestDevice: async () => { requestDeviceCount++; return device; } } },
     window: clock,
   });
   async function run(promise) {
@@ -61,8 +69,62 @@ function createConnection(onWrite) {
     if (!done) throw new Error('Delivery did not settle');
     return promise;
   }
-  return { connection: new exports.BangleConnection(), frames, timers, run, now: () => time };
+  return {
+    connection: new exports.BangleConnection(),
+    frames,
+    timers,
+    run,
+    now: () => time,
+    disconnectDevice: () => deviceListeners.get('gattserverdisconnected')?.(),
+    deviceListenerCount: () => deviceListeners.size,
+    requestDeviceCount: () => requestDeviceCount,
+  };
 }
+
+test('connection state is published only after BLE setup succeeds and stays synchronized on disconnect', async () => {
+  const harness = createConnection(async () => {});
+  const statuses = [];
+  harness.connection.subscribeStatus(status => statuses.push(status));
+  assert.equal(harness.connection.connected, false);
+  assert.equal(harness.deviceListenerCount(), 0);
+
+  await harness.connection.connect();
+  assert.equal(harness.connection.connected, true);
+  assert.equal(statuses.at(-1), 'Connected: Bangle.js test');
+  assert.equal(harness.deviceListenerCount(), 1);
+
+  harness.disconnectDevice();
+  assert.equal(harness.connection.connected, false);
+  assert.equal(statuses.at(-1), 'Watch disconnected');
+  assert.equal(harness.deviceListenerCount(), 0);
+});
+
+test('manual disconnect removes connection listeners and publishes the disconnected state', async () => {
+  const harness = createConnection(async () => {});
+  const statuses = [];
+  harness.connection.subscribeStatus(status => statuses.push(status));
+  await harness.connection.connect();
+  harness.connection.disconnect();
+  assert.equal(harness.connection.connected, false);
+  assert.equal(statuses.at(-1), 'Not connected');
+  assert.equal(harness.deviceListenerCount(), 0);
+});
+
+test('concurrent connect requests reuse one BLE connection attempt', async () => {
+  const harness = createConnection(async () => {});
+  const [first, second] = await Promise.all([harness.connection.connect(), harness.connection.connect()]);
+  assert.equal(first, 'Bangle.js test');
+  assert.equal(second, first);
+  assert.equal(harness.requestDeviceCount(), 1);
+  assert.equal(harness.deviceListenerCount(), 1);
+});
+
+test('GATT connection timeout is surfaced as a failed connection and clears its timer', async () => {
+  const harness = createConnection(async () => {}, { connectGatt: () => new Promise(() => {}) });
+  await assert.rejects(harness.run(harness.connection.connect()), /Timed out while connecting to the watch/);
+  assert.equal(harness.connection.status, 'Connection failed: Timed out while connecting to the watch.');
+  assert.equal(harness.timers.size, 0);
+});
 
 test('long transfers can be acknowledged after the original timeout', async () => {
   const harness = createConnection(async (frame, { notifyAck }) => {

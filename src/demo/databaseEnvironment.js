@@ -1,13 +1,27 @@
 import { ToolDispatcher } from '../intelligence/dispatcher.js';
-import { buildToolExampleIndex, ToolIntelligence } from '../intelligence/toolIntelligence.js';
+import { buildToolExampleIndex, ToolIntelligence, EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } from '../intelligence/toolIntelligence.js';
 import { normalizeArgumentsWithModel } from '../intelligence/argumentNormalization.js';
-import { buildProviderDataIndex } from '../intelligence/retrieval/providerData.js';
+import { buildProviderDataIndex, searchProviderData as searchLocalProviderData } from '../intelligence/retrieval/providerData.js';
+import { discoverTools } from '../intelligence/retrieval/semanticTools.js';
 import { ToolRegistry } from '../intelligence/toolRegistry.js';
+import alarmAdapter from '../providers/alarm/index.js';
+import ankiAdapter from '../providers/anki/index.js';
+import calendarAdapter from '../providers/calendar/index.js';
+import knowledgeAdapter from '../providers/knowledge/index.js';
+import notificationsAdapter from '../providers/notifications/index.js';
+import webAdapter from '../providers/web/index.js';
 
-export async function createDatabaseEnvironment({ registryData, embed, rerankTools, onRerankDecision, postApi, normalizeArguments, argumentNormalizerEnabled, threshold = undefined, plausibleThreshold = undefined, ambiguityMargin = undefined, initialState }) {
+const providerAdapters = new Map([
+  alarmAdapter, ankiAdapter, calendarAdapter, knowledgeAdapter, notificationsAdapter, webAdapter,
+].map(adapter => [adapter.id, adapter]));
+
+export async function createDatabaseEnvironment({ database, registryData, embed, rerankTools, onRerankDecision, onUsage, onToolExecution, normalizeArguments, argumentNormalizerEnabled, threshold = undefined, plausibleThreshold = undefined, ambiguityMargin = undefined, initialState, initializeRetrieval = true }) {
+  if (!database || typeof database.getRegistryData !== 'function') throw new TypeError('A browser-local database is required.');
+  registryData ??= await database.getRegistryData();
   if (!registryData || !Array.isArray(registryData.providers) || !Array.isArray(registryData.tools)) {
-    throw new TypeError('The demo registry response is invalid');
+    throw new TypeError('The local tool registry is invalid.');
   }
+  if (typeof embed !== 'function') throw new TypeError('A browser-side embedding function is required.');
   const config = registryData.toolRetrievalConfig ?? {};
   const minimumScore = threshold ?? config.minimumScore ?? 0.58;
   const plausibleScore = plausibleThreshold ?? config.plausibleScore ?? 0.38;
@@ -16,44 +30,70 @@ export async function createDatabaseEnvironment({ registryData, embed, rerankToo
   const weights = config.weights ?? { description: 0.35, keyword: 0.3, example: 0.35 };
   const crossEncoder = config.crossEncoder ?? {};
   const registry = new ToolRegistry();
-  let providerDataIndex = [];
-  async function indexPendingProviderData(sourceRegistry) {
-    const pendingIds = new Set(sourceRegistry.pendingProviderDataIds ?? []);
-    const entries = await buildProviderDataIndex({
-      providers: sourceRegistry.providers,
-      data: sourceRegistry.data,
-      embed,
-      recordIds: pendingIds,
-    });
-    for (let offset = 0; offset < entries.length; offset += 10) {
-      const batch = entries.slice(offset, offset + 10).map(({ providerId, recordType, recordId, contentHash, vector }) => ({
-        providerId,
-        recordType,
-        recordId,
-        contentHash,
-        vector,
-      }));
-      await postApi('/api/demo/index-provider-data', { entries: batch });
+  const toolsById = new Map(registryData.tools.map(tool => [tool.id, tool]));
+  const providersById = new Map(registryData.providers.map(provider => [provider.id, provider]));
+  const embedCached = async text => {
+    const cached = await database.getCachedEmbedding(text, EMBEDDING_MODEL);
+    if (cached?.dimensions === EMBEDDING_DIMENSIONS && cached.vector?.length === EMBEDDING_DIMENSIONS) {
+      return { vector: cached.vector, dimensions: cached.dimensions };
     }
-    return entries;
-  }
-  async function refreshProviderData() {
-    const response = await fetch('/api/demo/registry', { credentials: 'same-origin', cache: 'no-store' });
-    const freshRegistry = await response.json();
-    if (!response.ok) throw new Error(freshRegistry.error ?? `Provider-data refresh failed (${response.status})`);
-    providerDataIndex = await indexPendingProviderData(freshRegistry);
-  }
+    const result = await embed(text);
+    const vector = Array.isArray(result) ? result : result.vector;
+    const dimensions = result.dimensions ?? vector?.length;
+    if (!Array.isArray(vector) || dimensions !== EMBEDDING_DIMENSIONS || vector.length !== EMBEDDING_DIMENSIONS
+      || vector.some(value => !Number.isFinite(value))) {
+      throw new Error(`Unexpected embedding: expected ${EMBEDDING_DIMENSIONS} finite dimensions.`);
+    }
+    await database.cacheEmbedding(text, EMBEDDING_MODEL, dimensions, vector);
+    return { vector, dimensions };
+  };
+  let providerDataIndex = [];
+  let retrievalReady = false;
+  const indexProviderData = async () => {
+    const freshRegistry = await database.getRegistryData();
+    providerDataIndex = await buildProviderDataIndex({
+      providers: freshRegistry.providers,
+      data: freshRegistry.data,
+      embed: embedCached,
+      dimensions: EMBEDDING_DIMENSIONS,
+    });
+  };
+
   for (const provider of registryData.providers) {
+    const adapter = providerAdapters.get(provider.id);
     registry.registerProvider({
       id: provider.id,
       available: provider.status === 'available',
-      canExecute: true,
+      canExecute: Boolean(adapter),
       permissions: provider.manifest?.permissions ?? [],
       contextSearch: provider.manifest?.contextSearch,
-      execute: async (toolId, args, { confirmed, operationId } = {}) => {
-        const response = await postApi('/api/demo/execute', { toolId, arguments: args, confirmed: confirmed === true, operationId });
-        if (registry.get(toolId)?.effect === 'side_effecting') await refreshProviderData();
-        return response.result;
+      execute: async (toolId, args, context = {}) => {
+        if (!adapter) throw new Error(`No trusted local adapter is registered for ${provider.id}.`);
+        const tool = toolsById.get(toolId);
+        const storedProvider = providersById.get(provider.id);
+        if (!tool || !storedProvider || tool.providerId !== provider.id) throw new Error(`Tool is not registered for provider ${provider.id}: ${toolId}`);
+        let result;
+        const startedAt = performance.now();
+        let succeeded = false;
+        try {
+          result = await database.executeRegisteredTool(
+            tool,
+            storedProvider,
+            args,
+            context,
+            () => adapter.execute(toolId, args, { database }),
+          );
+          succeeded = true;
+        } catch (error) {
+          await onUsage?.('failures');
+          throw error;
+        } finally {
+          onToolExecution?.(performance.now() - startedAt, succeeded);
+        }
+        await onUsage?.('executions');
+        await onUsage?.('successes');
+        if (tool.confirmation === 'required' && retrievalReady) await indexProviderData();
+        return result;
       },
     });
   }
@@ -62,22 +102,35 @@ export async function createDatabaseEnvironment({ registryData, embed, rerankToo
     registry.registerTool(tool);
   }
 
-  providerDataIndex = await indexPendingProviderData(registryData);
-  let exampleIndex = [];
-  const pendingIds = new Set(registryData.pendingToolEmbeddingIds ?? []);
-  if (pendingIds.size) {
-    exampleIndex = await buildToolExampleIndex(registry.list().filter(tool => tool.available !== false), embed, { recordIds: pendingIds });
-    for (let offset = 0; offset < exampleIndex.length; offset += 10) {
-      const batch = exampleIndex.slice(offset, offset + 10).map(({ recordId, vector }) => ({ recordId, vector }));
-      await postApi('/api/demo/index-tools', { entries: batch });
+  const exampleIndex = [];
+  let retrievalAttempt;
+  const ensureRetrieval = async () => {
+    if (retrievalReady) return;
+    if (!retrievalAttempt) {
+      retrievalAttempt = (async () => {
+        const examples = await buildToolExampleIndex(
+          registry.list().filter(tool => tool.available !== false && registry.getProvider(tool.providerId)?.available !== false),
+          embedCached,
+        );
+        await indexProviderData();
+        exampleIndex.splice(0, exampleIndex.length, ...examples);
+        retrievalReady = true;
+      })();
     }
-  }
+    const attempt = retrievalAttempt;
+    try {
+      await attempt;
+    } finally {
+      if (retrievalAttempt === attempt) retrievalAttempt = undefined;
+    }
+  };
+  if (initializeRetrieval) await ensureRetrieval();
 
   const dispatcher = new ToolDispatcher(registry, { maxOperations: config.maxOperations ?? 8 });
   const intelligence = new ToolIntelligence({
     registry,
     dispatcher,
-    embed,
+    embed: embedCached,
     examples: exampleIndex,
     rerankTools,
     onRerankDecision,
@@ -93,16 +146,30 @@ export async function createDatabaseEnvironment({ registryData, embed, rerankToo
     initialState,
     argumentNormalizerEnabled,
     normalizeArguments: normalizeArguments
-      ? input => normalizeArgumentsWithModel(input, { generate: normalizeArguments })
+      ? input => normalizeArgumentsWithModel(input, { generate: normalizeArguments, includeProviderEvidence: false })
       : undefined,
-    searchTools: async vector => {
-      const response = await postApi('/api/demo/tools/search', { vector, limit: config.topK ?? 5, threshold: plausibleScore, scoring, weights });
-      return response.results;
-    },
-    searchProviderData: async (vector, providerIds) => {
-      const response = await postApi('/api/demo/provider-data/search', { vector, providerIds, limit: 3, threshold: 0.3 });
-      return response.results;
-    },
+    searchTools: async (vector, options = {}) => discoverTools(vector, exampleIndex, {
+      limit: options.limit ?? config.topK ?? 5,
+      threshold: options.threshold ?? plausibleScore,
+      strategy: options.scoring ?? scoring,
+      weights: options.weights ?? weights,
+    }),
+    searchProviderData: async (vector, providerIds) => searchLocalProviderData(vector, providerDataIndex, {
+      providerIds,
+      limit: 3,
+      threshold: 0.3,
+    }),
   });
-  return { registry, dispatcher, intelligence, exampleIndex, providerDataIndex, providers: registryData.providers, data: registryData.data, demoClock: registryData.demoClock };
+  return {
+    registry,
+    dispatcher,
+    intelligence,
+    exampleIndex,
+    ensureRetrieval,
+    get providerDataIndex() { return providerDataIndex; },
+    providers: registryData.providers,
+    data: registryData.data,
+    demoClock: registryData.demoClock,
+    registryData,
+  };
 }

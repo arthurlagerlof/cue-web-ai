@@ -2,9 +2,9 @@ import { detectAmbiguity, discoverTools } from './retrieval/semanticTools.js';
 import { clarificationForResolution, resolveArguments } from './argumentResolution.js';
 import { normalizeArgumentsWithModel, shouldNormalizeArguments } from './argumentNormalization.js';
 import { assertExecutionPlan, MAX_PLAN_OPERATIONS, PLAN_SCHEMA, PLAN_VERSION, readJsonPointer } from './executionPlan.js';
+import { EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } from './embeddingModel.js';
 
-export const EMBEDDING_MODEL = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2';
-export const EMBEDDING_DIMENSIONS = 384;
+export { EMBEDDING_DIMENSIONS, EMBEDDING_MODEL } from './embeddingModel.js';
 
 export async function buildToolExampleIndex(tools, embed, { model = EMBEDDING_MODEL, dimensions = EMBEDDING_DIMENSIONS, recordIds } = {}) {
   const index = [];

@@ -7,20 +7,21 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "test": "node --test tests/*.test.cjs",
-    "preview": "vite preview",
-    "seed:demo": "py seed_demo.py",
-    "verify:demo": "py seed_demo.py --verify",
-    "backend": "py backend.py"
+    "preview": "vite preview"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.4.0-next.0",
+    "@sqlite.org/sqlite-wasm": "^3.54.1-build1",
     "chrono-node": "^2.10.3",
+    "pg": "^8.13.1",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "three": "^0.187.0"
   },
   "devDependencies": {
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
+    "@types/three": "^0.187.0",
     "@vitejs/plugin-react": "4.3.4",
     "typescript": "~5.7.2",
     "vite": "6.1.0"

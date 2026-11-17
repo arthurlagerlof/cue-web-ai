@@ -19,4 +19,3 @@ cue_memory.db-wal
 *.anki21
 *anki*backup*
 *anki*export*
-!data/cue_demo.db

@@ -61,6 +61,7 @@ export function buildArgumentNormalizationPrompt({
   missing = [],
   ambiguous = [],
   providerEvidence = [],
+  includeProviderEvidence = true,
   timeZone,
   currentDate,
 }) {
@@ -77,7 +78,7 @@ export function buildArgumentNormalizationPrompt({
       deterministicArguments,
       missing,
       ambiguous,
-      providerEvidence,
+      providerEvidence: includeProviderEvidence ? providerEvidence : [],
       timeZone,
       currentDate,
     }),
@@ -141,9 +142,9 @@ export function validateNormalizedResponse(responseText, { tool, deterministicAr
   return { ...response, arguments: mergedArguments };
 }
 
-export async function normalizeArgumentsWithModel(input, { generate, maxAttempts = 2 }) {
+export async function normalizeArgumentsWithModel(input, { generate, maxAttempts = 2, includeProviderEvidence = true }) {
   if (typeof generate !== 'function') throw new TypeError('A model generation function is required.');
-  const basePrompt = buildArgumentNormalizationPrompt(input);
+  const basePrompt = buildArgumentNormalizationPrompt({ ...input, includeProviderEvidence });
   let prompt = basePrompt;
   let lastError;
   for (let attempt = 0; attempt < maxAttempts; attempt++) {

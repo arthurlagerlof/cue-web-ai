@@ -1,7 +1,7 @@
 type GattCharacteristic = { value?: DataView | null; properties?: { write?: boolean; writeWithoutResponse?: boolean; notify?: boolean; indicate?: boolean }; startNotifications(): Promise<GattCharacteristic>; writeValueWithoutResponse?: (value: BufferSource) => Promise<void>; writeValue(value: BufferSource): Promise<void>; addEventListener(type: string, listener: (event: Event) => void): void; removeEventListener(type: string, listener: (event: Event) => void): void };
 type GattService = { getCharacteristic(uuid: string): Promise<GattCharacteristic> };
 type GattServer = { getPrimaryService(uuid: string): Promise<GattService> };
-type BangleDevice = { name?: string | null; gatt?: { connected: boolean; connect(): Promise<GattServer>; disconnect(): void }; addEventListener(type: string, listener: () => void): void };
+type BangleDevice = { name?: string | null; gatt?: { connected: boolean; connect(): Promise<GattServer>; disconnect(): void }; addEventListener(type: string, listener: () => void): void; removeEventListener(type: string, listener: () => void): void };
 type BluetoothAPI = { requestDevice(options: { filters: { namePrefix: string }[]; optionalServices: string[] }): Promise<BangleDevice> };
 
 const UART_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
@@ -10,11 +10,19 @@ const UART_TX = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 
 const HEADER_SIZE = 9;
 const MAX_DISPLAY_BYTES = 2450;
+const GATT_CONNECTION_TIMEOUT_MS = 20000;
 let nextMessageId = 1;
 
 export class BangleConnection {
   private device?: BangleDevice;
   private characteristic?: GattCharacteristic;
+  private notificationCharacteristic?: GattCharacteristic;
+  private notificationListener?: (event: Event) => void;
+  private disconnectListener?: () => void;
+  private connectionAttempt?: Promise<string>;
+  private ready = false;
+  private currentStatus = 'Not connected';
+  private statusListeners = new Set<(message: string) => void>();
   onCommand?: (command: string) => void;
   onTrigger?: () => void;
   onAction?: (actionId: string) => void;
@@ -26,37 +34,111 @@ export class BangleConnection {
   private pendingAcks = new Map<number, (received: boolean) => void>();
   private rawTestResolver?: (received: boolean) => void;
   private rawTestBuffer = '';
-  get connected() { return !!this.device?.gatt?.connected; }
+  get connected() { return this.ready && !!this.device?.gatt?.connected; }
+  get status() { return this.currentStatus; }
+  get bluetoothAvailable() { return typeof navigator !== 'undefined' && 'bluetooth' in navigator && !!(navigator as Navigator & { bluetooth?: BluetoothAPI }).bluetooth; }
+
+  private setStatus(message: string) {
+    this.currentStatus = message;
+    this.onStatus?.(message);
+    this.statusListeners.forEach(listener => listener(message));
+  }
+
+  subscribeStatus(listener: (message: string) => void) {
+    this.statusListeners.add(listener);
+    listener(this.currentStatus);
+    return () => { this.statusListeners.delete(listener); };
+  }
 
   async connect() {
-    if (!('bluetooth' in navigator)) throw new Error('Web Bluetooth is unavailable. Use a supported Chromium browser over HTTPS or localhost.');
-    const bluetooth = (navigator as Navigator & { bluetooth?: BluetoothAPI }).bluetooth;
-    if (!bluetooth) throw new Error('Web Bluetooth is unavailable in this browser.');
-    this.device = await bluetooth.requestDevice({ filters: [{ namePrefix: 'Bangle.js' }], optionalServices: [UART_SERVICE] });
-    this.device.addEventListener('gattserverdisconnected', () => { this.characteristic = undefined; this.onStatus?.('Watch disconnected'); });
-    const server = await this.device.gatt?.connect();
-    if (!server) throw new Error('Could not establish a GATT connection.');
-    const service = await server.getPrimaryService(UART_SERVICE);
-    const tx = await service.getCharacteristic(UART_TX);
-    this.characteristic = await service.getCharacteristic(UART_RX);
-    this.onDiagnostic?.(`GATT ready: service ${UART_SERVICE}; write ${UART_RX} ${JSON.stringify(this.characteristic.properties)}; notify ${UART_TX} ${JSON.stringify(tx.properties)}`);
-    tx.addEventListener('characteristicvaluechanged', event => {
-      const value = (event.target as unknown as GattCharacteristic).value;
-      if (!value) return;
-      const data = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
-      this.onDiagnostic?.(`TX notification (${data.length} bytes): ${Array.from(data, byte => byte.toString(16).padStart(2, '0')).join(' ')}`);
-      if (this.rawTestResolver) {
-        this.rawTestBuffer = (this.rawTestBuffer + new TextDecoder().decode(data)).slice(-256);
-        if (this.rawTestBuffer.includes('ACK:TEST')) {
-          this.onDiagnostic?.('Raw diagnostic ACK received: ACK:TEST');
-          this.rawTestResolver(true);
-        }
+    if (this.connected) return this.device?.name ?? 'Bangle.js';
+    if (this.connectionAttempt) return this.connectionAttempt;
+    const attempt = this.connectOnce();
+    this.connectionAttempt = attempt;
+    try {
+      return await attempt;
+    } finally {
+      if (this.connectionAttempt === attempt) this.connectionAttempt = undefined;
+    }
+  }
+
+  private async connectOnce() {
+    this.setStatus('Requesting Bluetooth access…');
+    try {
+      if (!this.bluetoothAvailable) throw new Error('Web Bluetooth is unavailable. Use a supported Chromium browser over HTTPS or localhost.');
+      const bluetooth = (navigator as Navigator & { bluetooth?: BluetoothAPI }).bluetooth;
+      if (!bluetooth) throw new Error('Web Bluetooth is unavailable in this browser.');
+      this.device = await bluetooth.requestDevice({ filters: [{ namePrefix: 'Bangle.js' }], optionalServices: [UART_SERVICE] });
+      this.disconnectListener = () => {
+        this.clearConnection();
+        this.setStatus('Watch disconnected');
+      };
+      this.device.addEventListener('gattserverdisconnected', this.disconnectListener);
+      this.setStatus('Connecting…');
+      const device = this.device;
+      const connectAttempt = device.gatt?.connect();
+      if (!connectAttempt) throw new Error('Could not establish a GATT connection.');
+      let timedOut = false;
+      let timeout: number | undefined;
+      const timeoutAttempt = new Promise<GattServer>((_resolve, reject) => {
+        timeout = window.setTimeout(() => {
+          timedOut = true;
+          reject(new Error('Timed out while connecting to the watch.'));
+        }, GATT_CONNECTION_TIMEOUT_MS);
+      });
+      void connectAttempt.then(
+        () => { if (timedOut) device.gatt?.disconnect(); },
+        error => { if (timedOut) this.onDiagnostic?.(`Late GATT connection failed: ${error instanceof Error ? error.message : String(error)}`); },
+      );
+      let server: GattServer;
+      try {
+        server = await Promise.race([connectAttempt, timeoutAttempt]);
+      } finally {
+        if (timeout !== undefined) window.clearTimeout(timeout);
       }
-      this.parseFrames(data);
-    });
-    await tx.startNotifications();
-    this.onDiagnostic?.('Notifications enabled on UART TX');
-    return this.device.name ?? 'Bangle.js';
+      const service = await server.getPrimaryService(UART_SERVICE);
+      const tx = await service.getCharacteristic(UART_TX);
+      this.characteristic = await service.getCharacteristic(UART_RX);
+      this.onDiagnostic?.(`GATT ready: service ${UART_SERVICE}; write ${UART_RX} ${JSON.stringify(this.characteristic.properties)}; notify ${UART_TX} ${JSON.stringify(tx.properties)}`);
+      this.notificationCharacteristic = tx;
+      this.notificationListener = event => {
+        const value = (event.target as unknown as GattCharacteristic).value;
+        if (!value) return;
+        const data = new Uint8Array(value.buffer, value.byteOffset, value.byteLength);
+        this.onDiagnostic?.(`TX notification (${data.length} bytes): ${Array.from(data, byte => byte.toString(16).padStart(2, '0')).join(' ')}`);
+        if (this.rawTestResolver) {
+          this.rawTestBuffer = (this.rawTestBuffer + new TextDecoder().decode(data)).slice(-256);
+          if (this.rawTestBuffer.includes('ACK:TEST')) {
+            this.onDiagnostic?.('Raw diagnostic ACK received: ACK:TEST');
+            this.rawTestResolver(true);
+          }
+        }
+        this.parseFrames(data);
+      };
+      tx.addEventListener('characteristicvaluechanged', this.notificationListener);
+      await tx.startNotifications();
+      this.ready = true;
+      const name = this.device.name ?? 'Bangle.js';
+      this.setStatus(`Connected: ${name}`);
+      this.onDiagnostic?.('Notifications enabled on UART TX');
+      return name;
+    } catch (error) {
+      this.clearConnection();
+      const message = error instanceof Error ? error.message : String(error);
+      this.setStatus(`Connection failed: ${message}`);
+      throw error;
+    }
+  }
+
+  private clearConnection() {
+    if (this.device && this.disconnectListener) this.device.removeEventListener('gattserverdisconnected', this.disconnectListener);
+    if (this.notificationCharacteristic && this.notificationListener) this.notificationCharacteristic.removeEventListener('characteristicvaluechanged', this.notificationListener);
+    this.ready = false;
+    this.device = undefined;
+    this.characteristic = undefined;
+    this.disconnectListener = undefined;
+    this.notificationCharacteristic = undefined;
+    this.notificationListener = undefined;
   }
 
   private parseFrames(data: Uint8Array) {
@@ -270,5 +352,10 @@ export class BangleConnection {
     else await this.characteristic.writeValue(data);
   }
 
-  disconnect() { this.device?.gatt?.disconnect(); this.device = undefined; this.characteristic = undefined; }
+  disconnect() {
+    const device = this.device;
+    this.clearConnection();
+    device?.gatt?.disconnect();
+    this.setStatus('Not connected');
+  }
 }

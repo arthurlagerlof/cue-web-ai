@@ -69,6 +69,36 @@ function fakeEmbed(text) {
   return { vector: vector.map(value => value / norm), dimensions: 384 };
 }
 
+function localTestDatabase(registryData) {
+  const embeddings = new Map();
+  return {
+    async getRegistryData() { return registryData; },
+    async getCachedEmbedding(text, model) { return embeddings.get(`${model}\0${text}`); },
+    async cacheEmbedding(text, model, dimensions, vector) {
+      embeddings.set(`${model}\0${text}`, { model, dimensions, vector });
+    },
+    async getRecords(providerId, recordType) { return registryData.data?.[providerId]?.[recordType] ?? []; },
+    async getRecord(providerId, recordType, recordId) {
+      return (await this.getRecords(providerId, recordType)).find(record => record.id === recordId);
+    },
+    async putRecord(providerId, recordType, record) {
+      const records = registryData.data[providerId][recordType];
+      const index = records.findIndex(item => item.id === record.id);
+      if (index < 0) records.push(record);
+      else records[index] = record;
+    },
+    async deleteRecord(providerId, recordType, recordId) {
+      registryData.data[providerId][recordType] = (registryData.data[providerId][recordType] ?? []).filter(record => record.id !== recordId);
+    },
+    async getAssets() { return registryData.data?.web?.assets ?? []; },
+    async nextId(providerId, recordType, prefix) {
+      const records = await this.getRecords(providerId, recordType);
+      return `${prefix}-${records.length + 1}`;
+    },
+    async executeRegisteredTool(_tool, _provider, _args, _context, execute) { return execute(); },
+  };
+}
+
 async function environment(options = {}) {
   const [, , , mock] = await modules;
   return mock.createMockEnvironment({
@@ -158,35 +188,55 @@ test('provider-data indexes are provider-owned, namespaced, and do not mix sessi
   assert.deepEqual(providerData.searchProviderData([1, 0], index, { providerIds: ['anki'] }), {});
 });
 
-test('database environment persists pending provider-data embeddings and searches the stored namespace', async () => {
+test('database environment caches browser embeddings and searches local provider data', async () => {
   const tool = manifests.find(item => item.id === 'anki.create_card');
-  const calls = [];
+  const registryData = {
+    providers: [{ id: 'anki', status: 'available', manifest: { permissions: [], contextSearch: { recordTypes: ['cards'], fields: ['front', 'back', 'tags'] } } }],
+    tools: [tool],
+    data: { anki: { cards: [{ id: 'card-1', front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.', tags: ['biology'] }] } },
+    toolRetrievalConfig: { minimumScore: 0.2, plausibleScore: 0.1 },
+  };
+  const database = localTestDatabase(registryData);
   const { createDatabaseEnvironment } = await import('../src/demo/databaseEnvironment.js');
   const runtime = await createDatabaseEnvironment({
-    registryData: {
-      providers: [{ id: 'anki', status: 'available', manifest: { contextSearch: { recordTypes: ['cards'], fields: ['front', 'back', 'tags'] } } }],
-      tools: [tool],
-      data: { anki: { cards: [{ id: 'card-1', front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.', tags: ['biology'] }] } },
-      pendingProviderDataIds: ['anki:cards:card-1'],
-      pendingToolEmbeddingIds: [],
-      toolRetrievalConfig: { minimumScore: 0.2, plausibleScore: 0.1 },
-    },
-    embed: async text => fakeEmbed(text),
-    postApi: async (route, payload) => {
-      calls.push({ route, payload });
-      if (route === '/api/demo/tools/search') return { results: [{ toolId: tool.id, score: 0.9, bestDescriptionSimilarity: 0.9, bestKeywordSimilarity: 0.9, bestExampleSimilarity: 0.9, margin: 0.2 }] };
-      if (route === '/api/demo/provider-data/search') return { results: { anki: { namespace: 'provider-data', indexedAt: '2026-11-18T12:00:00.000Z', hits: [{ recordId: 'card-1', recordType: 'cards', record: { id: 'card-1' }, similarity: 0.9 }] } } };
-      return { indexed_records: payload.entries.length };
-    },
+    database,
+    registryData,
+    embed: async () => ({ vector: Array(384).fill(1), dimensions: 384 }),
   });
   const outcome = await runtime.intelligence.handle('Create a flashcard about photosynthesis');
   assert.equal(outcome.kind, 'clarification');
   assert.equal(outcome.retrieval.providerEvidence.hits[0].record.id, 'card-1');
-  const indexCall = calls.find(call => call.route === '/api/demo/index-provider-data');
-  assert.equal(indexCall.payload.entries[0].providerId, 'anki');
-  assert.equal(indexCall.payload.entries[0].vector.length, 384);
-  assert.match(indexCall.payload.entries[0].contentHash, /^[a-f0-9]{64}$/);
-  assert.ok(calls.some(call => call.route === '/api/demo/provider-data/search'));
+  assert.equal(runtime.providerDataIndex[0].providerId, 'anki');
+  assert.equal(runtime.providerDataIndex[0].vector.length, 384);
+  assert.match(runtime.providerDataIndex[0].contentHash, /^[a-f0-9]{64}$/);
+  assert.ok((await database.getCachedEmbedding('What is photosynthesis?\nPlants convert light into chemical energy.\nbiology', 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')).vector.length === 384);
+});
+
+test('hosted planning can defer retrieval indexing until a local mode needs it', async () => {
+  const tool = manifests.find(item => item.id === 'anki.create_card');
+  const registryData = {
+    providers: [{ id: 'anki', status: 'available', manifest: { permissions: [], contextSearch: { recordTypes: ['cards'], fields: ['front'] } } }],
+    tools: [tool],
+    data: { anki: { cards: [{ id: 'card-1', front: 'Photosynthesis' }] } },
+  };
+  let embeddings = 0;
+  const { createDatabaseEnvironment } = await import('../src/demo/databaseEnvironment.js');
+  const runtime = await createDatabaseEnvironment({
+    database: localTestDatabase(registryData),
+    registryData,
+    initializeRetrieval: false,
+    embed: async () => { embeddings++; return { vector: Array(384).fill(1), dimensions: 384 }; },
+  });
+  assert.ok(runtime.registry.get(tool.id));
+  assert.equal(embeddings, 0);
+  assert.equal(runtime.exampleIndex.length, 0);
+  await Promise.all([runtime.ensureRetrieval(), runtime.ensureRetrieval()]);
+  assert.ok(embeddings > 0);
+  assert.ok(runtime.exampleIndex.length > 0);
+  assert.equal(runtime.providerDataIndex.length, 1);
+  const count = embeddings;
+  await runtime.ensureRetrieval();
+  assert.equal(embeddings, count);
 });
 
 test('synthetic benchmark covers registered tools, languages, ambiguity, and no-tool outcomes', async () => {
@@ -304,32 +354,27 @@ test('configured cross-encoder thresholds select the decisive calendar result wi
   const ids = ['calendar.find_events', 'calendar.create_event', 'calendar.update_event', 'calendar.get_event'];
   const scores = [0.581, 0.016, 0.010, 0.004];
   const decisions = [];
-  const calls = [];
   const config = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'data', 'seed', 'tool-retrieval-config.json'), 'utf8'));
+  const registryData = {
+    providers: [{ id: 'calendar', status: 'available', manifest: { permissions: [], contextSearch: { recordTypes: ['events'], fields: ['title', 'start'] } } }],
+    tools: ids.map(id => manifests.find(tool => tool.id === id)),
+    data: { calendar: { events: [] } },
+    toolRetrievalConfig: config,
+  };
+  const database = localTestDatabase(registryData);
   const runtime = await createDatabaseEnvironment({
-    registryData: {
-      providers: [{ id: 'calendar', status: 'available' }],
-      tools: ids.map(id => manifests.find(tool => tool.id === id)),
-      data: {}, pendingToolEmbeddingIds: [], pendingProviderDataIds: [],
-      toolRetrievalConfig: config,
-    },
-    embed: async text => fakeEmbed(text),
+    database,
+    registryData,
+    embed: async () => ({ vector: Array(384).fill(1), dimensions: 384 }),
     rerankTools: async () => ids.map((toolId, index) => ({ toolId, score: scores[index] })).reverse(),
     onRerankDecision: decision => decisions.push(decision),
-    postApi: async (route, payload) => {
-      calls.push({ route, payload });
-      if (route === '/api/demo/tools/search') return { results: ids.map((toolId, index) => ({ toolId, score: 0.57 - index * 0.01 })) };
-      if (route === '/api/demo/provider-data/search') return { results: {} };
-      if (route === '/api/demo/execute') return { result: { document: sampleDocument('calendar', 'Events', 'Found events'), data: { events: [] } } };
-      throw new Error(`Unexpected API request: ${route}`);
-    },
   });
   const outcome = await runtime.intelligence.handle('What events do I have tomorrow?', {
     context: { now: new Date('2026-11-15T12:00:00Z'), timeZone: 'UTC', locale: 'en' },
   });
   assert.equal(outcome.kind, 'document');
   assert.equal(outcome.state.status, 'completed');
-  assert.equal(calls.find(call => call.route === '/api/demo/execute').payload.toolId, 'calendar.find_events');
+  assert.equal(outcome.retrieval.toolId, 'calendar.find_events');
   assert.equal(decisions.length, 1);
   assert.equal(decisions[0].topScore, 0.581);
   assert.equal(decisions[0].secondScore, 0.016);
@@ -409,6 +454,7 @@ async function crossEncoderWorker({ gpu = true, loadError, inferenceError } = {}
       if (name === '@huggingface/transformers') return { pipeline, env: {} };
       if (name === './asrModels') return { ASR_MODELS: {} };
       if (name.endsWith('crossEncoderScore.js')) return { crossEncoderScoreFromLogit };
+      if (name.endsWith('embeddingModel.js')) return { EMBEDDING_TOKENIZER: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2' };
       throw new Error(`Unexpected import: ${name}`);
     },
   };
@@ -416,6 +462,36 @@ async function crossEncoderWorker({ gpu = true, loadError, inferenceError } = {}
   const send = async (id = 1) => self.onmessage({ data: { id, stage: 'rerank', text: 'query', candidates: [{ toolId: 'a', text: 'candidate' }, { toolId: 'b', text: 'candidate' }] } });
   return { send, messages, loads, runs, disposals };
 }
+
+test('embedding worker loads the quantized model', async () => {
+  const vm = require('node:vm');
+  const ts = require('typescript');
+  const { crossEncoderScoreFromLogit } = await import('../src/intelligence/retrieval/crossEncoderScore.js');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', 'model.worker.ts'), 'utf8');
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const messages = [];
+  let dtype;
+  const self = {};
+  const pipeline = async (_task, _modelId, options) => {
+    dtype = options.dtype;
+    return async () => ({ data: Float32Array.of(0.25), dims: [1, 1] });
+  };
+  const context = {
+    exports: {}, self, Error,
+    postMessage: message => messages.push(message),
+    require: name => {
+      if (name === '@huggingface/transformers') return { pipeline, env: {} };
+      if (name === './asrModels') return { ASR_MODELS: {} };
+      if (name.endsWith('crossEncoderScore.js')) return { crossEncoderScoreFromLogit };
+      if (name.endsWith('embeddingModel.js')) return { EMBEDDING_TOKENIZER: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2' };
+      throw new Error(`Unexpected import: ${name}`);
+    },
+  };
+  vm.runInNewContext(compiled, context);
+  await self.onmessage({ data: { id: 1, stage: 'embed', text: 'query' } });
+  assert.equal(dtype, 'q8');
+  assert.deepEqual(Array.from(messages.find(message => message.status === 'complete').result.vector), [0.25]);
+});
 
 test('cross-encoder lazily loads q8 on WebGPU and reports progress and success', async () => {
   const worker = await crossEncoderWorker();

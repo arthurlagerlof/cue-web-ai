@@ -1,11 +1,30 @@
 import { useEffect, useRef, useState } from 'react';
 import { RollingAudio } from './services/audio';
-import { BangleConnection } from './services/bluetooth';
+import { watch } from './services/watch';
 import { ASR_MODELS, type ASRModelSize } from './services/asrModels';
 import { createDisplayDocument, validateDisplayDocument } from './display/document.js';
 import { DisplayDocumentView } from './display/DisplayDocumentView';
 import { createDatabaseEnvironment } from './demo/databaseEnvironment.js';
+import { openBrowserDatabase } from './storage/userDatabase';
+import { normalizeWithOpenRouter, planWithOpenRouter } from './intelligence/openRouter.js';
+import { navigateTo } from './navigation';
 import watchAppSource from '../watch/bangle-app.js?raw';
+import type { StorageValue } from './storage/storage';
+import {
+  beginRequestMeasurement,
+  completeRequestMeasurement,
+  flushTelemetryQueue,
+  markMultiStep,
+  recordClarification,
+  recordExternalCall,
+  recordLocalInference,
+  recordLocalProcessing,
+  recordToolExecution,
+  restoreRequestMeasurement,
+  serializeRequestMeasurement,
+  type CompletionStatus,
+  type RequestMeasurement,
+} from './statistics';
 
 type Stage = 'transcribe' | 'embed' | 'rerank';
 type WorkerReply = { id: number; stage: Stage; status: string; model?: string; result?: any; error?: string; message?: string; statusOnly?: boolean };
@@ -38,7 +57,6 @@ const DEMO_SCENARIOS = [
   'Etsi huomisen kalenteritapahtumat',
 ];
 const audio = new RollingAudio(10);
-const watch = new BangleConnection();
 
 function downloadWatchFile(filename: string, source: string) {
   const url = URL.createObjectURL(new Blob([source], { type: 'text/javascript;charset=utf-8' }));
@@ -47,29 +65,12 @@ function downloadWatchFile(filename: string, source: string) {
   window.setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
-type Session = { csrfToken: string };
-let sessionPromise: Promise<Session> | undefined;
-
-function getSession(forceRenew = false): Promise<Session> {
-  if (forceRenew || !sessionPromise) {
-    sessionPromise = fetch('/api/session', { credentials: 'same-origin', cache: 'no-store' })
-      .then(async response => {
-        if (!response.ok) throw new Error(`Session initialization failed (${response.status})`);
-        const result = await response.json();
-        if (typeof result.csrfToken !== 'string' || !result.csrfToken) throw new Error('Session initialization returned no token');
-        return { csrfToken: result.csrfToken };
-      })
-      .catch(error => { sessionPromise = undefined; throw error; });
-  }
-  return sessionPromise;
+async function getConversationState(): Promise<any> {
+  return (await openBrowserDatabase()).getConversationState();
 }
 
-async function getConversationState() {
-  const response = await fetch('/api/demo/conversation', { credentials: 'same-origin', cache: 'no-store' });
-  const result = await response.json();
-  if (response.status === 404) throw new Error('The backend does not support conversation state. Restart the Cue backend to load the current code.');
-  if (!response.ok) throw new Error(result.error ?? `Conversation state request failed (${response.status})`);
-  return result.state;
+async function saveConversationState(state: any) {
+  return (await openBrowserDatabase()).saveConversationState(state);
 }
 
 function interactionIdForState(state: any) {
@@ -113,23 +114,8 @@ function createClarificationDocument(state: any, message: string) {
   });
 }
 
-async function postApi(path: string, data: unknown) {
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const session = await getSession(attempt === 1);
-    const response = await fetch(path, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': session.csrfToken }, body: JSON.stringify(data) });
-    const result = await response.json();
-    if (response.ok) return result;
-    if (response.status === 403 && /session\/csrf/i.test(String(result.error)) && attempt === 0) {
-      sessionPromise = undefined;
-      continue;
-    }
-    throw new Error(result.error ?? `Backend request failed (${response.status})`);
-  }
-  throw new Error('Session validation failed after renewal');
-}
-
 export default function App() {
-  const [watchName, setWatchName] = useState('Not connected');
+  const [watchName, setWatchName] = useState(watch.status);
   const [installing, setInstalling] = useState(false);
   const [testSending, setTestSending] = useState(false);
   const [installStatus, setInstallStatus] = useState('');
@@ -171,19 +157,81 @@ export default function App() {
   const displayDocumentRef = useRef<any>();
   const pendingConfirmationRef = useRef<any>();
   const watchConfirmationRef = useRef(false);
-  const pending = useRef(new Map<number, { stage: Stage; resolve: (reply: WorkerReply) => void }>());
+  const pending = useRef(new Map<number, { stage: Stage; resolve: (reply: WorkerReply) => void; inferenceStartedAt?: number; inferenceModel?: string }>());
   const resolvingInteractions = useRef(new Set<string>());
+  const activeRequest = useRef<RequestMeasurement>();
 
   const log = (message: string) => setLogs(old => [`${new Date().toLocaleTimeString()} ${message}`, ...old].slice(0, 30));
+  const recordUsage = async (counter: string) => {
+    try { await (await openBrowserDatabase()).recordUsage(counter); }
+    catch (error) { log(`Could not save local usage statistics: ${error instanceof Error ? error.message : String(error)}`); }
+  };
+  const onExternalCall = (call: { provider: string; model: string; latencyMs: number; inputTokens?: number; outputTokens?: number; success: boolean; made: boolean }) => {
+    recordExternalCall(activeRequest.current, call);
+    if (call.made) {
+      void recordUsage('externalCalls');
+      if (activeRequest.current?.dots3Baseline) void recordUsage('dots3Calls');
+    }
+  };
+  const addClarification = async () => {
+    recordClarification(activeRequest.current);
+    await recordUsage('clarifications');
+  };
+  async function persistRequestMeasurement(measurement: RequestMeasurement, status: CompletionStatus) {
+    const statistic = completeRequestMeasurement(measurement, status);
+    if (activeRequest.current === measurement) activeRequest.current = undefined;
+    try {
+      const database = await openBrowserDatabase();
+      await database.recordRequestStatistic(statistic);
+      await database.setPreference('activeRequestMeasurement', null);
+      if (await database.getPreference<boolean>('sharePublicTelemetry') === true) {
+        await database.queueRequestStatistic(statistic);
+        void flushTelemetryQueue(database).then(result => {
+          if (result.failed) log('Telemetry upload is queued and will retry when available.');
+        }).catch(error => log(`Telemetry retry could not be scheduled: ${error instanceof Error ? error.message : String(error)}`));
+      }
+    } catch (error) {
+      log(`Could not save local request statistics: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  async function retainRequestMeasurement(measurement: RequestMeasurement) {
+    try {
+      await (await openBrowserDatabase()).setPreference('activeRequestMeasurement', serializeRequestMeasurement(measurement));
+    } catch (error) {
+      log(`Could not save a pending request measurement: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   const updatePendingConfirmation = (pending: any) => {
     pendingConfirmationRef.current = pending;
     setPendingConfirmation(pending);
   };
   useEffect(() => {
     const unsubscribe = audio.subscribe(() => { setRecording(audio.active); setBuffer(audio.bufferedSeconds); });
-    void getSession()
-      .then(() => getConversationState())
-      .then(state => {
+    let telemetryDatabase: Awaited<ReturnType<typeof openBrowserDatabase>> | undefined;
+    const retryTelemetry = () => {
+      if (telemetryDatabase) void flushTelemetryQueue(telemetryDatabase)
+        .catch(error => log(`Telemetry retry failed: ${error instanceof Error ? error.message : String(error)}`));
+    };
+    window.addEventListener('online', retryTelemetry);
+    void openBrowserDatabase()
+      .then(async database => {
+        telemetryDatabase = database;
+        retryTelemetry();
+        const [state, storedMeasurement] = await Promise.all([
+          database.getConversationState(),
+          database.getPreference<StorageValue>('activeRequestMeasurement'),
+        ]);
+        if (typeof state?.status === 'string'
+          && ['awaiting_confirmation', 'awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(state.status)
+          && storedMeasurement) {
+          try { activeRequest.current = restoreRequestMeasurement(storedMeasurement); }
+          catch (error) { log(`Could not restore the pending request measurement: ${error instanceof Error ? error.message : String(error)}`); }
+        } else if (storedMeasurement) {
+          await database.setPreference('activeRequestMeasurement', null);
+        }
+        return state;
+      })
+      .then((state: any) => {
         if (state?.status === 'awaiting_confirmation' && state.pendingConfirmation?.call) updatePendingConfirmation({ call: state.pendingConfirmation.call, fromWorkflow: true });
         if (state?.status === 'awaiting_confirmation' && state.executionState?.pendingConfirmation) {
           updatePendingConfirmation({ plan: state.executionState.plan, executionState: state.executionState, externalPlan: true });
@@ -207,7 +255,7 @@ export default function App() {
           void showDocument(document).catch(error => log(`Could not restore pending request display: ${error instanceof Error ? error.message : String(error)}`));
         }
       })
-      .catch(error => log(`Backend session unavailable: ${error instanceof Error ? error.message : 'initialization failed'}`));
+      .catch(error => log(`Local browser database unavailable: ${error instanceof Error ? error.message : 'initialization failed'}`));
     watch.onTrigger = () => {
       log('Watch hold-to-trigger received');
       try {
@@ -243,9 +291,12 @@ export default function App() {
       if (action) void dispatchDocumentAction(action);
       else log(`Ignored unknown watch action: ${actionId}`);
     };
-    watch.onStatus = message => { setWatchName('Not connected'); log(message); };
+    const unsubscribeWatchStatus = watch.subscribeStatus(message => {
+      setWatchName(message.startsWith('Connected: ') ? message.slice('Connected: '.length) : message);
+      if (message === 'Watch disconnected') log(message);
+    });
     watch.onDiagnostic = message => log(`BLE: ${message}`);
-    return () => { unsubscribe(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); watch.disconnect(); audio.stop(); };
+    return () => { window.removeEventListener('online', retryTelemetry); unsubscribe(); unsubscribeWatchStatus(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); watch.onTrigger = undefined; watch.onAction = undefined; watch.onDiagnostic = undefined; audio.stop(); };
   }, []);
 
   function setAiPreference(mode: AiMode) {
@@ -273,26 +324,43 @@ export default function App() {
             if (!reply.statusOnly) log(reply.message);
             return;
           }
+          const task = pending.current.get(reply.id);
+          if (reply.status === 'running' && task) {
+            task.inferenceStartedAt = performance.now();
+            task.inferenceModel = reply.model;
+          }
           if (reply.status !== 'complete' && reply.status !== 'error') {
             setStatus(old => ({ ...old, [stage]: `${reply.status}${reply.model ? ` — ${reply.model}` : ''}` })); return;
           }
           setStatus(old => ({ ...old, [stage]: reply.status === 'error' ? `Error — ${reply.error}` : `Complete — ${reply.model ?? 'done'}` }));
-          const task = pending.current.get(reply.id);
-          if (task) { pending.current.delete(reply.id); task.resolve(reply); }
+          if (task) {
+            if (task.inferenceStartedAt !== undefined) recordLocalInference(activeRequest.current, reply.model ?? task.inferenceModel, performance.now() - task.inferenceStartedAt);
+            pending.current.delete(reply.id);
+            task.resolve(reply);
+          }
         };
         instance.onerror = event => {
           const message = event.message || 'Model worker failed.';
           setStatus(old => ({ ...old, [stage]: `Error — ${message}` }));
-          pending.current.forEach((task, pendingId) => { if (task.stage === stage) { task.resolve({ id: pendingId, stage, status: 'error', error: message }); pending.current.delete(pendingId); } });
+          pending.current.forEach((task, pendingId) => {
+            if (task.stage === stage) {
+              if (task.inferenceStartedAt !== undefined) recordLocalInference(activeRequest.current, task.inferenceModel, performance.now() - task.inferenceStartedAt);
+              task.resolve({ id: pendingId, stage, status: 'error', error: message });
+              pending.current.delete(pendingId);
+            }
+          });
           log(message);
         };
     }
     return new Promise(resolve => { pending.current.set(id, { stage, resolve }); instance!.postMessage({ id, stage, ...data }, data.audio ? [data.audio.buffer] : []); });
   }
 
-  async function getEnvironment() {
-    if (environment.current) return environment.current;
-    await getSession();
+  async function getEnvironment(forceRetrieval = false) {
+    if (environment.current) {
+      if (forceRetrieval || aiModeRef.current !== 'dots3_always') await environment.current.ensureRetrieval();
+      return environment.current;
+    }
+    const database = await openBrowserDatabase();
     const embed = async (text: string) => {
       const reply = await runModel('embed', { text });
       if (reply.status === 'error') throw new Error(reply.error);
@@ -304,20 +372,21 @@ export default function App() {
       if (reply.status === 'error') throw new Error(reply.error);
       return reply.result;
     };
-    const response = await fetch('/api/demo/registry', { credentials: 'same-origin', cache: 'no-store' });
-    const registryData = await response.json();
-    if (!response.ok) throw new Error(registryData.error ?? `Demo registry request failed (${response.status})`);
-    const initialState = await getConversationState();
+    const registryData = await database.getRegistryData();
+    const initialState: any = await database.getConversationState();
+    if (database.storageWarning) log(database.storageWarning);
     environment.current = await createDatabaseEnvironment({
+      database,
       registryData,
       embed,
-      postApi,
+      initializeRetrieval: forceRetrieval || aiModeRef.current !== 'dots3_always',
+      onToolExecution: (durationMs: number, success: boolean) => recordToolExecution(activeRequest.current, durationMs, success),
+      onUsage: recordUsage,
       argumentNormalizerEnabled: () => aiModeRef.current === 'automatic',
-      normalizeArguments: async (prompt: string) => {
-        const result = await postApi('/api/demo/normalize', { prompt });
-        if (typeof result.text !== 'string' || !result.text.trim()) throw new Error('OpenRouter returned an empty response.');
-        return result.text;
-      },
+      normalizeArguments: (prompt: string) => normalizeWithOpenRouter({
+        prompt,
+        onCall: onExternalCall,
+      }),
       rerankTools,
       onRerankDecision: (decision: RerankDecision) => log(`Cross-encoder decision: top ${decision.topScore}, second ${decision.secondScore ?? 'none'}, margin ${decision.margin ?? 'n/a'}; score >= ${decision.minimumScore}: ${decision.scorePassed ? 'pass' : 'fail'}; margin >= ${decision.minimumMargin}: ${decision.margin === null ? 'not applicable' : decision.marginPassed ? 'pass' : 'fail'}; ${decision.decision}`),
       initialState: Array.isArray(initialState?.segments) ? initialState : undefined,
@@ -327,7 +396,7 @@ export default function App() {
       updatePendingConfirmation({ plan: initialState.executionState.plan, executionState: initialState.executionState, externalPlan: true });
     }
     if (initialState && ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(initialState.status)) setPendingClarification(true);
-    log(`Loaded ${registryData.tools.length} provider-owned tools from the SQLite demo registry`);
+    log(`Loaded ${registryData.tools.length} trusted provider tools from browser storage (${database.storage.backend})`);
     return environment.current;
   }
 
@@ -335,7 +404,13 @@ export default function App() {
     const instance = workers.get(stage);
     if (!instance) return;
     instance.terminate(); workers.delete(stage);
-    pending.current.forEach((task, id) => { if (task.stage === stage) { task.resolve({ id, stage, status: 'error', error: 'Stopped by user.' }); pending.current.delete(id); } });
+    pending.current.forEach((task, id) => {
+      if (task.stage === stage) {
+        if (task.inferenceStartedAt !== undefined) recordLocalInference(activeRequest.current, task.inferenceModel, performance.now() - task.inferenceStartedAt);
+        task.resolve({ id, stage, status: 'error', error: 'Stopped by user.' });
+        pending.current.delete(id);
+      }
+    });
     setStatus(old => ({ ...old, [stage]: 'Stopped by user' }));
     log(`${stage} stopped`);
   }
@@ -363,17 +438,20 @@ export default function App() {
       log('Resuming the saved execution plan');
     } else {
       const previous = await getConversationState();
-      const searchText = previous?.pendingReasoning && previous.originalRequest
-        ? `${previous.originalRequest}\n${request}` : request;
-      const embedded = await runtime.intelligence.embed(searchText);
-      const vector = Array.isArray(embedded) ? embedded : embedded.vector;
-      log('External planning started with the currently registered tool catalog');
-      response = await postApi('/api/demo/reason', { request, context, vector });
+      log('OpenRouter planning started with the currently registered tool catalog; browser records remain local');
+      response = await planWithOpenRouter({
+        request,
+        context,
+        runtime,
+        priorState: previous,
+        onCall: onExternalCall,
+      });
     }
     if (response.kind === 'clarification') {
       log('External planner requested clarification');
+      await addClarification();
       updatePendingConfirmation(undefined);
-      await postApi('/api/demo/conversation', { state: response.state });
+      await saveConversationState(response.state);
       setPendingClarification(true);
       await showDocument(createDisplayDocument({
         id: 'cue-dots3-clarification',
@@ -400,6 +478,7 @@ export default function App() {
       return;
     }
     if (response.kind !== 'plan' || !response.plan) throw new TypeError('Dots 3 returned an unsupported reasoning outcome.');
+    markMultiStep(activeRequest.current, response.plan.operations.length);
     for (const operation of response.plan.operations) {
       log(`Validated plan proposal: ${operation.toolId}; dependencies=${operation.dependsOn.length}; bindings=${operation.inputBindings.length}; fan-out=${Boolean(operation.forEach)}`);
     }
@@ -420,34 +499,31 @@ export default function App() {
         : executionState.plan.status === 'completed' ? 'completed'
           : executionState.plan.status === 'failed' ? 'failed'
             : executionState.plan.status === 'waiting_for_input' ? 'awaiting_argument' : 'executing';
-      await postApi('/api/demo/conversation', {
-        state: {
-          conversationId: executionState.plan.conversationId,
-          status: state,
-          originalRequest: executionState.plan.originalRequest,
-          reasoningHistory: executionState.reasoningHistory,
-          pendingReasoning: state === 'awaiting_argument',
-          pendingQuestion: executionState.pendingConfirmation
-            ? `Confirm ${executionState.pendingConfirmation.toolId}?`
-            : executionState.pendingQuestion,
-          executionState,
-        },
+      await saveConversationState({
+        conversationId: executionState.plan.conversationId,
+        status: state,
+        originalRequest: executionState.plan.originalRequest,
+        reasoningHistory: executionState.reasoningHistory,
+        pendingReasoning: state === 'awaiting_argument',
+        pendingQuestion: executionState.pendingConfirmation
+          ? `Confirm ${executionState.pendingConfirmation.toolId}?`
+          : executionState.pendingQuestion,
+        executionState,
       });
     };
     const outcome = await runtime.dispatcher.dispatchPlan(response.plan, { executionState: resumedExecutionState, onStateChange: saveExecutionState });
     outcome.executionState.reasoningHistory = reasoningHistory;
     if (outcome.state === 'operation_limit') {
-      await postApi('/api/demo/conversation', {
-        state: {
-          conversationId: outcome.plan.conversationId,
-          status: 'awaiting_argument',
-          originalRequest: outcome.plan.originalRequest,
-          reasoningHistory: outcome.executionState.reasoningHistory,
-          pendingReasoning: true,
-          pendingQuestion: outcome.question,
-          executionState: outcome.executionState,
-        },
+      await saveConversationState({
+        conversationId: outcome.plan.conversationId,
+        status: 'awaiting_argument',
+        originalRequest: outcome.plan.originalRequest,
+        reasoningHistory: outcome.executionState.reasoningHistory,
+        pendingReasoning: true,
+        pendingQuestion: outcome.question,
+        executionState: outcome.executionState,
       });
+      await addClarification();
       setPendingClarification(true);
       updatePendingConfirmation(undefined);
       await showDocument(createDisplayDocument({
@@ -478,14 +554,12 @@ export default function App() {
     }
     updatePendingConfirmation(undefined);
     setPendingClarification(false);
-    await postApi('/api/demo/conversation', {
-      state: {
-        conversationId: outcome.plan.conversationId,
-        status: outcome.plan.status,
-        originalRequest: outcome.plan.originalRequest,
-        reasoningHistory: outcome.executionState.reasoningHistory,
-        executionState: outcome.executionState,
-      },
+    await saveConversationState({
+      conversationId: outcome.plan.conversationId,
+      status: outcome.plan.status,
+      originalRequest: outcome.plan.originalRequest,
+      reasoningHistory: outcome.executionState.reasoningHistory,
+      executionState: outcome.executionState,
     });
     if (outcome.document) await showDocument(outcome.document);
     else await showDocument(createDisplayDocument({
@@ -498,9 +572,11 @@ export default function App() {
     log('Dots 3 plan completed under Cue validation and execution control');
   }
 
-  async function processTranscript(text: string, continuePendingLocally = false) {
+  async function processTranscript(text: string, continuePendingLocally = false, existingMeasurement?: RequestMeasurement) {
     const clean = text.trim();
     if (!clean) throw new Error('Enter transcript text first.');
+    await recordUsage('requests');
+    if (aiModeRef.current === 'dots3_always') await recordUsage('dots3Requests');
     const pendingAction = pendingConfirmationRef.current;
     if (pendingAction?.externalPlan && /^(?:yes|yeah|yep|sure|ok|okay|confirm|confirmed|do it|go ahead)$/i.test(clean)) {
       setTranscriptInput('');
@@ -526,10 +602,13 @@ export default function App() {
       }));
       return;
     }
+    const measurement = existingMeasurement ?? activeRequest.current ?? beginRequestMeasurement(aiModeRef.current === 'dots3_always');
+    activeRequest.current = measurement;
+    let requestFailed = false;
     setTranscription(clean); setTranscriptInput(clean); setBusy(true);
     try {
       await showDocument(createDisplayDocument({ id: 'cue-loading', title: 'Working', source: { app: 'cue', name: 'Cue' }, state: 'loading', message: 'Discovering provider tools and preparing a local response.', elements: [{ type: 'text', text: clean, role: 'body' }] }));
-      const runtime = await getEnvironment();
+      const runtime = await getEnvironment(continuePendingLocally);
       const requestNow = clockForRuntime(runtime);
       const context = { now: requestNow, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn };
       const savedState = await getConversationState();
@@ -592,8 +671,14 @@ export default function App() {
         return;
       }
       log('Local-first request routing accepted');
+      await recordUsage('localCalls');
+      recordLocalProcessing(activeRequest.current);
       const outcome = await runtime.intelligence.handle(clean, { context: { ...context, now: requestNow } });
-      if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
+      markMultiStep(activeRequest.current, outcome.operations?.length ?? outcome.plan?.operations?.length ?? 0);
+      if (outcome.state) await saveConversationState(outcome.state);
+      if (outcome.kind === 'clarification' || ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(outcome.state?.status)) {
+        await addClarification();
+      }
       const rerankDiagnostics = outcome.diagnostics?.rerank ?? outcome.retrieval?.rerankDiagnostics;
       if (rerankDiagnostics?.candidates) {
         log(`Cross-encoder ranking: ${rerankDiagnostics.candidates.map((item: any) => `${item.toolId} ${item.score.toFixed(3)}`).join(', ')}`);
@@ -653,6 +738,7 @@ export default function App() {
         log(`Tool intelligence outcome: ${outcome.kind}`);
       }
     } catch (error) {
+      requestFailed = true;
       const message = error instanceof Error ? error.message : String(error);
       log(`Processing error: ${message}`);
       try {
@@ -669,7 +755,17 @@ export default function App() {
       }
       throw error;
     }
-    finally { setBusy(false); }
+    finally {
+      setBusy(false);
+      const state = displayDocumentRef.current?.state;
+      const completionStatus: CompletionStatus = requestFailed || state === 'error'
+        ? 'failed'
+        : state === 'clarification_required' ? 'clarification'
+          : state === 'confirmation_required' ? 'awaiting_confirmation'
+            : 'completed';
+      if (!requestFailed && ['awaiting_confirmation', 'clarification'].includes(completionStatus)) await retainRequestMeasurement(measurement);
+      else await persistRequestMeasurement(measurement, completionStatus);
+    }
   }
 
   async function confirmPendingAction(pendingActionOverride?: any, confirmedOnWatch = false) {
@@ -701,10 +797,11 @@ export default function App() {
       let document;
       if (pendingAction.fromWorkflow) {
         const outcome = await runtime.intelligence.handle('yes', { confirmed: true, context: { timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn } });
-        if (outcome.state) await postApi('/api/demo/conversation', { state: outcome.state });
+        if (outcome.state) await saveConversationState(outcome.state);
         if (outcome.kind === 'confirmation_required') {
           updatePendingConfirmation({ call: outcome.pendingCall, fromWorkflow: true });
           watchConfirmationRef.current = true;
+          if (activeRequest.current) await retainRequestMeasurement(activeRequest.current);
           if (watch.connected) {
             await watch.sendDisplayDocument(createDisplayDocument({
               id: 'cue-confirm-next-action',
@@ -725,22 +822,21 @@ export default function App() {
           confirmed: true,
           confirmedOperationId: executionState.pendingConfirmation?.operationId,
           executionState,
-          onStateChange: async (state: PlanExecutionState) => postApi('/api/demo/conversation', {
-            state: {
-              conversationId: state.plan.conversationId,
-              status: state.plan.status === 'waiting_for_confirmation' ? 'awaiting_confirmation'
-                : state.plan.status === 'completed' ? 'completed'
-                  : state.plan.status === 'failed' ? 'failed' : 'executing',
-              originalRequest: state.plan.originalRequest,
-              reasoningHistory: state.reasoningHistory,
-              pendingQuestion: state.pendingConfirmation ? `Confirm ${state.pendingConfirmation.toolId}?` : undefined,
-              executionState: state,
-            },
+          onStateChange: async (state: PlanExecutionState) => saveConversationState({
+            conversationId: state.plan.conversationId,
+            status: state.plan.status === 'waiting_for_confirmation' ? 'awaiting_confirmation'
+              : state.plan.status === 'completed' ? 'completed'
+                : state.plan.status === 'failed' ? 'failed' : 'executing',
+            originalRequest: state.plan.originalRequest,
+            reasoningHistory: state.reasoningHistory,
+            pendingQuestion: state.pendingConfirmation ? `Confirm ${state.pendingConfirmation.toolId}?` : undefined,
+            executionState: state,
           }),
         });
         if (outcome.state === 'confirmation_required') {
           updatePendingConfirmation({ plan: outcome.plan, executionState: outcome.executionState, externalPlan: true });
           watchConfirmationRef.current = true;
+          if (activeRequest.current) await retainRequestMeasurement(activeRequest.current);
           await showDocument(createDisplayDocument({
             id: 'cue-confirm-next-plan-operation',
             title: 'Confirmation required',
@@ -766,7 +862,9 @@ export default function App() {
       }
       updatePendingConfirmation(undefined);
       setPendingClarification(false);
+      if (!pendingAction.fromWorkflow && pendingAction.call) await saveConversationState(null);
       await showDocument(document);
+      if (activeRequest.current) await persistRequestMeasurement(activeRequest.current, 'completed');
       log(`Confirmed mock action completed: ${labels}`);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -780,6 +878,7 @@ export default function App() {
           message,
         })).catch(displayError => log(`Could not display action failure on watch: ${displayError instanceof Error ? displayError.message : String(displayError)}`));
       }
+      if (activeRequest.current) await persistRequestMeasurement(activeRequest.current, 'failed');
     }
     finally { setBusy(false); }
   }
@@ -798,23 +897,22 @@ export default function App() {
         if (operation) operation.status = 'skipped';
       }
       cancelled.pendingConfirmation = undefined;
-      await postApi('/api/demo/conversation', {
-        state: {
-          conversationId: cancelled.plan.conversationId,
-          status: 'cancelled',
-          originalRequest: cancelled.plan.originalRequest,
-          executionState: cancelled,
-        },
+      await saveConversationState({
+        conversationId: cancelled.plan.conversationId,
+        status: 'cancelled',
+        originalRequest: cancelled.plan.originalRequest,
+        executionState: cancelled,
       });
     } else if (savedState?.pendingReasoning) {
-      await postApi('/api/demo/conversation', { state: { ...savedState, status: 'cancelled', pendingReasoning: false } });
+      await saveConversationState({ ...savedState, status: 'cancelled', pendingReasoning: false });
     } else {
       environment.current?.intelligence.cancelPendingOperation();
-      if (environment.current) await postApi('/api/demo/conversation', { state: environment.current.intelligence.getState() });
+      if (environment.current) await saveConversationState(environment.current.intelligence.getState());
     }
     updatePendingConfirmation(undefined);
     watchConfirmationRef.current = false;
     setPendingClarification(false);
+    if (activeRequest.current) await persistRequestMeasurement(activeRequest.current, 'cancelled');
     log('Pending operation cancelled');
   }
 
@@ -822,8 +920,8 @@ export default function App() {
     if (!window.confirm('Reset this demo session to the committed synthetic baseline?')) return;
     setBusy(true);
     try {
-      await postApi('/api/demo/reset', {});
-      await postApi('/api/demo/conversation', { state: null });
+      if (activeRequest.current) await persistRequestMeasurement(activeRequest.current, 'cancelled');
+      await (await openBrowserDatabase()).resetDemoData();
       environment.current = undefined;
       displayDocumentRef.current = undefined;
       setDisplayDocument(undefined);
@@ -833,6 +931,21 @@ export default function App() {
       log('Demo session reset to the committed synthetic baseline');
     } catch (error) { log(`Demo reset failed: ${error instanceof Error ? error.message : String(error)}`); }
     finally { setBusy(false); }
+  }
+
+  async function exportLocalBackup() {
+    try {
+      const backup = await (await openBrowserDatabase()).exportBackup();
+      const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = `cue-browser-backup-${new Date().toISOString().slice(0, 10)}.json`;
+      link.click();
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+      log('Local browser backup exported');
+    } catch (error) {
+      log(`Local backup export failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   async function dispatchDocumentAction(action: any) {
@@ -869,7 +982,17 @@ export default function App() {
       }
       const result = await environment.current.dispatcher.dispatch({ toolId: action.toolId, arguments: action.arguments });
       if (result.state === 'confirmation_required') {
-        const pending = { call: { toolId: result.toolId, arguments: result.arguments }, fromWorkflow: false };
+        const call = {
+          toolId: result.toolId,
+          arguments: result.arguments,
+          operationId: `direct_${crypto.randomUUID()}`,
+        };
+        const pending = { call, fromWorkflow: false };
+        await saveConversationState({
+          conversationId: `interaction_${crypto.randomUUID()}`,
+          status: 'awaiting_confirmation',
+          pendingConfirmation: { call },
+        });
         updatePendingConfirmation(pending);
         if (watch.connected) {
           watchConfirmationRef.current = true;
@@ -908,6 +1031,8 @@ export default function App() {
   async function runPipeline(snapshot = audio.snapshot()) {
     if (running.current) return;
     running.current = true;
+    const measurement = beginRequestMeasurement(aiModeRef.current === 'dots3_always');
+    activeRequest.current = measurement;
     setBusy(true);
     try {
       log(`Frozen ${snapshot.audio.length} samples at ${snapshot.sampleRate} Hz`);
@@ -916,7 +1041,15 @@ export default function App() {
       const text = String(asr.result ?? '').trim(); setTranscription(text);
       setStatus(old => ({ ...old, transcribe: `Complete — ${asr.model}` }));
       if (!text) throw new Error('No speech was detected.');
-      await processTranscript(text);
+      await processTranscript(text, false, measurement);
+      if (!measurement.completed) {
+        const state = displayDocumentRef.current?.state;
+        const completionStatus: CompletionStatus = state === 'error' ? 'failed'
+          : state === 'clarification_required' ? 'clarification'
+            : state === 'confirmation_required' ? 'awaiting_confirmation' : 'completed';
+        if (completionStatus === 'awaiting_confirmation' || completionStatus === 'clarification') await retainRequestMeasurement(measurement);
+        else await persistRequestMeasurement(measurement, completionStatus);
+      }
       await watch.send('STATUS:DONE'); log('Transcript processing complete');
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -930,12 +1063,13 @@ export default function App() {
           message,
         })).catch(displayError => log(`Could not display recording failure on watch: ${displayError instanceof Error ? displayError.message : String(displayError)}`));
       }
+      if (!measurement.completed) await persistRequestMeasurement(measurement, 'failed');
     } finally { running.current = false; setBusy(false); }
   }
 
   async function connectWatch() {
-    try { setWatchName('Connecting…'); const name = await watch.connect(); setWatchName(name); log(`Connected: ${name}`); }
-    catch (error) { setWatchName('Not connected'); log(error instanceof Error ? error.message : String(error)); }
+    try { const name = await watch.connect(); setWatchName(name); log(`Connected: ${name}`); }
+    catch (error) { log(error instanceof Error ? error.message : String(error)); }
   }
 
   async function sendWatchTest() {
@@ -1011,8 +1145,9 @@ export default function App() {
     catch (error) { log(error instanceof Error ? error.message : String(error)); }
   }
 
-  return <main>
+  return <main className="app-shell">
     <h1>Cue</h1>
+    <p><a href="/landing" onClick={event => { event.preventDefault(); navigateTo('/landing'); }}>Watch onboarding</a></p>
     <p>Enter a request for tool discovery, argument resolution, and provider execution. Cue validates and controls every operation.</p>
     <section><h2>Devices</h2><button onClick={() => watch.connected ? watch.disconnect() : void connectWatch()}>{watch.connected ? 'Disconnect watch' : 'Connect Bangle.js'}</button> <span>{watchName}</span> <button disabled={!watch.connected || testSending} onClick={() => void sendWatchTest()}>{testSending ? 'Sending raw test…' : 'Send raw TEST to watch'}</button><p><button disabled={installing} onClick={() => void installOnWatch()}>{installing ? 'Installing…' : 'Install on watch'}</button></p>{installStatus && <p role="status">{installStatus}</p>}<details><summary>Manual downloads</summary><p>These files can also be installed with the Espruino Web IDE.</p><button onClick={() => downloadWatchFile('cue.app.js', watchAppSource)}>Download watch display app</button> <a href="https://www.espruino.com/ide/" target="_blank" rel="noreferrer">Open Espruino Web IDE</a></details><br /><button onClick={() => void toggleMicrophone()}>{recording ? 'Stop microphone' : 'Start microphone'}</button><button disabled={!recording || buffer < 0.2} onClick={freezeBuffer}>Freeze rolling buffer</button> <strong style={{ color: recording ? '#16803c' : '#777' }}>{recording ? '● Recording' : 'Microphone off'}</strong><p>Rolling buffer: {buffer.toFixed(1)} / 10.0 seconds (sample rate {audio.sampleRate || '—'} Hz)</p></section>
     <section><h2>Processing</h2>
@@ -1024,8 +1159,8 @@ export default function App() {
         <option value="automatic">Automatic</option>
         <option value="dots3_always">Always Dots 3</option>
       </select></label>
-      <p>Web AI uses browser-side MiniLM and deterministic argument resolution; it never calls OpenRouter. Automatic keeps straightforward requests local and escalates multi-step, collection, implicit-context, or uncertain requests to Dots 3. Automatic may also use Dots 3 to normalize arguments that deterministic resolution cannot complete. Always Dots 3 sends requests to OpenRouter with the available registered tool catalog. All operations still use Cue’s registered provider tools; do not enter sensitive information in external modes.</p>
-      <label>Calendar week starts<select value={weekStartsOn} onChange={event => setCalendarWeekStart(Number(event.target.value))}><option value={1}>Monday</option><option value={0}>Sunday</option></select></label><label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label><button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button><button disabled={busy || !recording || buffer < 0.2} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); void startHoldCapture(); }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()}>{holding ? 'Release to transcribe…' : 'Hold to transcribe (max 5 min)'}</button>{(['transcribe', 'embed', 'rerank'] as Stage[]).map(stage => <p key={stage}>{stage === 'rerank' ? 'cross-encoder' : stage}: {status[stage]}{busy && <button onClick={() => stopStage(stage)}>Stop {stage === 'rerank' ? 'cross-encoder' : stage}</button>}</p>)}<p>Tools and provider availability are loaded dynamically from the session's SQLite registry. MiniLM retrieval and deterministic argument resolution run in your browser.</p><label>Demo scenario<select value={scenario} onChange={event => { setScenario(event.target.value); setTranscriptInput(event.target.value); }}><option value="">Choose an example request</option>{DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}</select></label><label>{pendingClarification ? 'Clarification' : 'Transcript text'}<textarea value={transcriptInput} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder={pendingClarification ? 'Enter the missing details or a correction' : 'Enter sample transcript text'} /></label>{pendingClarification && <p role="status">Reply here to continue the pending request. Your message will go directly to that request.</p>}<button disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>{busy ? 'Processing…' : pendingClarification ? 'Send clarification' : 'Process transcript'}</button> <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button><label>Transcription (audio capture only)<textarea readOnly value={transcription} /></label><p>Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>{displayDocument && <><DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />{pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}{pendingClarification && <button disabled={busy} onClick={() => void cancelPendingOperation().catch(error => log(`Could not cancel pending operation: ${error instanceof Error ? error.message : String(error)}`))}>Cancel pending operation</button>}</>}</section>
+      <p>Web AI stays in this browser. Automatic keeps straightforward requests local and escalates complex or uncertain requests through the server-configured OpenRouter key. Always Dots 3 sends the request and registered tool catalog through that backend. The API key stays on the server; provider records remain local. Avoid sensitive request text in external modes.</p>
+      <label>Calendar week starts<select value={weekStartsOn} onChange={event => setCalendarWeekStart(Number(event.target.value))}><option value={1}>Monday</option><option value={0}>Sunday</option></select></label><label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label><button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button><button disabled={busy || !recording || buffer < 0.2} onPointerDown={event => { event.currentTarget.setPointerCapture(event.pointerId); void startHoldCapture(); }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()}>{holding ? 'Release to transcribe…' : 'Hold to transcribe (max 5 min)'}</button>{(['transcribe', 'embed', 'rerank'] as Stage[]).map(stage => <p key={stage}>{stage === 'rerank' ? 'cross-encoder' : stage}: {status[stage]}{busy && <button onClick={() => stopStage(stage)}>Stop {stage === 'rerank' ? 'cross-encoder' : stage}</button>}</p>)}<p>Tools and provider availability are stored locally. MiniLM retrieval, deterministic argument resolution, and trusted provider adapters run in your browser.</p><label>Demo scenario<select value={scenario} onChange={event => { setScenario(event.target.value); setTranscriptInput(event.target.value); }}><option value="">Choose an example request</option>{DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}</select></label><label>{pendingClarification ? 'Clarification' : 'Transcript text'}<textarea value={transcriptInput} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder={pendingClarification ? 'Enter the missing details or a correction' : 'Enter sample transcript text'} /></label>{pendingClarification && <p role="status">Reply here to continue the pending request. Your message will go directly to that request.</p>}<button disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>{busy ? 'Processing…' : pendingClarification ? 'Send clarification' : 'Process transcript'}</button> <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button> <button disabled={busy} onClick={() => void exportLocalBackup()}>Export local backup</button><label>Transcription (audio capture only)<textarea readOnly value={transcription} /></label><p>Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>{displayDocument && <><DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />{pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}{pendingClarification && <button disabled={busy} onClick={() => void cancelPendingOperation().catch(error => log(`Could not cancel pending operation: ${error instanceof Error ? error.message : String(error)}`))}>Cancel pending operation</button>}</>}</section>
     <section><h2>Status log</h2><pre>{logs.join('\n')}</pre></section>
   </main>;
 }

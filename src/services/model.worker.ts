@@ -1,12 +1,13 @@
 import { pipeline, env } from '@huggingface/transformers';
 import { ASR_MODELS, type ASRModelSize } from './asrModels';
 import { crossEncoderScoreFromLogit } from '../intelligence/retrieval/crossEncoderScore.js';
+import { EMBEDDING_TOKENIZER } from '../intelligence/embeddingModel.js';
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
 type RequestMessage = { id: number; stage: 'transcribe' | 'embed' | 'rerank'; text?: string; candidates?: Array<{ toolId: string; text: string }>; asrModel?: ASRModelSize; audio?: Float32Array; sampleRate?: number };
 const models = {
-  embed: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2',
+  embed: EMBEDDING_TOKENIZER,
   rerank: 'SugoLabs/mmarco-mMiniLMv2-L12-H384-v1',
 };
 const pipelines: Partial<Record<RequestMessage['stage'], { modelId: string; instance: any; device?: 'webgpu' | 'wasm' }>> = {};
@@ -84,6 +85,7 @@ async function rerank(id: number, modelId: string, text: string, candidates: Arr
   };
   let scores;
   try {
+    postMessage({ id, stage: 'rerank', status: 'running', model: modelId });
     scores = await run(entry);
   } catch (error) {
     const detail = errorDetail(error);
@@ -110,8 +112,9 @@ async function rerank(id: number, modelId: string, text: string, candidates: Arr
 
 self.onmessage = async (event: MessageEvent<RequestMessage>) => {
   const { id, stage } = event.data;
+  let modelId: string | undefined;
   try {
-    const modelId = stage === 'transcribe' ? ASR_MODELS[event.data.asrModel ?? 'tiny'].modelId : models[stage];
+    modelId = stage === 'transcribe' ? ASR_MODELS[event.data.asrModel ?? 'tiny'].modelId : models[stage];
     if (stage === 'rerank') {
       if (!event.data.text?.trim() || !Array.isArray(event.data.candidates) || !event.data.candidates.length) {
         throw new Error('A reranking request requires a query and candidates.');
@@ -127,7 +130,7 @@ self.onmessage = async (event: MessageEvent<RequestMessage>) => {
     if (!pipelines[stage] || pipelines[stage].modelId !== modelId) {
       const task = stage === 'transcribe' ? 'automatic-speech-recognition' : 'feature-extraction';
       const device = 'webgpu';
-      const dtype = stage === 'embed' ? 'fp32' : 'q4';
+      const dtype = stage === 'embed' ? 'q8' : 'q4';
       const instance = await pipeline(task as never, modelId, { device, dtype } as never);
       pipelines[stage] = { modelId, instance };
     }
@@ -165,6 +168,6 @@ self.onmessage = async (event: MessageEvent<RequestMessage>) => {
       ? `Model runtime error ${detail}; check model download completion, available memory, and WebGPU/ONNX support.`
       : detail;
     if (stage === 'rerank') postMessage({ id, stage, status: 'notice', message: `Cross-encoder failed: ${message}` });
-    postMessage({ id, stage, status: 'error', error: message });
+    postMessage({ id, stage, status: 'error', model: modelId, error: message });
   }
 };
