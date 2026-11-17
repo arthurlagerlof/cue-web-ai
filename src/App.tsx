@@ -17,6 +17,7 @@ import {
   markMultiStep,
   recordClarification,
   recordExternalCall,
+  recordIndexInitialization,
   recordLocalInference,
   recordLocalProcessing,
   recordToolExecution,
@@ -157,7 +158,7 @@ export default function App() {
   const displayDocumentRef = useRef<any>();
   const pendingConfirmationRef = useRef<any>();
   const watchConfirmationRef = useRef(false);
-  const pending = useRef(new Map<number, { stage: Stage; resolve: (reply: WorkerReply) => void; inferenceStartedAt?: number; inferenceModel?: string }>());
+  const pending = useRef(new Map<number, { stage: Stage; resolve: (reply: WorkerReply) => void; measurement?: RequestMeasurement; inferenceStartedAt?: number; inferenceModel?: string }>());
   const resolvingInteractions = useRef(new Set<string>());
   const activeRequest = useRef<RequestMeasurement>();
 
@@ -316,7 +317,7 @@ export default function App() {
     catch (error) { log(`Could not save calendar week-start preference: ${error instanceof Error ? error.message : String(error)}`); }
   }
 
-  function runModel(stage: Stage, data: { text?: string; candidates?: Array<{ toolId: string; text: string }>; asrModel?: ASRModelSize; audio?: Float32Array; sampleRate?: number }): Promise<WorkerReply> {
+  function runModel(stage: Stage, data: { text?: string; candidates?: Array<{ toolId: string; text: string }>; asrModel?: ASRModelSize; audio?: Float32Array; sampleRate?: number }, measureRequest = true): Promise<WorkerReply> {
     const id = ++sequence.current;
     let instance = workers.get(stage);
     if (!instance) {
@@ -340,7 +341,7 @@ export default function App() {
           setStatus(old => ({ ...old, [stage]: reply.status === 'error' ? `Error — ${reply.error}` : `Complete — ${reply.model ?? 'done'}` }));
           if (task) {
             const durationMs = task.inferenceStartedAt === undefined ? undefined : performance.now() - task.inferenceStartedAt;
-            if (durationMs !== undefined) recordLocalInference(activeRequest.current, reply.model ?? task.inferenceModel, durationMs);
+            if (durationMs !== undefined) recordLocalInference(task.measurement, reply.model ?? task.inferenceModel, durationMs);
             const model = reply.model ?? task.inferenceModel ?? 'unknown model';
             const duration = durationMs === undefined ? '' : ` in ${(durationMs / 1000).toFixed(1)}s`;
             log(reply.status === 'error'
@@ -355,7 +356,7 @@ export default function App() {
           setStatus(old => ({ ...old, [stage]: `Error — ${message}` }));
           pending.current.forEach((task, pendingId) => {
             if (task.stage === stage) {
-              if (task.inferenceStartedAt !== undefined) recordLocalInference(activeRequest.current, task.inferenceModel, performance.now() - task.inferenceStartedAt);
+              if (task.inferenceStartedAt !== undefined) recordLocalInference(task.measurement, task.inferenceModel, performance.now() - task.inferenceStartedAt);
               task.resolve({ id: pendingId, stage, status: 'error', error: message });
               pending.current.delete(pendingId);
             }
@@ -363,7 +364,7 @@ export default function App() {
           log(message);
         };
     }
-    return new Promise(resolve => { pending.current.set(id, { stage, resolve }); instance!.postMessage({ id, stage, ...data }, data.audio ? [data.audio.buffer] : []); });
+    return new Promise(resolve => { pending.current.set(id, { stage, resolve, measurement: measureRequest ? activeRequest.current : undefined }); instance!.postMessage({ id, stage, ...data }, data.audio ? [data.audio.buffer] : []); });
   }
 
   async function getEnvironment(forceRetrieval = false) {
@@ -371,9 +372,20 @@ export default function App() {
       if (forceRetrieval || aiModeRef.current !== 'dots3_always') await environment.current.ensureRetrieval();
       return environment.current;
     }
-    const database = await openBrowserDatabase();
-    const embed = async (text: string) => {
-      const reply = await runModel('embed', { text });
+    const loadingMeasurement = activeRequest.current;
+    const loadingStartedAt = performance.now();
+    const { database, registryData, initialState } = await (async () => {
+      try {
+        const database = await openBrowserDatabase();
+        const registryData = await database.getRegistryData();
+        const initialState: any = await database.getConversationState();
+        return { database, registryData, initialState };
+      } finally {
+        recordIndexInitialization(loadingMeasurement, performance.now() - loadingStartedAt);
+      }
+    })();
+    const embed = async (text: string, options?: { purpose?: string }) => {
+      const reply = await runModel('embed', { text }, options?.purpose !== 'index');
       if (reply.status === 'error') throw new Error(reply.error);
       setEmbedding({ ...reply.result, model: reply.model });
       return reply.result;
@@ -383,8 +395,6 @@ export default function App() {
       if (reply.status === 'error') throw new Error(reply.error);
       return reply.result;
     };
-    const registryData = await database.getRegistryData();
-    const initialState: any = await database.getConversationState();
     if (database.storageWarning) log(database.storageWarning);
     environment.current = await createDatabaseEnvironment({
       database,
@@ -392,6 +402,11 @@ export default function App() {
       embed,
       initializeRetrieval: forceRetrieval || aiModeRef.current !== 'dots3_always',
       onToolExecution: (durationMs: number, success: boolean) => recordToolExecution(activeRequest.current, durationMs, success),
+      onIndexStart: () => {
+        const measurement = activeRequest.current;
+        const startedAt = performance.now();
+        return () => recordIndexInitialization(measurement, performance.now() - startedAt);
+      },
       onUsage: recordUsage,
       argumentNormalizerEnabled: () => aiModeRef.current === 'automatic',
       normalizeArguments: (prompt: string) => normalizeWithOpenRouter({
@@ -417,7 +432,7 @@ export default function App() {
     instance.terminate(); workers.delete(stage);
     pending.current.forEach((task, id) => {
       if (task.stage === stage) {
-        if (task.inferenceStartedAt !== undefined) recordLocalInference(activeRequest.current, task.inferenceModel, performance.now() - task.inferenceStartedAt);
+        if (task.inferenceStartedAt !== undefined) recordLocalInference(task.measurement, task.inferenceModel, performance.now() - task.inferenceStartedAt);
         task.resolve({ id, stage, status: 'error', error: 'Stopped by user.' });
         pending.current.delete(id);
       }

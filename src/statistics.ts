@@ -46,6 +46,7 @@ export type RequestMeasurement = {
   localProcessing: boolean;
   externalModels: ExternalModelCall[];
   localInferenceMs: number;
+  indexInitializationMs: number;
   externalAiMs: number;
   toolExecutionMs: number;
   toolCalls: number;
@@ -129,6 +130,7 @@ export function beginRequestMeasurement(selectedMode: SelectedMode, startedAtMs 
     localProcessing: false,
     externalModels: [],
     localInferenceMs: 0,
+    indexInitializationMs: 0,
     externalAiMs: 0,
     toolExecutionMs: 0,
     toolCalls: 0,
@@ -153,6 +155,7 @@ export function serializeRequestMeasurement(measurement: RequestMeasurement) {
     localProcessing: measurement.localProcessing,
     externalModels: measurement.externalModels.map(call => ({ ...call })),
     localInferenceMs: measurement.localInferenceMs,
+    indexInitializationMs: measurement.indexInitializationMs,
     externalAiMs: measurement.externalAiMs,
     toolExecutionMs: measurement.toolExecutionMs,
     toolCalls: measurement.toolCalls,
@@ -180,6 +183,10 @@ export function restoreRequestMeasurement(value: unknown): RequestMeasurement {
   for (const field of nonNegativeFields) {
     if (!Number.isSafeInteger(source[field]) || (source[field] as number) < 0) throw new TypeError(`Stored request ${field} is invalid.`);
   }
+  if (source.indexInitializationMs !== undefined
+    && (!Number.isSafeInteger(source.indexInitializationMs) || (source.indexInitializationMs as number) < 0)) {
+    throw new TypeError('Stored request indexInitializationMs is invalid.');
+  }
   if ((source.toolFailures as number) > (source.toolCalls as number)) throw new TypeError('Stored tool-failure count is invalid.');
   const localModels = source.localModels as string[];
   const externalModels = source.externalModels as ExternalModelCall[];
@@ -200,6 +207,7 @@ export function restoreRequestMeasurement(value: unknown): RequestMeasurement {
     localProcessing: source.localProcessing,
     externalModels: externalModels.map(call => ({ ...call })),
     localInferenceMs: source.localInferenceMs as number,
+    indexInitializationMs: (source.indexInitializationMs as number | undefined) ?? 0,
     externalAiMs: source.externalAiMs as number,
     toolExecutionMs: source.toolExecutionMs as number,
     toolCalls: source.toolCalls as number,
@@ -218,6 +226,10 @@ export function recordLocalInference(measurement: RequestMeasurement | undefined
   if (!measurement) return;
   if (model) measurement.localModels.add(model);
   measurement.localInferenceMs += measuredDuration(durationMs);
+}
+
+export function recordIndexInitialization(measurement: RequestMeasurement | undefined, durationMs: number) {
+  if (measurement) measurement.indexInitializationMs += measuredDuration(durationMs);
 }
 
 export function recordExternalCall(
@@ -284,7 +296,7 @@ export function completeRequestMeasurement(
     localInferenceMs: measurement.localInferenceMs,
     externalAiMs: measurement.externalAiMs,
     toolExecutionMs: measurement.toolExecutionMs,
-    responseMs: finishedAtMs - measurement.startedAtMs,
+    responseMs: Math.max(0, finishedAtMs - measurement.startedAtMs - measurement.indexInitializationMs),
     toolCalls: measurement.toolCalls,
     toolFailures: measurement.toolFailures,
     clarifications: measurement.clarifications,

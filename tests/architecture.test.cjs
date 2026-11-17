@@ -71,11 +71,12 @@ function fakeEmbed(text) {
 
 function localTestDatabase(registryData) {
   const embeddings = new Map();
+  const { EMBEDDING_CACHE_VERSION } = require('../src/intelligence/embeddingModel.js');
   return {
     async getRegistryData() { return registryData; },
     async getCachedEmbedding(text, model) { return embeddings.get(`${model}\0${text}`); },
     async cacheEmbedding(text, model, dimensions, vector) {
-      embeddings.set(`${model}\0${text}`, { model, dimensions, vector });
+      embeddings.set(`${model}\0${text}`, { model, version: EMBEDDING_CACHE_VERSION, dimensions, vector });
     },
     async getRecords(providerId, recordType) { return registryData.data?.[providerId]?.[recordType] ?? []; },
     async getRecord(providerId, recordType, recordId) {
@@ -222,7 +223,7 @@ test('database environment caches browser embeddings and searches local provider
   const runtime = await createDatabaseEnvironment({
     database,
     registryData,
-    embed: async () => ({ vector: Array(384).fill(1), dimensions: 384 }),
+    embed: async () => ({ vector: Array(384).fill(1 / Math.sqrt(384)), dimensions: 384 }),
   });
   const outcome = await runtime.intelligence.handle('Create a flashcard about photosynthesis');
   assert.equal(outcome.kind, 'clarification');
@@ -246,7 +247,7 @@ test('hosted planning can defer retrieval indexing until a local mode needs it',
     database: localTestDatabase(registryData),
     registryData,
     initializeRetrieval: false,
-    embed: async () => { embeddings++; return { vector: Array(384).fill(1), dimensions: 384 }; },
+    embed: async () => { embeddings++; return { vector: Array(384).fill(1 / Math.sqrt(384)), dimensions: 384 }; },
   });
   assert.ok(runtime.registry.get(tool.id));
   assert.equal(embeddings, 0);
@@ -386,7 +387,7 @@ test('configured cross-encoder thresholds select the decisive calendar result wi
   const runtime = await createDatabaseEnvironment({
     database,
     registryData,
-    embed: async () => ({ vector: Array(384).fill(1), dimensions: 384 }),
+    embed: async () => ({ vector: Array(384).fill(1 / Math.sqrt(384)), dimensions: 384 }),
     rerankTools: async () => ids.map((toolId, index) => ({ toolId, score: scores[index] })).reverse(),
     onRerankDecision: decision => decisions.push(decision),
   });
@@ -492,9 +493,11 @@ test('embedding worker loads the quantized model', async () => {
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const messages = [];
   let dtype;
+  let revision;
   const self = {};
   const pipeline = async (_task, _modelId, options) => {
     dtype = options.dtype;
+    revision = options.revision;
     return async () => ({ data: Float32Array.of(0.25), dims: [1, 1] });
   };
   const context = {
@@ -504,13 +507,14 @@ test('embedding worker loads the quantized model', async () => {
       if (name === '@huggingface/transformers') return { pipeline, env: {} };
       if (name === './asrModels') return { ASR_MODELS: {} };
       if (name.endsWith('crossEncoderScore.js')) return { crossEncoderScoreFromLogit };
-      if (name.endsWith('embeddingModel.js')) return { EMBEDDING_TOKENIZER: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2' };
+      if (name.endsWith('embeddingModel.js')) return { EMBEDDING_TOKENIZER: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2', EMBEDDING_REVISION: 'pinned-revision' };
       throw new Error(`Unexpected import: ${name}`);
     },
   };
   vm.runInNewContext(compiled, context);
   await self.onmessage({ data: { id: 1, stage: 'embed', text: 'query' } });
   assert.equal(dtype, 'q8');
+  assert.equal(revision, 'pinned-revision');
   assert.deepEqual(Array.from(messages.find(message => message.status === 'complete').result.vector), [0.25]);
 });
 
@@ -679,6 +683,8 @@ test('argument normalization is conditional, schema-checked, retried once, and n
     },
   });
   assert.equal(prompts.length, 2);
+  assert.match(prompts[0], /Minimize internal reasoning/);
+  assert.match(prompts[0], /Return the required JSON directly/);
   assert.match(prompts[0], /selected tool/);
   assert.match(prompts[0], /anki\.create_card/);
   assert.match(prompts[0], /question_text/);
@@ -1122,6 +1128,12 @@ test('execution plans validate bindings, deterministic transforms, conditions, a
   const invalid = structuredClone(valid);
   invalid.operations[1].inputBindings[0].sourceOperation = 'missing';
   assert.match(planModule.validateExecutionPlan(invalid, runtime.registry).errors.join(' '), /unknown operation/);
+  const missingCollectionPointer = structuredClone(valid);
+  missingCollectionPointer.operations[1].forEach = { sourceOperation: 'search', bindings: [] };
+  assert.match(planModule.validateExecutionPlan(missingCollectionPointer, runtime.registry).errors.join(' '), /requires a source operation, array JSON Pointer/);
+  const missingItemPointer = structuredClone(valid);
+  missingItemPointer.operations[1].forEach = { sourceOperation: 'search', sourcePointer: '/events', bindings: [{ targetArgument: 'time' }] };
+  assert.match(planModule.validateExecutionPlan(missingItemPointer, runtime.registry).errors.join(' '), /requires targetArgument and an item JSON Pointer/);
   assert.equal(planModule.applyBindingTransform('2026-11-14T10:00:00+02:00', { type: 'subtract_duration', duration: 'PT15M' }), '2026-11-14T07:45:00.000Z');
   assert.equal(planModule.applyBindingTransform('2026-11-14T10:00:00+02:00', { type: 'add_duration', duration: 'PT15M' }), '2026-11-14T08:15:00.000Z');
   assert.equal(planModule.applyBindingTransform([{ id: 'first' }], { type: 'select_first' }).id, 'first');

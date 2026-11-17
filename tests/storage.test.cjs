@@ -3,6 +3,7 @@ const assert = require('node:assert/strict');
 
 const { UserDatabase } = require('../src/storage/userDatabase.ts');
 const { createMemoryStorage } = require('../src/storage/storage.ts');
+const { createHash } = require('node:crypto');
 
 test('browser database seeds locally, preserves mutations across reopen, and resets to synthetic fixtures', async () => {
   const storage = createMemoryStorage();
@@ -23,6 +24,79 @@ test('browser database seeds locally, preserves mutations across reopen, and res
   assert.equal(await reopened.getRecord('anki', 'cards', 'user-card'), undefined);
   assert.equal((await reopened.getRecords('anki', 'cards')).length, 20);
   assert.equal((await reopened.getCachedEmbedding(embeddingSeed.entries[0].text, EMBEDDING_MODEL)).vector.length, 384);
+});
+
+test('seeded indexes load without inference and regenerate only missing, changed or stale content', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.parse('2026-11-16T12:00:00Z') });
+  const { createDatabaseEnvironment } = await import('../src/demo/databaseEnvironment.js');
+  const { EMBEDDING_MODEL, EMBEDDING_CACHE_VERSION } = await import('../src/intelligence/embeddingModel.js');
+  const storage = createMemoryStorage();
+  const database = await new UserDatabase(storage, false).initialize();
+  const calls = [];
+  const embed = async (text, options) => {
+    calls.push({ text, purpose: options.purpose });
+    return { vector: Array(384).fill(1 / Math.sqrt(384)), dimensions: 384 };
+  };
+  const initial = await createDatabaseEnvironment({ database, embed });
+  assert.equal(calls.length, 0);
+  assert.ok(initial.exampleIndex.some(entry => entry.sourceType === 'keyword'));
+  assert.ok(initial.providerDataIndex.length > 0);
+
+  const registry = await database.getRegistryData();
+  const oldText = registry.tools[0].description;
+  const key = `${EMBEDDING_MODEL}:${EMBEDDING_CACHE_VERSION}:${createHash('sha256').update(oldText).digest('hex')}`;
+  await storage.put('embeddings', key, { model: EMBEDDING_MODEL, version: 'outdated', dimensions: 384, vector: Array(384).fill(1) });
+  const missingText = registry.tools[2].keywords[0];
+  const missingKey = `${EMBEDDING_MODEL}:${EMBEDDING_CACHE_VERSION}:${createHash('sha256').update(missingText).digest('hex')}`;
+  await storage.delete('embeddings', missingKey);
+  const invalidText = registry.tools[3].description;
+  const invalidKey = `${EMBEDDING_MODEL}:${EMBEDDING_CACHE_VERSION}:${createHash('sha256').update(invalidText).digest('hex')}`;
+  await storage.put('embeddings', invalidKey, { model: EMBEDDING_MODEL, version: EMBEDDING_CACHE_VERSION, dimensions: 384, vector: Array(384).fill(0) });
+  registry.tools[1].description = 'A changed tool description';
+  await database.putRecord('anki', 'cards', { id: 'new-card', front: 'A new card', back: 'A new answer' });
+  await createDatabaseEnvironment({ database, registryData: registry, embed });
+  assert.deepEqual(new Set(calls.map(call => call.text)), new Set([oldText, missingText, invalidText, 'A changed tool description', 'A new card\nA new answer']));
+  assert.ok(calls.every(call => call.purpose === 'index'));
+  calls.length = 0;
+  await createDatabaseEnvironment({ database, registryData: registry, embed });
+  assert.equal(calls.length, 0);
+});
+
+test('packaged demo dates and embeddings stay fixed across days while user changes are indexed', async t => {
+  const { seedDate } = require('../data/seed/tool-embeddings.json');
+  assert.match(seedDate, /^\d{4}-\d{2}-\d{2}$/);
+  const builtAt = Date.parse(`${seedDate}T12:00:00Z`);
+  t.mock.timers.enable({ apis: ['Date'], now: builtAt });
+  const { createDatabaseEnvironment } = await import('../src/demo/databaseEnvironment.js');
+  const database = await new UserDatabase(createMemoryStorage(), false).initialize();
+  const calls = [];
+  const embed = async (text, options) => {
+    calls.push({ text, purpose: options.purpose });
+    return { vector: Array(384).fill(1 / Math.sqrt(384)), dimensions: 384 };
+  };
+  const built = await createDatabaseEnvironment({ database, embed });
+  assert.equal(calls.length, 0);
+  const builtStart = built.data.calendar.events.find(record => record.id === 'event-1').start;
+  assert.equal(builtStart, `${new Date(builtAt - 2 * 86_400_000).toISOString().slice(0, 10)}T09:30:00+02:00`);
+  assert.ok(built.providerDataIndex.find(item => item.recordId === 'event-1' && item.providerId === 'calendar').text.includes(builtStart));
+  const later = new Date(builtAt + 40 * 86_400_000);
+  t.mock.timers.setTime(later.getTime());
+  const laterRuntime = await createDatabaseEnvironment({ database, embed });
+  assert.equal(calls.length, 0);
+  assert.equal(laterRuntime.data.calendar.events.find(record => record.id === 'event-1').start, builtStart);
+  assert.ok(laterRuntime.demoClock.startsWith(later.toISOString().slice(0, 10)));
+  const fresh = await new UserDatabase(createMemoryStorage(), false).initialize();
+  await createDatabaseEnvironment({ database: fresh, embed });
+  assert.equal(calls.length, 0);
+
+  const event = await database.getRecord('calendar', 'events', 'event-1');
+  await database.putRecord('calendar', 'events', { ...event, start: '2027-01-01T09:30:00+02:00' });
+  await createDatabaseEnvironment({ database, embed });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].purpose, 'index');
+  assert.ok(calls[0].text.includes('2027-01-01T09:30:00+02:00'));
+  await createDatabaseEnvironment({ database, embed });
+  assert.equal(calls.length, 1);
 });
 
 test('browser conversations and operation idempotency survive database reconstruction', async () => {

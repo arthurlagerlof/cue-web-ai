@@ -5,52 +5,30 @@ import retrievalConfig from '../../data/seed/tool-retrieval-config.json' with { 
 import embeddingSeed from '../../data/seed/tool-embeddings.json' with { type: 'json' };
 import { validateArguments } from '../intelligence/toolRegistry.js';
 import { validateFormats } from '../intelligence/argumentNormalization.js';
+import { seedOffsetDays, shiftSeedDates, utcDateString } from '../demo/seedDates.js';
 import {
   EMBEDDING_DIMENSIONS,
+  EMBEDDING_CACHE_VERSION,
   EMBEDDING_MODEL,
   EMBEDDING_PREPROCESSING,
+  EMBEDDING_REVISION,
   EMBEDDING_TOKENIZER,
 } from '../intelligence/embeddingModel.js';
 import { openUserStorage, type StorageAdapter, type StorageValue } from './storage.ts';
 import type { RequestStatistic } from '../statistics';
 
 const APP_SCHEMA_VERSION = 2;
-const SEED_BASE_DATE = '2026-11-16';
 const DEMO_CLOCK_TIME = '08:00:00+02:00';
-const DAY_MS = 86_400_000;
-const ISO_DATE_PREFIX = /^(\d{4}-\d{2}-\d{2})(?=$|T)/;
-
-function utcDateString(date = new Date()) {
-  return date.toISOString().slice(0, 10);
-}
 
 function currentDemoClock() {
   return `${utcDateString()}T${DEMO_CLOCK_TIME}`;
 }
 
-// Moves seeded dates so the seed's base date maps to the current UTC date.
-function shiftSeedDates<T>(value: T, offsetDays: number): T {
-  if (offsetDays === 0) return value;
-  if (typeof value === 'string') {
-    return value.replace(ISO_DATE_PREFIX, date => utcDateString(new Date(Date.parse(date) + offsetDays * DAY_MS))) as T;
-  }
-  if (Array.isArray(value)) return value.map(item => shiftSeedDates(item, offsetDays)) as T;
-  if (value && typeof value === 'object') {
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, shiftSeedDates(item, offsetDays)])) as T;
-  }
-  return value;
-}
-
-function seedOffsetDays() {
-  return Math.round((Date.parse(utcDateString()) - Date.parse(SEED_BASE_DATE)) / DAY_MS);
-}
-
 function presentRecord(stored: StoredRecord) {
-  return stored.origin === 'demo-seed' ? shiftSeedDates(stored.value, seedOffsetDays()) : stored.value;
+  return stored.origin === 'demo-seed' ? shiftSeedDates(stored.value, packagedSeedOffsetDays) : stored.value;
 }
 const JSON_SCHEMA_REF = { $ref: 'https://cue.local/schemas/cue-display-v1.schema.json' };
 const RECORD_STORE = 'records';
-const SEEDED_EMBEDDINGS_VERSION = 1;
 
 type ProviderSeed = {
   id: string;
@@ -88,11 +66,14 @@ type SeedEmbeddingFixture = {
   model: string;
   modelVersion: string;
   tokenizer: string;
+  revision: string;
   preprocessing: string;
+  dtype: string;
   dimensions: number;
   pooling: string;
   normalized: boolean;
   similarityMetric: string;
+  seedDate: string;
   entries: SeedEmbeddingEntry[];
   vectorsBase64: string;
 };
@@ -101,6 +82,13 @@ const seedProviders = providerSeed as ProviderSeed[];
 const seedTools = toolSeed as ToolSeed[];
 const seedData = providerDataSeed as Record<string, Record<string, Array<Record<string, unknown>>>>;
 const seededEmbeddings = embeddingSeed as SeedEmbeddingFixture;
+const seedDate = seededEmbeddings.seedDate;
+const parsedSeedDate = new Date(`${seedDate}T00:00:00.000Z`);
+if (!/^\d{4}-\d{2}-\d{2}$/.test(seedDate) || !Number.isFinite(parsedSeedDate.getTime())
+  || utcDateString(parsedSeedDate) !== seedDate) {
+  throw new Error('The packaged seed embedding date is invalid.');
+}
+const packagedSeedOffsetDays = seedOffsetDays(parsedSeedDate);
 
 function recordKey(providerId: string, recordType: string, recordId: string) {
   return JSON.stringify([providerId, recordType, recordId]);
@@ -174,13 +162,17 @@ export class UserDatabase {
   }
 
   private async initializeSeedEmbeddings() {
-    if (await this.storage.get<number>('meta', 'toolEmbeddingsVersion') === SEEDED_EMBEDDINGS_VERSION) return;
     if (seededEmbeddings.model !== EMBEDDING_MODEL || seededEmbeddings.modelVersion !== EMBEDDING_MODEL
       || seededEmbeddings.tokenizer !== EMBEDDING_TOKENIZER || seededEmbeddings.preprocessing !== EMBEDDING_PREPROCESSING
+      || seededEmbeddings.revision !== EMBEDDING_REVISION
+      || seededEmbeddings.dtype !== 'q8'
       || seededEmbeddings.dimensions !== EMBEDDING_DIMENSIONS || seededEmbeddings.pooling !== 'mean'
       || seededEmbeddings.normalized !== true || seededEmbeddings.similarityMetric !== 'cosine') {
-      throw new Error('The packaged tool embedding fixture does not match the configured MiniLM model.');
+      console.warn('Packaged seed embeddings are outdated; they will be regenerated locally as needed.');
+      return;
     }
+    const seedVersion = await sha256(JSON.stringify(seededEmbeddings));
+    if (await this.storage.get<string>('meta', 'toolEmbeddingsVersion') === seedVersion) return;
     const bytes = Uint8Array.from(atob(seededEmbeddings.vectorsBase64), character => character.charCodeAt(0));
     const vectorBytes = EMBEDDING_DIMENSIONS * Float32Array.BYTES_PER_ELEMENT;
     if (bytes.byteLength !== seededEmbeddings.entries.length * vectorBytes) {
@@ -197,14 +189,15 @@ export class UserDatabase {
       if (vector.some(value => !Number.isFinite(value)) || Math.abs(magnitude - 1) > 0.002) {
         throw new Error(`The packaged tool embedding vector is invalid: ${entry.id}`);
       }
-      const cacheKey = `${EMBEDDING_MODEL}:${await sha256(entry.text)}`;
+      const cacheKey = `${EMBEDDING_MODEL}:${EMBEDDING_CACHE_VERSION}:${await sha256(entry.text)}`;
       await this.storage.putIfAbsent('embeddings', cacheKey, {
         model: EMBEDDING_MODEL,
+        version: EMBEDDING_CACHE_VERSION,
         dimensions: EMBEDDING_DIMENSIONS,
         vector,
       });
     }
-    await this.storage.put('meta', 'toolEmbeddingsVersion', SEEDED_EMBEDDINGS_VERSION);
+    await this.storage.put('meta', 'toolEmbeddingsVersion', seedVersion);
   }
 
   private async initializeSeed() {
@@ -323,16 +316,16 @@ export class UserDatabase {
   }
 
   async getCachedEmbedding(text: string, model: string) {
-    const key = `${model}:${await sha256(text)}`;
-    return this.storage.get<{ model: string; dimensions: number; vector: number[] }>('embeddings', key);
+    const key = `${model}:${EMBEDDING_CACHE_VERSION}:${await sha256(text)}`;
+    return this.storage.get<{ model: string; version: string; dimensions: number; vector: number[] }>('embeddings', key);
   }
 
   async cacheEmbedding(text: string, model: string, dimensions: number, vector: number[]) {
     if (!Array.isArray(vector) || vector.length !== dimensions || vector.some(value => !Number.isFinite(value))) {
       throw new TypeError(`Cached embedding must contain ${dimensions} finite numbers.`);
     }
-    const key = `${model}:${await sha256(text)}`;
-    await this.storage.put('embeddings', key, { model, dimensions, vector });
+    const key = `${model}:${EMBEDDING_CACHE_VERSION}:${await sha256(text)}`;
+    await this.storage.put('embeddings', key, { model, version: EMBEDDING_CACHE_VERSION, dimensions, vector });
   }
 
   async recordUsage(counter: string, amount = 1) {

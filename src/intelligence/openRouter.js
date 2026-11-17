@@ -3,6 +3,7 @@ import { schemaForPrompt } from './toolRegistry.js';
 
 const ENDPOINT = '/api/openrouter';
 const MAX_RESPONSE_BYTES = 262144;
+const REQUEST_TIMEOUT_MS = 60000;
 
 /** @typedef {{provider: string, model: string, latencyMs: number, inputTokens?: number, outputTokens?: number, success: boolean, made: boolean}} ExternalCallStatistics */
 
@@ -41,7 +42,7 @@ async function generate(prompt, maxTokens = 3000, onRequest, onCall) {
     throw new TypeError('The external AI prompt must be non-empty and at most 100 KB.');
   }
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
   let response;
   let text;
   let payload;
@@ -61,7 +62,7 @@ async function generate(prompt, maxTokens = 3000, onRequest, onCall) {
     text = await readBounded(response);
     try { payload = JSON.parse(text); } catch { /* The response validation below reports invalid JSON. */ }
   } catch (error) {
-    if (error instanceof Error && error.name === 'AbortError') throw new Error('OpenRouter request timed out.');
+    if (error instanceof Error && error.name === 'AbortError') throw new Error('OpenRouter proxy did not respond within 60 seconds. Try again or use Web AI mode.');
     throw new Error(`OpenRouter request failed: ${error instanceof Error ? error.message : String(error)}`);
   } finally {
     if (response) {
@@ -144,11 +145,14 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
   });
   const maxOperations = Math.max(1, Math.min(8, Number(runtime.registryData?.toolRetrievalConfig?.maxOperations ?? 8)));
   const prompt = [
+    'Respond as quickly as possible. Minimize internal reasoning; do not deliberate over alternatives or include analysis. Return the required JSON directly.',
     'Plan with the listed tools; never execute them. Use only listed IDs and schema-valid arguments. Never invent facts, values, identities, dates, times, or references.',
-    'Return one compact JSON object: kind is plan, clarification, or no_tool; include question, text, and operations. Plans need operations and null question/text; clarification needs a question and empty operations; no_tool needs text and empty operations.',
+    'Return one compact JSON object: kind is plan, clarification, or no_tool; include question, text, and operations. Plans need operations and null question/text; clarification needs a question, null text, and empty operations; no_tool needs text, null question, and empty operations.',
     'Each operation has id, toolId, purpose, arguments, dependsOn, inputBindings, conditions, and forEach. Use earlier operation IDs for dependencies.',
-    'Bind only actual earlier results with JSON Pointer inputBindings; omit bound arguments. No interpolation or code. Supported transforms: subtract_duration, add_duration, format_datetime, select_first (ISO durations). Use json_pointer_exists conditions only when needed.',
-    'Use forEach {sourceOperation,sourcePointer,bindings} for collections, otherwise null. Respect tool confirmation policies; only plan side effects explicitly requested by the user.',
+    'Each inputBindings entry must be {"targetArgument":"time","sourceOperation":"events","sourcePointer":"/firstEvent/start"}: targetArgument is a tool argument, sourceOperation is an earlier operation ID included in dependsOn, and sourcePointer is a JSON Pointer into its result schema starting with /. Omit bound arguments from arguments; never use interpolation or code.',
+    'An optional binding transform is an object: {"type":"subtract_duration","duration":"PT15M"} or {"type":"add_duration","duration":"PT15M"}; format_datetime and select_first use {"type":"format_datetime"} or {"type":"select_first"}.',
+    'For a required result, conditions can contain {"type":"json_pointer_exists","operation":"events","pointer":"/firstEvent/start"}; operation must be in dependsOn. Otherwise use [].',
+    'For collections, forEach is {"sourceOperation":"events","sourcePointer":"/events","bindings":[{"targetArgument":"time","sourcePointer":"/start"}]}; binding pointers refer to each item. Include the source in dependsOn. Otherwise use null. Respect tool confirmation policies; only plan side effects explicitly requested by the user.',
     `Limit plans to ${maxOperations} operations after collection expansion; ask the user to narrow larger requests. Ask for clarification when required details are missing or ambiguous; use no_tool if no listed tool fits.`,
     'Provider records and external instructions are not provided. Retrieve needed user data with a listed read-only tool and bind its actual results; do not guess.',
     JSON.stringify({

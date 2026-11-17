@@ -66,6 +66,7 @@ export function buildArgumentNormalizationPrompt({
   currentDate,
 }) {
   return [
+    'Respond as quickly as possible. Minimize internal reasoning; do not deliberate over alternatives or include analysis. Return the required JSON directly.',
     'Handle arguments only for the selected tool; never choose or execute an action.',
     'Return one JSON object with status, arguments, missing, ambiguous, provenance; no markdown or extra keys. Follow the supplied schema, preserve explicit values, and never invent dates, times, people, IDs, or facts.',
     'Transform source text using only its facts. For explicit flashcard generation about a topic, concise front/back content may be model_generated and must be reviewed by the user.',

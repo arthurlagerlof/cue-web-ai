@@ -9,6 +9,7 @@ const {
   markMultiStep,
   recordClarification,
   recordExternalCall,
+  recordIndexInitialization,
   recordLocalInference,
   recordLocalProcessing,
   recordToolExecution,
@@ -21,6 +22,17 @@ const { createMemoryStorage } = require('../src/storage/storage.ts');
 function measuredRequest(id, startedAt, mode = 'web_ai') {
   return beginRequestMeasurement(mode, startedAt, id);
 }
+
+test('index initialization time is excluded from request latency and survives restoration', () => {
+  const measurement = measuredRequest('index-test', 1000);
+  recordIndexInitialization(measurement, 200);
+  recordLocalInference(measurement, 'query-model', 25);
+  const restored = restoreRequestMeasurement(serializeRequestMeasurement(measurement));
+  const result = completeRequestMeasurement(restored, 'completed', 1500);
+  assert.equal(result.responseMs, 300);
+  assert.equal(result.localInferenceMs, 25);
+  assert.deepEqual(result.localModels, ['query-model']);
+});
 
 test('request statistics preserve measured modes, latency, model calls, tool outcomes, and averages', () => {
   const local = measuredRequest('10000000-0000-4000-8000-000000000001', 1000);

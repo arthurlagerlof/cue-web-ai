@@ -4,6 +4,7 @@ const MAX_BODY_BYTES = 102400;
 const MAX_PROMPT_BYTES = 100000;
 const MAX_RESPONSE_BYTES = 262144;
 const MAX_TOKENS = 3000;
+const UPSTREAM_TIMEOUT_MS = 55000;
 const RATE_WINDOW_MS = 60000;
 const MAX_REQUESTS_PER_WINDOW = 30;
 const requestsByClient = new Map();
@@ -108,7 +109,7 @@ export async function handleOpenRouterRequest({
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  const timeout = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT_MS);
   const telemetryHeaders = {
     'X-Cue-External-Call': 'true',
     'X-Cue-Model': model.trim(),
@@ -120,6 +121,9 @@ export async function handleOpenRouterRequest({
       body: JSON.stringify({
         model: model.trim(),
         messages: [{ role: 'user', content: request.prompt }],
+        ...(['dots-studio/dots-3-note-preview', 'dots-studio/dots-3-note-preview:free'].includes(model.trim())
+          ? { reasoning: { enabled: false } }
+          : {}),
         max_tokens: request.maxTokens,
         temperature: 0.1,
         response_format: { type: 'json_object' },
@@ -156,7 +160,7 @@ export async function handleOpenRouterRequest({
     }, { ...telemetryHeaders, 'X-Cue-Model': actualModel });
   } catch (error) {
     const message = error instanceof Error && error.name === 'AbortError'
-      ? 'OpenRouter request timed out.'
+      ? 'OpenRouter did not respond within 55 seconds. Try again or use Web AI mode.'
       : 'OpenRouter request failed.';
     return jsonResponse(502, { error: message }, telemetryHeaders);
   } finally {

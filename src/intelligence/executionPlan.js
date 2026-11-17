@@ -175,7 +175,7 @@ export function validateExecutionPlan(plan, registry, {
       if (binding) {
         if (!byId.has(binding.sourceOperation)) add(`${path}.inputBindings`, `references unknown operation '${binding.sourceOperation}'`);
         else if (!operation.dependsOn.includes(binding.sourceOperation)) add(`${path}.inputBindings`, `source '${binding.sourceOperation}' must be a dependency`);
-        else {
+        else if (validPointer(binding.sourcePointer)) {
           const sourceTool = registry?.get(byId.get(binding.sourceOperation)?.toolId);
           if (sourceTool?.resultSchema && !sourceTool.resultSchema.$ref
             && !schemaAtPointer(sourceTool.resultSchema, binding.sourcePointer)) {
@@ -188,7 +188,7 @@ export function validateExecutionPlan(plan, registry, {
       const sourceId = operation.forEach.sourceOperation;
       if (!byId.has(sourceId)) add(`${path}.forEach`, `references unknown operation '${sourceId}'`);
       else if (!operation.dependsOn.includes(sourceId)) add(`${path}.forEach`, `source '${sourceId}' must be a dependency`);
-      else {
+      else if (validPointer(operation.forEach.sourcePointer)) {
         const sourceTool = registry?.get(byId.get(sourceId)?.toolId);
         const arraySchema = schemaAtPointer(sourceTool?.resultSchema, operation.forEach.sourcePointer);
         if (arraySchema && arraySchema.type !== 'array') {
@@ -197,7 +197,7 @@ export function validateExecutionPlan(plan, registry, {
         const itemSchema = arraySchema?.items;
         if (itemSchema) {
           for (const [bindingIndex, binding] of (operation.forEach.bindings ?? []).entries()) {
-            if (!schemaAtPointer(itemSchema, binding.sourcePointer)) {
+            if (validPointer(binding?.sourcePointer) && !schemaAtPointer(itemSchema, binding.sourcePointer)) {
               add(`${path}.forEach.bindings[${bindingIndex}].sourcePointer`, 'is not declared in the registered result schema');
             }
           }

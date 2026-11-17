@@ -104,7 +104,7 @@ export function parseRequestStatistic(body) {
     || value.outputTokens !== externalModels.reduce((total, call) => total + (call.outputTokens ?? 0), 0)
     || value.tokenUsageCalls !== externalModels.filter(call => call.inputTokens !== null || call.outputTokens !== null).length
     || value.externalAiMs !== externalModels.reduce((total, call) => total + call.latencyMs, 0)
-    || value.responseMs !== Date.parse(value.completedAt) - Date.parse(value.startedAt)
+    || value.responseMs > Date.parse(value.completedAt) - Date.parse(value.startedAt)
     || value.toolFailures > value.toolCalls || typeof value.multiStep !== 'boolean'
     || (value.selectedMode !== null && !SELECTED_MODES.includes(value.selectedMode))
     || (value.requestText !== null && (typeof value.requestText !== 'string' || Buffer.byteLength(value.requestText, 'utf8') > 100000))

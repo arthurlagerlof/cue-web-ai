@@ -1,7 +1,7 @@
 import { pipeline, env } from '@huggingface/transformers';
 import { ASR_MODELS, type ASRModelSize } from './asrModels';
 import { crossEncoderScoreFromLogit } from '../intelligence/retrieval/crossEncoderScore.js';
-import { EMBEDDING_TOKENIZER } from '../intelligence/embeddingModel.js';
+import { EMBEDDING_REVISION, EMBEDDING_TOKENIZER } from '../intelligence/embeddingModel.js';
 env.allowLocalModels = false;
 env.useBrowserCache = true;
 
@@ -131,7 +131,7 @@ self.onmessage = async (event: MessageEvent<RequestMessage>) => {
       const task = stage === 'transcribe' ? 'automatic-speech-recognition' : 'feature-extraction';
       const device = 'webgpu';
       const dtype = stage === 'embed' ? 'q8' : 'q4';
-      const instance = await pipeline(task as never, modelId, { device, dtype } as never);
+      const instance = await pipeline(task as never, modelId, { device, dtype, ...(stage === 'embed' ? { revision: EMBEDDING_REVISION } : {}) } as never);
       pipelines[stage] = { modelId, instance };
     }
     const modelPipeline = pipelines[stage]!.instance;

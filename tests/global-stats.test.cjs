@@ -36,12 +36,14 @@ const request = {
 test('telemetry accepts bounded request text and rejects unapproved fields', async () => {
   const { parseRequestStatistic } = await import('../netlify/functions/global-stats.mjs');
   assert.deepEqual(parseRequestStatistic(JSON.stringify(request)), request);
+  assert.equal(parseRequestStatistic(JSON.stringify({ ...request, responseMs: 1800 })).responseMs, 1800);
   for (const body of [
     '{',
     JSON.stringify({ ...request, prompt: 'private' }),
     JSON.stringify({ ...request, externalCalls: 2 }),
     JSON.stringify({ ...request, requestId: 'not-a-uuid' }),
     JSON.stringify({ ...request, responseMs: -1 }),
+    JSON.stringify({ ...request, responseMs: 2001 }),
     JSON.stringify({ ...request, executionMode: 'hybrid' }),
     JSON.stringify({ ...request, selectedMode: 'invalid' }),
     JSON.stringify({ ...request, requestText: 'x'.repeat(100001) }),
