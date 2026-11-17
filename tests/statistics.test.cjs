@@ -18,8 +18,8 @@ const {
 const { UserDatabase } = require('../src/storage/userDatabase.ts');
 const { createMemoryStorage } = require('../src/storage/storage.ts');
 
-function measuredRequest(id, startedAt, completeAt, baseline = false) {
-  return beginRequestMeasurement(baseline, startedAt, id);
+function measuredRequest(id, startedAt, mode = 'web_ai') {
+  return beginRequestMeasurement(mode, startedAt, id);
 }
 
 test('request statistics preserve measured modes, latency, model calls, tool outcomes, and averages', () => {
@@ -27,7 +27,7 @@ test('request statistics preserve measured modes, latency, model calls, tool out
   recordLocalInference(local, 'local/mini-lm', 40);
   recordToolExecution(local, 50, true);
 
-  const baseline = measuredRequest('10000000-0000-4000-8000-000000000002', 2000, undefined, true);
+  const baseline = measuredRequest('10000000-0000-4000-8000-000000000002', 2000, 'dots3_always');
   recordExternalCall(baseline, {
     provider: 'openrouter', model: 'dots-studio/dots-3-note-preview:free',
     latencyMs: 300, inputTokens: 5, outputTokens: 7, success: true, made: true,
@@ -39,7 +39,7 @@ test('request statistics preserve measured modes, latency, model calls, tool out
   recordToolExecution(baseline, 60, true);
   recordToolExecution(baseline, 90, false);
 
-  const hybrid = measuredRequest('10000000-0000-4000-8000-000000000003', 6000);
+  const hybrid = measuredRequest('10000000-0000-4000-8000-000000000003', 6000, 'automatic');
   recordLocalInference(hybrid, 'local/mini-lm', 20);
   recordLocalProcessing(hybrid);
   recordClarification(hybrid);
@@ -73,13 +73,7 @@ test('request statistics preserve measured modes, latency, model calls, tool out
   const stats = calculateStatistics(records);
   assert.equal(stats.sampleSize, 3);
   assert.equal(stats.averageExternalApiCalls, 4 / 3);
-  assert.equal(stats.averageBaselineApiCalls, 2);
-  assert.ok(Math.abs(stats.averageApiCallsSaved - 2 / 3) < 1e-12);
-  assert.equal(stats.averagePercentApiCallsAvoided, 100 / 3);
-  assert.equal(stats.totalApiCallsSaved, 2);
   assert.equal(stats.averageResponseMs, 7000 / 3);
-  assert.equal(stats.averageBaselineResponseMs, 4000);
-  assert.ok(Math.abs(stats.averageTimeSavedMs - 5000 / 3) < 1e-12);
   assert.equal(stats.averageLocalInferenceMs, 20);
   assert.equal(stats.averageExternalAiMs, 900 / 3);
   assert.equal(stats.averageToolExecutionMs, 230 / 3);
@@ -94,33 +88,45 @@ test('request statistics preserve measured modes, latency, model calls, tool out
   assert.deepEqual(stats.byMode.map(mode => mode.mode), ['local', 'external', 'hybrid']);
   assert.equal(stats.byExternalModel.length, 3);
   assert.equal(stats.byExternalModel[0].model, 'dots-studio/dots-3-note-preview:free');
+  assert.deepEqual(stats.bySelectedMode.map(group => group.mode), ['web_ai', 'automatic', 'dots3_always']);
+  const [localGroup, automaticGroup, dotsGroup] = stats.bySelectedMode;
+  assert.equal(localGroup.averageExternalCallLatencyMs, null);
+  assert.equal(localGroup.averageInputTokens, 0);
+  assert.equal(localGroup.tokenSampleSize, 1);
+  assert.equal(automaticGroup.averageExternalCallLatencyMs, 50);
+  assert.equal(automaticGroup.tokenSampleSize, 0);
+  assert.equal(automaticGroup.averageInputTokens, null);
+  assert.equal(dotsGroup.averageExternalApiCalls, 2);
+  assert.equal(dotsGroup.averageExternalCallLatencyMs, 400);
+  assert.equal(dotsGroup.tokenSampleSize, 0);
+  assert.equal(dotsGroup.periodStart, records[1].completedAt);
+  assert.equal(dotsGroup.toolSuccessRate, 0.5);
 });
 
-test('savings remain unavailable until there is an observed Dots3-only baseline', () => {
+test('empty groups and legacy records do not produce invented mode comparisons', () => {
   const measurement = measuredRequest('20000000-0000-4000-8000-000000000001', 10);
   const stats = calculateStatistics([completeRequestMeasurement(measurement, 'completed', 40)]);
   assert.equal(stats.averageExternalApiCalls, 0);
-  assert.equal(stats.averageBaselineApiCalls, null);
-  assert.equal(stats.averageApiCallsSaved, null);
-  assert.equal(stats.averagePercentApiCallsAvoided, null);
-  assert.equal(stats.averageBaselineResponseMs, null);
-  assert.equal(stats.averageTimeSavedMs, null);
-  assert.equal(stats.totalApiCallsSaved, null);
+  assert.equal(stats.bySelectedMode[1].requests, 0);
+  assert.equal(stats.bySelectedMode[1].averageResponseMs, null);
+  const legacy = { ...completeRequestMeasurement(measurement, 'completed', 40), selectedMode: undefined };
+  assert.equal(calculateStatistics([legacy]).bySelectedMode.reduce((n, group) => n + group.requests, 0), 0);
   assert.equal(calculateStatistics([]).completionRate, null);
 });
 
-test('pending confirmation measurements can be resumed without storing request content', () => {
+test('pending measurements preserve the original request and selected mode', () => {
   const measurement = measuredRequest('25000000-0000-4000-8000-000000000001', 500);
+  measurement.requestText = 'Find my meeting';
   recordLocalInference(measurement, 'local/model', 25);
   recordToolExecution(measurement, 10, true);
   const snapshot = serializeRequestMeasurement(measurement);
-  assert.equal(Object.hasOwn(snapshot, 'prompt'), false);
-  assert.equal(Object.hasOwn(snapshot, 'transcript'), false);
   const restored = restoreRequestMeasurement(JSON.parse(JSON.stringify(snapshot)));
   recordToolExecution(restored, 20, true);
   const result = completeRequestMeasurement(restored, 'completed', 1000);
   assert.equal(result.toolCalls, 2);
   assert.equal(result.responseMs, 500);
+  assert.equal(result.requestText, 'Find my meeting');
+  assert.equal(result.selectedMode, 'web_ai');
   assert.deepEqual(result.localModels, ['local/model']);
 });
 
@@ -129,6 +135,7 @@ test('local records are deduplicated and telemetry requires consent, retries off
   const measurement = measuredRequest('30000000-0000-4000-8000-000000000001', 100);
   recordLocalInference(measurement, 'local/model', 10);
   const record = completeRequestMeasurement(measurement, 'completed', 300);
+  record.requestText = 'Find my meeting';
   assert.equal(await database.recordRequestStatistic(record), true);
   assert.equal(await database.recordRequestStatistic(record), false);
   await database.queueRequestStatistic(record);
@@ -143,6 +150,9 @@ test('local records are deduplicated and telemetry requires consent, retries off
   assert.equal((await database.getPendingTelemetry()).length, 0);
 
   await database.setPreference('sharePublicTelemetry', true);
+  await database.queueRequestStatistic(record);
+  assert.deepEqual(await flushTelemetryQueue(database, async () => { throw new Error('must not upload'); }, 1000, false), { uploaded: 0, failed: 0 });
+  await database.setPreference('sharePublicTelemetryWithRequestText', true);
   await database.queueRequestStatistic(record);
   const failed = await flushTelemetryQueue(database, async () => {
     fetchCalls++;
@@ -166,6 +176,7 @@ test('local records are deduplicated and telemetry requires consent, retries off
   assert.equal(uploaded.options.credentials, 'omit');
   assert.equal(uploaded.options.redirect, 'error');
   assert.equal(uploaded.body.requestId, record.requestId);
+  assert.equal(uploaded.body.requestText, 'Find my meeting');
   assert.equal(Object.hasOwn(uploaded.body, 'prompt'), false);
   assert.equal((await database.getPendingTelemetry()).length, 0);
   assert.equal((await database.getRequestStatistics()).length, 1);

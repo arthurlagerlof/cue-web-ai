@@ -71,6 +71,11 @@ test('OpenRouter plan request contains the tool catalog but no local provider re
     assert.equal(usageCalls, 1);
     const prompt = requestBody.prompt;
     assert.match(prompt, /anki\.search_cards/);
+    assert.match(prompt, /Search my Anki cards about photosynthesis/);
+    assert.match(prompt, /Etsi Anki-kortti fotosynteesistä/);
+    assert.doesNotMatch(prompt, /Find the card about chloroplasts/);
+    assert.doesNotMatch(prompt, /acceptedSources|providerPermissions|requiredPermissions|keywords/);
+    assert.match(prompt, /additionalProperties/);
     assert.doesNotMatch(prompt, /PRIVATE RECORD CONTENT/);
   } finally {
     global.fetch = originalFetch;

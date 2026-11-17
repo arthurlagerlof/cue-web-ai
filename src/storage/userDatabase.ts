@@ -15,7 +15,39 @@ import { openUserStorage, type StorageAdapter, type StorageValue } from './stora
 import type { RequestStatistic } from '../statistics';
 
 const APP_SCHEMA_VERSION = 2;
-const DEFAULT_DEMO_CLOCK = '2026-11-16T08:00:00+02:00';
+const SEED_BASE_DATE = '2026-11-16';
+const DEMO_CLOCK_TIME = '08:00:00+02:00';
+const DAY_MS = 86_400_000;
+const ISO_DATE_PREFIX = /^(\d{4}-\d{2}-\d{2})(?=$|T)/;
+
+function utcDateString(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+function currentDemoClock() {
+  return `${utcDateString()}T${DEMO_CLOCK_TIME}`;
+}
+
+// Moves seeded dates so the seed's base date maps to the current UTC date.
+function shiftSeedDates<T>(value: T, offsetDays: number): T {
+  if (offsetDays === 0) return value;
+  if (typeof value === 'string') {
+    return value.replace(ISO_DATE_PREFIX, date => utcDateString(new Date(Date.parse(date) + offsetDays * DAY_MS))) as T;
+  }
+  if (Array.isArray(value)) return value.map(item => shiftSeedDates(item, offsetDays)) as T;
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, shiftSeedDates(item, offsetDays)])) as T;
+  }
+  return value;
+}
+
+function seedOffsetDays() {
+  return Math.round((Date.parse(utcDateString()) - Date.parse(SEED_BASE_DATE)) / DAY_MS);
+}
+
+function presentRecord(stored: StoredRecord) {
+  return stored.origin === 'demo-seed' ? shiftSeedDates(stored.value, seedOffsetDays()) : stored.value;
+}
 const JSON_SCHEMA_REF = { $ref: 'https://cue.local/schemas/cue-display-v1.schema.json' };
 const RECORD_STORE = 'records';
 const SEEDED_EMBEDDINGS_VERSION = 1;
@@ -227,9 +259,6 @@ export class UserDatabase {
         }
       }
     }
-    if (await this.storage.get('meta', 'demoClock') === undefined) {
-      await this.storage.put('meta', 'demoClock', DEFAULT_DEMO_CLOCK);
-    }
     if (await this.storage.get('meta', 'toolRetrievalConfig') === undefined) {
       await this.storage.put('meta', 'toolRetrievalConfig', retrievalConfig);
     }
@@ -246,7 +275,7 @@ export class UserDatabase {
     for (const stored of storedRecords) {
       data[stored.providerId] ??= {};
       data[stored.providerId][stored.recordType] ??= [];
-      data[stored.providerId][stored.recordType].push(stored.value);
+      data[stored.providerId][stored.recordType].push(presentRecord(stored));
     }
     for (const rows of Object.values(data)) {
       for (const values of Object.values(rows)) values.sort((left, right) => String(left.id).localeCompare(String(right.id)));
@@ -255,7 +284,7 @@ export class UserDatabase {
       data.web ??= {};
       data.web.assets = assets.map(({ origin: _origin, ...asset }) => asset);
     }
-    const demoClock = await this.storage.get<string>('meta', 'demoClock');
+    const demoClock = currentDemoClock();
     const toolRetrievalConfig = await this.storage.get<Record<string, unknown>>('meta', 'toolRetrievalConfig');
     return { providers, tools, data, demoClock, toolRetrievalConfig: toolRetrievalConfig ?? retrievalConfig };
   }
@@ -264,12 +293,12 @@ export class UserDatabase {
     const records = await this.storage.getAll<StoredRecord>(RECORD_STORE);
     return records.filter(item => item.providerId === providerId && item.recordType === recordType)
       .sort((left, right) => left.recordId.localeCompare(right.recordId))
-      .map(item => item.value);
+      .map(presentRecord);
   }
 
   async getRecord(providerId: string, recordType: string, recordId: string) {
     const item = await this.storage.get<StoredRecord>(RECORD_STORE, recordKey(providerId, recordType, recordId));
-    return item?.value;
+    return item && presentRecord(item);
   }
 
   async putRecord(providerId: string, recordType: string, value: Record<string, unknown>) {

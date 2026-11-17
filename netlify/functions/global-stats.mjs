@@ -1,18 +1,18 @@
 import pg from 'pg';
 
 const { Pool } = pg;
-const MAX_BODY_BYTES = 16384;
+const MAX_BODY_BYTES = 700000;
 const MAX_MODEL_CALLS = 20;
 const MAX_DURATION_MS = 86400000;
 const MAX_COUNT = 10000;
 const MODES = new Set(['local', 'external', 'hybrid']);
 const COMPLETION_STATUSES = new Set(['completed', 'clarification', 'awaiting_confirmation', 'failed', 'cancelled']);
-const DOTS3_BASELINE_MODEL = 'dots-studio/dots-3-note-preview:free';
+const SELECTED_MODES = ['web_ai', 'automatic', 'dots3_always'];
 const requestKeys = [
   'requestId', 'startedAt', 'completedAt', 'executionMode', 'localModels', 'localProcessing', 'externalModels',
   'externalCalls', 'inputTokens', 'outputTokens', 'tokenUsageCalls', 'localInferenceMs',
   'externalAiMs', 'toolExecutionMs', 'responseMs', 'toolCalls', 'toolFailures',
-  'clarifications', 'multiStep', 'completionStatus', 'dots3Baseline',
+  'clarifications', 'multiStep', 'completionStatus', 'selectedMode', 'requestText',
 ];
 let pool;
 
@@ -106,15 +106,14 @@ export function parseRequestStatistic(body) {
     || value.externalAiMs !== externalModels.reduce((total, call) => total + call.latencyMs, 0)
     || value.responseMs !== Date.parse(value.completedAt) - Date.parse(value.startedAt)
     || value.toolFailures > value.toolCalls || typeof value.multiStep !== 'boolean'
-    || typeof value.dots3Baseline !== 'boolean' || !COMPLETION_STATUSES.has(value.completionStatus)) {
+    || (value.selectedMode !== null && !SELECTED_MODES.includes(value.selectedMode))
+    || (value.requestText !== null && (typeof value.requestText !== 'string' || Buffer.byteLength(value.requestText, 'utf8') > 100000))
+    || !COMPLETION_STATUSES.has(value.completionStatus)) {
     throw new TypeError('Request statistics are inconsistent.');
   }
   const expectedMode = (value.localProcessing || value.localModels.length) && externalModels.length ? 'hybrid'
     : externalModels.length ? 'external' : 'local';
   if (value.executionMode !== expectedMode) throw new TypeError('The execution mode does not match the recorded models.');
-  if (value.dots3Baseline && externalModels.some(call => call.model !== DOTS3_BASELINE_MODEL)) {
-    throw new TypeError('The Dots3 baseline contains a different external model.');
-  }
   return {
     requestId: value.requestId,
     startedAt: value.startedAt,
@@ -136,7 +135,8 @@ export function parseRequestStatistic(body) {
     clarifications: value.clarifications,
     multiStep: value.multiStep,
     completionStatus: value.completionStatus,
-    dots3Baseline: value.dots3Baseline,
+    selectedMode: value.selectedMode,
+    requestText: value.requestText,
   };
 }
 
@@ -163,10 +163,7 @@ async function loadAggregate(database) {
         CROSS JOIN LATERAL unnest(local_stats.local_models) AS models(local_model)) AS local_models,
       COALESCE(SUM(external_calls), 0)::text AS total_external_api_calls,
       AVG(external_calls)::float8 AS average_external_api_calls,
-      COUNT(*) FILTER (WHERE dots3_baseline AND external_calls > 0)::text AS baseline_sample_size,
-      AVG(external_calls) FILTER (WHERE dots3_baseline AND external_calls > 0)::float8 AS average_baseline_api_calls,
       AVG(response_ms)::float8 AS average_response_ms,
-      AVG(response_ms) FILTER (WHERE dots3_baseline AND external_calls > 0)::float8 AS average_baseline_response_ms,
       AVG(local_inference_ms)::float8 AS average_local_inference_ms,
       AVG(external_ai_ms)::float8 AS average_external_ai_ms,
       AVG(tool_execution_ms)::float8 AS average_tool_execution_ms,
@@ -210,39 +207,45 @@ async function loadAggregate(database) {
     GROUP BY model_call->>'provider', model_call->>'model'
     ORDER BY COUNT(*) DESC, model_call->>'model'
   `);
+  const selectedModeResult = await database.query(`
+    WITH measured AS (
+      SELECT selected_mode, completed_at, external_calls, external_ai_ms, response_ms,
+        local_inference_ms, completion_status, tool_calls, tool_failures, input_tokens, output_tokens,
+        NOT EXISTS (
+          SELECT 1 FROM jsonb_array_elements(external_models) AS calls(call)
+          WHERE call->>'inputTokens' IS NULL OR call->>'outputTokens' IS NULL
+        ) AS tokens_complete
+      FROM cue_request_statistics
+      WHERE selected_mode IS NOT NULL
+    )
+    SELECT selected_mode, COUNT(*)::text AS requests,
+      MIN(completed_at)::text AS period_start, MAX(completed_at)::text AS period_end,
+      AVG(external_calls)::float8 AS average_external_api_calls,
+      AVG(response_ms)::float8 AS average_response_ms,
+      AVG(local_inference_ms)::float8 AS average_local_inference_ms,
+      SUM(external_calls)::text AS external_calls,
+      SUM(external_ai_ms)::float8 / NULLIF(SUM(external_calls), 0) AS average_external_call_latency_ms,
+      COUNT(*) FILTER (WHERE completion_status = 'completed')::float8 / COUNT(*) AS completion_rate,
+      SUM(tool_calls)::text AS tool_calls,
+      (SUM(tool_calls) - SUM(tool_failures))::float8 / NULLIF(SUM(tool_calls), 0) AS tool_success_rate,
+      AVG(input_tokens) FILTER (WHERE tokens_complete)::float8 AS average_input_tokens,
+      AVG(output_tokens) FILTER (WHERE tokens_complete)::float8 AS average_output_tokens,
+      COUNT(*) FILTER (WHERE tokens_complete)::text AS token_sample_size
+    FROM measured GROUP BY selected_mode
+  `);
   const row = totalsResult.rows[0];
   const sampleSize = safeInteger(row.sample_size, 'request count');
   const totalExternalApiCalls = safeInteger(row.total_external_api_calls, 'external API call');
-  const baselineSampleSize = safeInteger(row.baseline_sample_size, 'baseline sample');
   const averageExternalApiCalls = row.average_external_api_calls === null ? null : safeNumber(row.average_external_api_calls, 'average external API call');
-  const averageBaselineApiCalls = row.average_baseline_api_calls === null ? null : safeNumber(row.average_baseline_api_calls, 'baseline API call');
   const averageResponseMs = row.average_response_ms === null ? null : safeNumber(row.average_response_ms, 'average response time');
-  const averageBaselineResponseMs = row.average_baseline_response_ms === null ? null : safeNumber(row.average_baseline_response_ms, 'baseline response time');
-  const averageApiCallsSaved = averageBaselineApiCalls === null || averageExternalApiCalls === null
-    ? null
-    : averageBaselineApiCalls - averageExternalApiCalls;
   return {
     sampleSize,
     periodStart: row.period_start,
     periodEnd: row.period_end,
     localModels: row.local_models ?? [],
-    baselineModel: DOTS3_BASELINE_MODEL,
-    baselineSampleSize,
     averageExternalApiCalls,
-    averageBaselineApiCalls,
-    averageApiCallsSaved,
-    averagePercentApiCallsAvoided: averageApiCallsSaved === null || averageBaselineApiCalls === null || averageBaselineApiCalls <= 0
-      ? null
-      : (averageApiCallsSaved / averageBaselineApiCalls) * 100,
-    totalApiCallsSaved: averageBaselineApiCalls === null
-      ? null
-      : averageBaselineApiCalls * sampleSize - totalExternalApiCalls,
     totalExternalApiCalls,
     averageResponseMs,
-    averageBaselineResponseMs,
-    averageTimeSavedMs: averageBaselineResponseMs === null || averageResponseMs === null
-      ? null
-      : averageBaselineResponseMs - averageResponseMs,
     averageLocalInferenceMs: row.average_local_inference_ms === null ? null : safeNumber(row.average_local_inference_ms, 'local inference time'),
     averageExternalAiMs: row.average_external_ai_ms === null ? null : safeNumber(row.average_external_ai_ms, 'external AI time'),
     averageToolExecutionMs: row.average_tool_execution_ms === null ? null : safeNumber(row.average_tool_execution_ms, 'tool execution time'),
@@ -257,6 +260,30 @@ async function loadAggregate(database) {
     inputTokens: safeInteger(row.input_tokens, 'input token'),
     outputTokens: safeInteger(row.output_tokens, 'output token'),
     tokenUsageCalls: safeInteger(row.token_usage_calls, 'token usage call'),
+    bySelectedMode: SELECTED_MODES.map(mode => {
+      const selected = selectedModeResult.rows.find(item => item.selected_mode === mode);
+      if (!selected) return {
+        mode, requests: 0, periodStart: null, periodEnd: null, averageExternalApiCalls: null,
+        averageResponseMs: null, averageLocalInferenceMs: null, averageExternalCallLatencyMs: null,
+        externalCalls: 0, completionRate: null, toolSuccessRate: null, toolCalls: 0,
+        averageInputTokens: null, averageOutputTokens: null, tokenSampleSize: 0,
+      };
+      return {
+        mode, requests: safeInteger(selected.requests, 'selected mode request'),
+        periodStart: selected.period_start, periodEnd: selected.period_end,
+        averageExternalApiCalls: safeNumber(selected.average_external_api_calls, 'selected mode calls'),
+        averageResponseMs: safeNumber(selected.average_response_ms, 'selected mode response'),
+        averageLocalInferenceMs: safeNumber(selected.average_local_inference_ms, 'selected mode local inference'),
+        averageExternalCallLatencyMs: selected.average_external_call_latency_ms === null ? null : safeNumber(selected.average_external_call_latency_ms, 'selected mode call latency'),
+        externalCalls: safeInteger(selected.external_calls, 'selected mode external calls'),
+        completionRate: safeNumber(selected.completion_rate, 'selected mode completion'),
+        toolSuccessRate: selected.tool_success_rate === null ? null : safeNumber(selected.tool_success_rate, 'selected mode tool success'),
+        toolCalls: safeInteger(selected.tool_calls, 'selected mode tool calls'),
+        averageInputTokens: selected.average_input_tokens === null ? null : safeNumber(selected.average_input_tokens, 'selected mode input tokens'),
+        averageOutputTokens: selected.average_output_tokens === null ? null : safeNumber(selected.average_output_tokens, 'selected mode output tokens'),
+        tokenSampleSize: safeInteger(selected.token_sample_size, 'selected mode token sample'),
+      };
+    }),
     byMode: modeResult.rows.map(mode => ({
       mode: mode.execution_mode,
       requests: safeInteger(mode.requests, 'mode request'),
@@ -297,10 +324,10 @@ export const handleGlobalStats = async (event, connectionString) => {
           request_id, started_at, completed_at, execution_mode, local_models, local_processing, external_models,
           external_calls, input_tokens, output_tokens, token_usage_calls, local_inference_ms,
           external_ai_ms, tool_execution_ms, response_ms, tool_calls, tool_failures,
-          clarifications, multi_step, completion_status, dots3_baseline
+          clarifications, multi_step, completion_status, selected_mode, request_text
         ) VALUES (
           $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12,
-          $13, $14, $15, $16, $17, $18, $19, $20, $21
+          $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
         ) ON CONFLICT (request_id) DO NOTHING
       `, [
         statistic.requestId, statistic.startedAt, statistic.completedAt, statistic.executionMode,
@@ -308,7 +335,7 @@ export const handleGlobalStats = async (event, connectionString) => {
         statistic.inputTokens, statistic.outputTokens, statistic.tokenUsageCalls,
         statistic.localInferenceMs, statistic.externalAiMs, statistic.toolExecutionMs,
         statistic.responseMs, statistic.toolCalls, statistic.toolFailures,
-        statistic.clarifications, statistic.multiStep, statistic.completionStatus, statistic.dots3Baseline,
+        statistic.clarifications, statistic.multiStep, statistic.completionStatus, statistic.selectedMode, statistic.requestText,
       ]);
       return response(200, { accepted: true, duplicate: result.rowCount === 0 });
     }

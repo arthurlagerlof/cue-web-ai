@@ -170,7 +170,7 @@ export default function App() {
     recordExternalCall(activeRequest.current, call);
     if (call.made) {
       void recordUsage('externalCalls');
-      if (activeRequest.current?.dots3Baseline) void recordUsage('dots3Calls');
+      if (activeRequest.current?.selectedMode === 'dots3_always') void recordUsage('dots3Calls');
     }
   };
   const addClarification = async () => {
@@ -184,7 +184,11 @@ export default function App() {
       const database = await openBrowserDatabase();
       await database.recordRequestStatistic(statistic);
       await database.setPreference('activeRequestMeasurement', null);
-      if (await database.getPreference<boolean>('sharePublicTelemetry') === true) {
+      if (await database.getPreference<boolean>('sharePublicTelemetryWithRequestText') === true) {
+        if (statistic.requestText && new TextEncoder().encode(statistic.requestText).length > 100000) {
+          log('Request statistics were saved locally but not shared: request text exceeds the 100 KB telemetry limit.');
+          return;
+        }
         await database.queueRequestStatistic(statistic);
         void flushTelemetryQueue(database).then(result => {
           if (result.failed) log('Telemetry upload is queued and will retry when available.');
@@ -328,13 +332,20 @@ export default function App() {
           if (reply.status === 'running' && task) {
             task.inferenceStartedAt = performance.now();
             task.inferenceModel = reply.model;
+            log(`Local model started (${stage}): ${reply.model ?? 'unknown model'}`);
           }
           if (reply.status !== 'complete' && reply.status !== 'error') {
             setStatus(old => ({ ...old, [stage]: `${reply.status}${reply.model ? ` — ${reply.model}` : ''}` })); return;
           }
           setStatus(old => ({ ...old, [stage]: reply.status === 'error' ? `Error — ${reply.error}` : `Complete — ${reply.model ?? 'done'}` }));
           if (task) {
-            if (task.inferenceStartedAt !== undefined) recordLocalInference(activeRequest.current, reply.model ?? task.inferenceModel, performance.now() - task.inferenceStartedAt);
+            const durationMs = task.inferenceStartedAt === undefined ? undefined : performance.now() - task.inferenceStartedAt;
+            if (durationMs !== undefined) recordLocalInference(activeRequest.current, reply.model ?? task.inferenceModel, durationMs);
+            const model = reply.model ?? task.inferenceModel ?? 'unknown model';
+            const duration = durationMs === undefined ? '' : ` in ${(durationMs / 1000).toFixed(1)}s`;
+            log(reply.status === 'error'
+              ? `Local model failed (${stage}): ${model}${duration} — ${reply.error ?? 'Unknown error'}`
+              : `Local model completed (${stage}): ${model}${duration}`);
             pending.current.delete(reply.id);
             task.resolve(reply);
           }
@@ -602,7 +613,8 @@ export default function App() {
       }));
       return;
     }
-    const measurement = existingMeasurement ?? activeRequest.current ?? beginRequestMeasurement(aiModeRef.current === 'dots3_always');
+    const measurement = existingMeasurement ?? activeRequest.current ?? beginRequestMeasurement(aiModeRef.current);
+    if (measurement.requestText === null) measurement.requestText = clean;
     activeRequest.current = measurement;
     let requestFailed = false;
     setTranscription(clean); setTranscriptInput(clean); setBusy(true);
@@ -1031,7 +1043,7 @@ export default function App() {
   async function runPipeline(snapshot = audio.snapshot()) {
     if (running.current) return;
     running.current = true;
-    const measurement = beginRequestMeasurement(aiModeRef.current === 'dots3_always');
+    const measurement = beginRequestMeasurement(aiModeRef.current);
     activeRequest.current = measurement;
     setBusy(true);
     try {

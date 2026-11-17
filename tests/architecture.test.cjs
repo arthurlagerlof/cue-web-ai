@@ -122,6 +122,27 @@ test('Cue Display Document fixtures satisfy the v1 contract', async () => {
   })).valid, true);
 });
 
+test('display message is not repeated when a text element already shows it', async () => {
+  const [display] = await modules;
+  const duplicate = display.createDisplayDocument({
+    id: 'duplicate-message',
+    title: 'Result',
+    source: { app: 'cue', name: 'Cue' },
+    message: 'Request completed.',
+    elements: [{ type: 'container', layout: 'column', children: [{ type: 'text', text: 'Request completed.' }] }],
+  });
+  assert.equal(display.hasMessageElement(duplicate), true);
+
+  const distinct = display.createDisplayDocument({
+    id: 'distinct-message',
+    title: 'Result',
+    source: { app: 'cue', name: 'Cue' },
+    message: 'Summary',
+    elements: [{ type: 'text', text: 'Details' }],
+  });
+  assert.equal(display.hasMessageElement(distinct), false);
+});
+
 test('display validator checks nested components, assets, action IDs, and registry arguments', async () => {
   const [display, registryModule, , mock] = await modules;
   const runtime = await mock.createMockEnvironment({ manifests, providers: testProviders(), embed: async text => fakeEmbed(text) });
@@ -658,8 +679,10 @@ test('argument normalization is conditional, schema-checked, retried once, and n
     },
   });
   assert.equal(prompts.length, 2);
-  assert.match(prompts[0], /already selected local tool/);
+  assert.match(prompts[0], /selected tool/);
   assert.match(prompts[0], /anki\.create_card/);
+  assert.match(prompts[0], /question_text/);
+  assert.doesNotMatch(prompts[0], /acceptedSources/);
   assert.deepEqual(normalized.arguments, { front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.' });
   assert.throws(() => normalization.validateNormalizedResponse(JSON.stringify({
     status: 'resolved', arguments: { toolId: 'alarm.create' }, missing: [], ambiguous: [], provenance: { toolId: 'model_extracted' },

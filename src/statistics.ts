@@ -1,4 +1,5 @@
 export type ExecutionMode = 'local' | 'external' | 'hybrid';
+export type SelectedMode = 'web_ai' | 'automatic' | 'dots3_always';
 export type CompletionStatus = 'completed' | 'clarification' | 'awaiting_confirmation' | 'failed' | 'cancelled';
 
 export type ExternalModelCall = {
@@ -31,14 +32,16 @@ export type RequestStatistic = {
   clarifications: number;
   multiStep: boolean;
   completionStatus: CompletionStatus;
-  dots3Baseline: boolean;
+  selectedMode: SelectedMode | null;
+  requestText: string | null;
 };
 
 export type RequestMeasurement = {
   requestId: string;
   startedAt: string;
   startedAtMs: number;
-  dots3Baseline: boolean;
+  selectedMode: SelectedMode | null;
+  requestText: string | null;
   localModels: Set<string>;
   localProcessing: boolean;
   externalModels: ExternalModelCall[];
@@ -57,17 +60,9 @@ export type StatisticsSummary = {
   periodStart: string | null;
   periodEnd: string | null;
   localModels: string[];
-  baselineModel: string;
-  baselineSampleSize: number;
   averageExternalApiCalls: number | null;
-  averageBaselineApiCalls: number | null;
-  averageApiCallsSaved: number | null;
-  averagePercentApiCallsAvoided: number | null;
-  totalApiCallsSaved: number | null;
   totalExternalApiCalls: number;
   averageResponseMs: number | null;
-  averageBaselineResponseMs: number | null;
-  averageTimeSavedMs: number | null;
   averageLocalInferenceMs: number | null;
   averageExternalAiMs: number | null;
   averageToolExecutionMs: number | null;
@@ -80,6 +75,7 @@ export type StatisticsSummary = {
   inputTokens: number;
   outputTokens: number;
   tokenUsageCalls: number;
+  bySelectedMode: ModeStatistics[];
   byMode: Array<{
     mode: ExecutionMode;
     requests: number;
@@ -103,15 +99,32 @@ export type StatisticsSummary = {
   }>;
 };
 
-export const DOTS3_BASELINE_MODEL = 'dots-studio/dots-3-note-preview:free';
+export type ModeStatistics = {
+  mode: SelectedMode;
+  requests: number;
+  periodStart: string | null;
+  periodEnd: string | null;
+  averageExternalApiCalls: number | null;
+  averageResponseMs: number | null;
+  averageLocalInferenceMs: number | null;
+  averageExternalCallLatencyMs: number | null;
+  externalCalls: number;
+  completionRate: number | null;
+  toolSuccessRate: number | null;
+  toolCalls: number;
+  averageInputTokens: number | null;
+  averageOutputTokens: number | null;
+  tokenSampleSize: number;
+};
 
-export function beginRequestMeasurement(dots3Baseline = false, startedAtMs = Date.now(), requestId = crypto.randomUUID()): RequestMeasurement {
+export function beginRequestMeasurement(selectedMode: SelectedMode, startedAtMs = Date.now(), requestId = crypto.randomUUID()): RequestMeasurement {
   if (!Number.isSafeInteger(startedAtMs) || startedAtMs < 0 || !requestId) throw new TypeError('Request measurement identity is invalid.');
   return {
     requestId,
     startedAt: new Date(startedAtMs).toISOString(),
     startedAtMs,
-    dots3Baseline,
+    selectedMode,
+    requestText: null,
     localModels: new Set(),
     localProcessing: false,
     externalModels: [],
@@ -134,7 +147,8 @@ export function serializeRequestMeasurement(measurement: RequestMeasurement) {
     requestId: measurement.requestId,
     startedAt: measurement.startedAt,
     startedAtMs: measurement.startedAtMs,
-    dots3Baseline: measurement.dots3Baseline,
+    selectedMode: measurement.selectedMode,
+    requestText: measurement.requestText,
     localModels: [...measurement.localModels],
     localProcessing: measurement.localProcessing,
     externalModels: measurement.externalModels.map(call => ({ ...call })),
@@ -154,7 +168,9 @@ export function restoreRequestMeasurement(value: unknown): RequestMeasurement {
   if (typeof source.requestId !== 'string' || typeof source.startedAt !== 'string'
     || typeof source.startedAtMs !== 'number' || !Number.isSafeInteger(source.startedAtMs) || source.startedAtMs < 0
     || Date.parse(source.startedAt) !== source.startedAtMs
-    || typeof source.dots3Baseline !== 'boolean' || typeof source.localProcessing !== 'boolean'
+    || (source.selectedMode !== undefined && source.selectedMode !== null && !['web_ai', 'automatic', 'dots3_always'].includes(String(source.selectedMode)))
+    || (source.requestText !== undefined && source.requestText !== null && typeof source.requestText !== 'string')
+    || typeof source.localProcessing !== 'boolean'
     || !Array.isArray(source.localModels) || source.localModels.some(model => typeof model !== 'string')
     || !Array.isArray(source.externalModels)
     || typeof source.multiStep !== 'boolean') {
@@ -178,7 +194,8 @@ export function restoreRequestMeasurement(value: unknown): RequestMeasurement {
     requestId: source.requestId,
     startedAt: source.startedAt,
     startedAtMs: source.startedAtMs as number,
-    dots3Baseline: source.dots3Baseline,
+    selectedMode: (source.selectedMode as SelectedMode | null | undefined) ?? null,
+    requestText: (source.requestText as string | null | undefined) ?? null,
     localModels: new Set(localModels),
     localProcessing: source.localProcessing,
     externalModels: externalModels.map(call => ({ ...call })),
@@ -219,7 +236,6 @@ export function recordExternalCall(
     success: call.success,
   };
   if (!normalized.provider || !normalized.model) throw new TypeError('External model call identity is invalid.');
-  if (measurement.dots3Baseline && normalized.model !== DOTS3_BASELINE_MODEL) measurement.dots3Baseline = false;
   measurement.externalModels.push(normalized);
   measurement.externalAiMs += normalized.latencyMs;
 }
@@ -274,7 +290,8 @@ export function completeRequestMeasurement(
     clarifications: measurement.clarifications,
     multiStep: measurement.multiStep,
     completionStatus,
-    dots3Baseline: measurement.dots3Baseline,
+    selectedMode: measurement.selectedMode,
+    requestText: measurement.requestText,
   };
   return measurement.completed;
 }
@@ -285,21 +302,35 @@ function average(values: number[]) {
 
 export function calculateStatistics(records: RequestStatistic[]): StatisticsSummary {
   const ordered = [...records].sort((left, right) => left.completedAt.localeCompare(right.completedAt));
-  const baseline = ordered.filter(record => record.dots3Baseline && record.externalCalls > 0);
   const averageExternalApiCalls = average(ordered.map(record => record.externalCalls));
-  const averageBaselineApiCalls = average(baseline.map(record => record.externalCalls));
   const averageResponseMs = average(ordered.map(record => record.responseMs));
-  const averageBaselineResponseMs = average(baseline.map(record => record.responseMs));
-  const averageApiCallsSaved = averageBaselineApiCalls === null || averageExternalApiCalls === null
-    ? null
-    : averageBaselineApiCalls - averageExternalApiCalls;
-  const averageTimeSavedMs = averageBaselineResponseMs === null || averageResponseMs === null
-    ? null
-    : averageBaselineResponseMs - averageResponseMs;
   const totalExternalApiCalls = ordered.reduce((total, record) => total + record.externalCalls, 0);
   const totalToolCalls = ordered.reduce((total, record) => total + record.toolCalls, 0);
   const totalToolFailures = ordered.reduce((total, record) => total + record.toolFailures, 0);
   const externalCalls = ordered.flatMap(record => record.externalModels);
+  const bySelectedMode: ModeStatistics[] = (['web_ai', 'automatic', 'dots3_always'] as const).map(mode => {
+    const subset = ordered.filter(record => record.selectedMode === mode);
+    const calls = subset.flatMap(record => record.externalModels);
+    const toolCalls = subset.reduce((sum, record) => sum + record.toolCalls, 0);
+    const failures = subset.reduce((sum, record) => sum + record.toolFailures, 0);
+    const tokens = subset.filter(record => record.externalModels.every(call => call.inputTokens !== null && call.outputTokens !== null));
+    return {
+      mode, requests: subset.length,
+      periodStart: subset[0]?.completedAt ?? null,
+      periodEnd: subset.at(-1)?.completedAt ?? null,
+      averageExternalApiCalls: average(subset.map(record => record.externalCalls)),
+      averageResponseMs: average(subset.map(record => record.responseMs)),
+      averageLocalInferenceMs: average(subset.map(record => record.localInferenceMs)),
+      averageExternalCallLatencyMs: average(calls.map(call => call.latencyMs)),
+      externalCalls: calls.length,
+      completionRate: subset.length ? subset.filter(record => record.completionStatus === 'completed').length / subset.length : null,
+      toolSuccessRate: toolCalls ? (toolCalls - failures) / toolCalls : null,
+      toolCalls,
+      averageInputTokens: average(tokens.map(record => record.inputTokens)),
+      averageOutputTokens: average(tokens.map(record => record.outputTokens)),
+      tokenSampleSize: tokens.length,
+    };
+  });
   const byMode = (['local', 'external', 'hybrid'] as const).flatMap(mode => {
     const subset = ordered.filter(record => record.executionMode === mode);
     if (!subset.length) return [];
@@ -341,21 +372,9 @@ export function calculateStatistics(records: RequestStatistic[]): StatisticsSumm
     periodStart: ordered[0]?.completedAt ?? null,
     periodEnd: ordered.at(-1)?.completedAt ?? null,
     localModels: [...new Set(ordered.flatMap(record => record.localModels))].sort(),
-    baselineModel: DOTS3_BASELINE_MODEL,
-    baselineSampleSize: baseline.length,
     averageExternalApiCalls,
-    averageBaselineApiCalls,
-    averageApiCallsSaved,
-    averagePercentApiCallsAvoided: averageApiCallsSaved === null || averageBaselineApiCalls === null || averageBaselineApiCalls <= 0
-      ? null
-      : (averageApiCallsSaved / averageBaselineApiCalls) * 100,
-    totalApiCallsSaved: averageBaselineApiCalls === null
-      ? null
-      : averageBaselineApiCalls * ordered.length - totalExternalApiCalls,
     totalExternalApiCalls,
     averageResponseMs,
-    averageBaselineResponseMs,
-    averageTimeSavedMs,
     averageLocalInferenceMs: average(ordered.map(record => record.localInferenceMs)),
     averageExternalAiMs: average(ordered.map(record => record.externalAiMs)),
     averageToolExecutionMs: average(ordered.map(record => record.toolExecutionMs)),
@@ -368,6 +387,7 @@ export function calculateStatistics(records: RequestStatistic[]): StatisticsSumm
     inputTokens: externalCalls.reduce((total, call) => total + (call.inputTokens ?? 0), 0),
     outputTokens: externalCalls.reduce((total, call) => total + (call.outputTokens ?? 0), 0),
     tokenUsageCalls: externalCalls.filter(call => call.inputTokens !== null || call.outputTokens !== null).length,
+    bySelectedMode,
     byMode,
     byExternalModel,
   };
@@ -402,7 +422,7 @@ export function flushTelemetryQueue(
 ): Promise<{ uploaded: number; failed: number }> {
   if (pendingFlush) return pendingFlush;
   pendingFlush = (async () => {
-    if (await database.getPreference('sharePublicTelemetry') !== true) {
+    if (await database.getPreference('sharePublicTelemetryWithRequestText') !== true) {
       await database.clearPendingTelemetry();
       return { uploaded: 0, failed: 0 };
     }

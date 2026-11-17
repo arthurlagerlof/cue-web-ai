@@ -1,4 +1,5 @@
 import type { CSSProperties, ReactNode } from 'react';
+import { hasMessageElement } from './document.js';
 
 const assetUrls = import.meta.glob('../demo/assets/*', { eager: true, query: '?url', import: 'default' }) as Record<string, string>;
 
@@ -41,7 +42,7 @@ export function DisplayDocumentView({ document, onAction }: { document: any; onA
   return <article aria-label={document.title}>
     <h2>{document.title}</h2>
     <small>{document.source?.name} · {document.state}</small>
-    {document.message ? <p>{document.message}</p> : null}
+    {document.message && !hasMessageElement(document) ? <p>{document.message}</p> : null}
     {(document.pages ?? []).map((page: any) => <section key={page.id} aria-label={page.title ?? page.id}>
       {page.title ? <h3>{page.title}</h3> : null}
       {page.elements.map((element: any, index: number) => renderElement(element, `${page.id}-${index}`, actions, onAction))}

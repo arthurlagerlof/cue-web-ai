@@ -105,6 +105,14 @@ export function assertDisplayDocument(document, options) {
   return document;
 }
 
+export function hasMessageElement(document) {
+  if (typeof document?.message !== 'string') return false;
+  const containsMessage = elements => Array.isArray(elements) && elements.some(element =>
+    (element.type === 'text' && element.text === document.message)
+    || (element.type === 'container' && containsMessage(element.children)));
+  return document.pages?.some(page => containsMessage(page.elements)) ?? false;
+}
+
 /** @param {{id: string, title: string, source: {app: string, name: string}, state?: string, elements?: any[], actions?: any[], assets?: any[], pageTitle?: string, message?: string, metadata?: object}} options */
 export function createDisplayDocument({ id, title, source, state = 'ready', elements = [], actions = [], assets = [], pageTitle, message, metadata }) {
   const document = { schema: 'cue.display', version: 1, id, title, source, state, pages: [{ id: `${id}-page-1`, ...(pageTitle ? { title: pageTitle } : {}), elements }], actions, assets, ...(message ? { message } : {}), ...(metadata ? { metadata } : {}) };

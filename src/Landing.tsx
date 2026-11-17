@@ -3,7 +3,7 @@ import watchAppSource from '../watch/bangle-app.js?raw';
 import { navigateTo } from './navigation';
 import { watch } from './services/watch';
 import type { UserDatabase } from './storage/userDatabase';
-import { calculateStatistics, flushTelemetryQueue, type StatisticsSummary } from './statistics';
+import { calculateStatistics, flushTelemetryQueue, type ModeStatistics, type StatisticsSummary } from './statistics';
 
 const WatchModel = lazy(() => import('./components/WatchModel'));
 
@@ -20,15 +20,12 @@ function parseStatistics(value: unknown): StatisticsSummary {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new TypeError('The statistics response is invalid.');
   const source = value as Partial<StatisticsSummary>;
   if (!Number.isSafeInteger(source.sampleSize) || (source.sampleSize ?? -1) < 0
-    || !Number.isSafeInteger(source.baselineSampleSize) || (source.baselineSampleSize ?? -1) < 0
-    || typeof source.baselineModel !== 'string' || !Array.isArray(source.localModels)
+    || !Array.isArray(source.localModels)
     || source.localModels.some(model => typeof model !== 'string')
-    || !Array.isArray(source.byMode) || !Array.isArray(source.byExternalModel)) {
+    || !Array.isArray(source.byMode) || !Array.isArray(source.byExternalModel) || !Array.isArray(source.bySelectedMode)) {
     throw new TypeError('The statistics response is invalid.');
   }
-  for (const name of ['averageExternalApiCalls', 'averageBaselineApiCalls', 'averageApiCallsSaved',
-    'averagePercentApiCallsAvoided', 'totalApiCallsSaved', 'averageResponseMs',
-    'averageBaselineResponseMs', 'averageTimeSavedMs', 'averageLocalInferenceMs',
+  for (const name of ['averageExternalApiCalls', 'averageResponseMs', 'averageLocalInferenceMs',
     'averageExternalAiMs', 'averageToolExecutionMs', 'completionRate', 'toolSuccessRate'] as const) {
     const item = source[name];
     if (item !== null && (typeof item !== 'number' || !Number.isFinite(item))) throw new TypeError(`The ${name} statistic is invalid.`);
@@ -65,24 +62,69 @@ function formatPercent(value: number | null) {
   return value === null ? '—' : `${value.toFixed(1)}%`;
 }
 
+const modeLabels = { web_ai: 'Local only', automatic: 'Automatic', dots3_always: 'Always Dots 3' } as const;
+const comparisonMetrics: Array<{
+  label: string;
+  field: keyof ModeStatistics;
+  unit: string;
+  scale?: number;
+  sample: (mode: ModeStatistics) => number;
+}> = [
+  { label: 'External AI calls per request', field: 'averageExternalApiCalls', unit: 'calls', sample: mode => mode.requests },
+  { label: 'Response time', field: 'averageResponseMs', unit: 'ms', sample: mode => mode.requests },
+  { label: 'Local inference time', field: 'averageLocalInferenceMs', unit: 'ms', sample: mode => mode.requests },
+  { label: 'External AI latency per call', field: 'averageExternalCallLatencyMs', unit: 'ms', sample: mode => mode.externalCalls },
+  { label: 'Completion rate', field: 'completionRate', unit: '%', scale: 100, sample: mode => mode.requests },
+  { label: 'Tool success rate', field: 'toolSuccessRate', unit: '%', scale: 100, sample: mode => mode.toolCalls },
+  { label: 'Input tokens per request', field: 'averageInputTokens', unit: 'tokens', sample: mode => mode.tokenSampleSize },
+  { label: 'Output tokens per request', field: 'averageOutputTokens', unit: 'tokens', sample: mode => mode.tokenSampleSize },
+];
+
+function ModeComparisons({ modes }: { modes: ModeStatistics[] }) {
+  return <>
+    <h4>Measured comparisons by selected mode</h4>
+    <p>These are unpaired requests, not controlled runs of the same request. Small samples may be unreliable. Token averages include requests with complete reported token counts, including zero for requests without external calls.</p>
+    {comparisonMetrics.map(metric => {
+      const values = modes.map(mode => {
+        const value = mode[metric.field];
+        return typeof value === 'number' ? value * (metric.scale ?? 1) : null;
+      });
+      const max = Math.max(0, ...values.filter((value): value is number => value !== null));
+      const differences = modes.flatMap((mode, index) => modes.slice(index + 1).flatMap((other, offset) => {
+        const otherIndex = index + offset + 1;
+        const left = values[index];
+        const right = values[otherIndex];
+        if (left === null || right === null || !metric.sample(mode) || !metric.sample(other)) return [];
+        return [`${modeLabels[mode.mode]} − ${modeLabels[other.mode]}: ${formatAverage(left - right)} ${metric.unit === '%' ? 'percentage points' : metric.unit}`];
+      }));
+      return <div className="statistics-comparison" key={metric.field}>
+        <h5>{metric.label}</h5>
+        {modes.map((mode, index) => <div className="statistics-bar-row" key={mode.mode}>
+          <span>{modeLabels[mode.mode]}</span>
+          <div className="statistics-bar-track" aria-hidden="true"><div className="statistics-bar" style={{ width: `${max && values[index] !== null ? values[index]! / max * 100 : 0}%` }} /></div>
+          <span>{values[index] === null ? '—' : `${formatAverage(values[index])} ${metric.unit}`} (n={metric.sample(mode)})</span>
+        </div>)}
+        {differences.length > 0 && <p>{differences.join(' · ')}</p>}
+      </div>;
+    })}
+    <p>{modes.map(mode => `${modeLabels[mode.mode]}: ${mode.requests} requests (${mode.periodStart && mode.periodEnd ? `${new Date(mode.periodStart).toLocaleDateString()} – ${new Date(mode.periodEnd).toLocaleDateString()}` : 'no data'})`).join(' · ')}</p>
+  </>;
+}
+
 function StatisticsSummaryView({ title, stats, local = false }: { title: string; stats: StatisticsSummary; local?: boolean }) {
   const period = stats.periodStart && stats.periodEnd
     ? `${new Date(stats.periodStart).toLocaleDateString()} – ${new Date(stats.periodEnd).toLocaleDateString()}`
     : 'No completed requests yet';
   return <div className="statistics-summary">
     <h3>{title}</h3>
-    <p>{stats.sampleSize.toLocaleString()} requests · {period} · baseline: {stats.baselineModel} ({stats.baselineSampleSize} measured requests)</p>
+    <p>{stats.sampleSize.toLocaleString()} requests · {period}</p>
     <dl className="statistics-highlights">
       <div><dt>Average external API calls / request</dt><dd>{formatAverage(stats.averageExternalApiCalls)}</dd></div>
-      <div><dt>Average API calls saved / request*</dt><dd>{formatAverage(stats.averageApiCallsSaved)}</dd></div>
-      <div><dt>Average API calls avoided*</dt><dd>{formatPercent(stats.averagePercentApiCallsAvoided)}</dd></div>
       <div><dt>Average response time</dt><dd>{formatAverage(stats.averageResponseMs)} ms</dd></div>
-      <div><dt>Average time saved / request*</dt><dd>{stats.averageTimeSavedMs === null ? '—' : `${formatAverage(stats.averageTimeSavedMs)} ms`}</dd></div>
       <div><dt>Completion rate</dt><dd>{formatPercent(stats.completionRate === null ? null : stats.completionRate * 100)}</dd></div>
       <div><dt>Tool success rate</dt><dd>{formatPercent(stats.toolSuccessRate === null ? null : stats.toolSuccessRate * 100)}</dd></div>
     </dl>
-    {stats.baselineSampleSize === 0 && <p>Insufficient Dots3-only baseline data; savings are not calculated.</p>}
-    {stats.baselineSampleSize > 0 && <p>*Savings are estimates from the measured Dots3-only average, not paired counterfactual runs.</p>}
+    <ModeComparisons modes={stats.bySelectedMode} />
     <h4>Average timing by execution mode</h4>
     {stats.byMode.length
       ? <div className="statistics-table-wrap"><table className="statistics-table">
@@ -105,7 +147,6 @@ function StatisticsSummaryView({ title, stats, local = false }: { title: string;
     <details>
       <summary>Supplementary totals</summary>
       <p>{stats.sampleSize.toLocaleString()} requests · {stats.totalExternalApiCalls.toLocaleString()} external API calls · {stats.totalToolCalls.toLocaleString()} tool calls ({stats.totalToolFailures.toLocaleString()} failed) · {stats.totalClarifications.toLocaleString()} clarifications · {stats.multiStepRequests.toLocaleString()} multi-step requests · {formatAverage(stats.inputTokens, 0)} input and {formatAverage(stats.outputTokens, 0)} output tokens reported on {stats.tokenUsageCalls.toLocaleString()} calls.</p>
-      <p>{stats.totalApiCallsSaved === null ? 'Cumulative API call savings unavailable without a measured baseline.' : `Estimated cumulative API calls saved vs the measured Dots3 baseline average: ${formatAverage(stats.totalApiCallsSaved)}.`}</p>
     </details>
   </div>;
 }
@@ -207,14 +248,14 @@ export default function Landing() {
       .then(async openedDatabase => {
         const [records, sharing] = await Promise.all([
           openedDatabase.getRequestStatistics(),
-          openedDatabase.getPreference<boolean>('sharePublicTelemetry'),
+          openedDatabase.getPreference<boolean>('sharePublicTelemetryWithRequestText'),
         ]);
         if (!active) return;
         telemetryDatabase = openedDatabase;
         setDatabase(openedDatabase);
         setLocalUsage(calculateStatistics(records));
         setSharingEnabled(sharing === true);
-        if (sharing === true) retryTelemetry();
+        retryTelemetry();
       })
       .catch(error => {
         if (active) setSharingStatus(`Local browser storage is unavailable: ${error instanceof Error ? error.message : String(error)}`);
@@ -284,7 +325,8 @@ export default function Landing() {
     setSharingEnabled(enabled);
     setSharingStatus('');
     try {
-      await database.setPreference('sharePublicTelemetry', enabled);
+      if (enabled && await database.getPreference<boolean>('sharePublicTelemetryWithRequestText') !== true) await database.clearPendingTelemetry();
+      await database.setPreference('sharePublicTelemetryWithRequestText', enabled);
       if (enabled) {
         const result = await flushTelemetryQueue(database);
         setSharingStatus(result.failed ? 'Some opted-in uploads are queued for retry.' : 'Automatic sharing is enabled for future requests.');
@@ -366,7 +408,7 @@ export default function Landing() {
     <section className="landing-statistics" aria-labelledby="statistics-title">
       <div className="statistics-inner">
         <h2 id="statistics-title">Statistics</h2>
-        <p>Request averages are shown with sample size and period. Public statistics contain aggregates only; raw request records remain in this browser.</p>
+        <p>Request averages are shown with sample size and period. Public statistics show aggregates; opted-in request records are also stored on the server.</p>
         {globalBusy
           ? <p role="status">Loading global statistics…</p>
           : globalError
@@ -379,8 +421,8 @@ export default function Landing() {
             <input type="checkbox" checked={sharingEnabled} disabled={!database} onChange={event => void toggleSharing(event.target.checked)} />
             Opt in to automatic public telemetry.
           </label>
-          <p>Off by default. When enabled, Cue uploads one privacy-limited statistics record after each request. It includes execution mode, model names, timing, token counts, tool counts, clarification and completion counts, and a random request ID used only for deduplication. Cue never uploads prompts, transcripts, responses, tool arguments, provider records, account details, or a browser identifier.</p>
-          <p>Failed or offline uploads stay queued locally and retry later. Turning sharing off removes queued uploads; already included public aggregates cannot be withdrawn. No extra AI calls are made for statistics.</p>
+          <p>Off by default. When enabled, Cue uploads the actual request text, including transcribed speech, together with execution mode, model names, timing, token and tool counts, completion status, and a random request ID. Request text may contain sensitive information; do not opt in if you do not want it stored. Requests over 100 KB are not shared. Existing telemetry users must opt in again.</p>
+          <p>Records are stored in the database until manually deleted and can be accessed by database administrators; the public statistics endpoint shows aggregates only. Responses, tool arguments, provider records, account details and browser identifiers are not included. Failed uploads retry; turning sharing off removes queued uploads but does not delete records already sent. No extra AI calls are made for statistics.</p>
           {sharingStatus && <p role="status">{sharingStatus}</p>}
           <p>Global aggregates include opted-in records only. Use Refresh to fetch the latest public aggregate.</p>
           <button disabled={globalBusy} onClick={() => void loadGlobalUsage()}>Refresh public statistics</button>

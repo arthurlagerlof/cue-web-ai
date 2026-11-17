@@ -1,4 +1,4 @@
-import { validateArguments } from './toolRegistry.js';
+import { schemaForPrompt, validateArguments } from './toolRegistry.js';
 
 const responseProperties = new Set(['status', 'arguments', 'missing', 'ambiguous', 'provenance']);
 const provenanceValues = new Set(['current_user_request', 'previous_conversation', 'model_extracted', 'model_generated', 'inferred']);
@@ -66,15 +66,14 @@ export function buildArgumentNormalizationPrompt({
   currentDate,
 }) {
   return [
-    'You normalize arguments for an already selected local tool. Never select a tool, provider, or action and never execute anything.',
-    'Return exactly one JSON object with keys status, arguments, missing, ambiguous, provenance. No markdown or extra keys.',
-    'Use only arguments allowed by the supplied JSON Schema. Preserve explicit user values. Do not invent dates, times, attendee names, IDs, or facts.',
-    'For source text, transform only facts present in that text. For an explicit flashcard-generation request about a topic, concise front/back content may be model_generated and must be reviewed by the user.',
+    'Handle arguments only for the selected tool; never choose or execute an action.',
+    'Return one JSON object with status, arguments, missing, ambiguous, provenance; no markdown or extra keys. Follow the supplied schema, preserve explicit values, and never invent dates, times, people, IDs, or facts.',
+    'Transform source text using only its facts. For explicit flashcard generation about a topic, concise front/back content may be model_generated and must be reviewed by the user.',
     JSON.stringify({
       originalRequest,
       currentRequest: request,
       recentConversation: conversation,
-      selectedTool: { id: tool.id, name: tool.name, description: tool.description, inputSchema: tool.parameters },
+      selectedTool: { id: tool.id, name: tool.name, description: tool.description, inputSchema: schemaForPrompt(tool.parameters) },
       deterministicArguments,
       missing,
       ambiguous,

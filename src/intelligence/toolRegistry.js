@@ -43,6 +43,21 @@ export function validateArguments(schema, value, path = '$') {
   return { valid: errors.length === 0, errors };
 }
 
+export function schemaForPrompt(schema) {
+  if (Array.isArray(schema)) return schema.map(schemaForPrompt);
+  if (!schema || typeof schema !== 'object') return schema;
+  const result = {};
+  for (const [key, value] of Object.entries(schema)) {
+    if (key === 'x-cue' && value && typeof value === 'object' && !Array.isArray(value)) {
+      const { acceptedSources, ...promptMetadata } = value;
+      if (Object.keys(promptMetadata).length) result[key] = schemaForPrompt(promptMetadata);
+    } else {
+      result[key] = schemaForPrompt(value);
+    }
+  }
+  return result;
+}
+
 export function validateToolDefinition(tool) {
   if (!tool || typeof tool !== 'object' || !idPattern.test(tool.id ?? '')) throw new TypeError('Tool id must be a qualified id such as provider.operation');
   if (typeof tool.providerId !== 'string' || !tool.providerId || typeof tool.name !== 'string' || !tool.name || typeof tool.description !== 'string' || !tool.description) throw new TypeError(`Tool ${tool.id} requires providerId, name, and description`);

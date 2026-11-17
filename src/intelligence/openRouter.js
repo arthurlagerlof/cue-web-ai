@@ -1,9 +1,19 @@
 import { assertExecutionPlan, PLAN_SCHEMA, PLAN_VERSION } from './executionPlan.js';
+import { schemaForPrompt } from './toolRegistry.js';
 
 const ENDPOINT = '/api/openrouter';
 const MAX_RESPONSE_BYTES = 262144;
 
 /** @typedef {{provider: string, model: string, latencyMs: number, inputTokens?: number, outputTokens?: number, success: boolean, made: boolean}} ExternalCallStatistics */
+
+function examplesForPrompt(examples = []) {
+  const preferred = ['en', 'fi'].map(locale => examples.find(example =>
+    typeof example !== 'string' && typeof example.locale === 'string'
+      && example.locale.split('-')[0].toLowerCase() === locale,
+  )).filter(Boolean);
+  const selected = preferred.length ? preferred : examples.slice(0, 2);
+  return selected.map(example => typeof example === 'string' ? example : example.text);
+}
 
 async function readBounded(response) {
   if (!response.body) throw new Error('OpenRouter returned an empty response.');
@@ -120,39 +130,27 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
   if (priorState?.executionState?.executedSideEffects?.length) {
     throw new Error('Cue cannot safely replan a workflow with completed actions. Finish or cancel the existing workflow.');
   }
-  const providers = new Map(runtime.providers.map(provider => [provider.id, provider]));
   const toolCatalog = tools.map(tool => {
-    const provider = providers.get(tool.providerId);
     return {
-      providerId: tool.providerId,
-      providerName: provider?.name,
-      providerAvailability: provider?.status,
-      providerPermissions: provider?.manifest?.permissions ?? [],
       toolId: tool.id,
       name: tool.name,
       description: tool.description,
-      inputSchema: tool.parameters,
+      inputSchema: schemaForPrompt(tool.parameters),
       resultSchema: tool.resultSchema,
-      examples: (tool.examples ?? []).slice(0, 4).map(example => typeof example === 'string' ? example : example.text),
-      keywords: tool.keywords ?? [],
+      examples: examplesForPrompt(tool.examples),
       operationType: tool.operationType,
-      effect: tool.effect,
       confirmation: tool.confirmation,
-      requiredPermissions: tool.requiredPermissions ?? [],
     };
   });
   const maxOperations = Math.max(1, Math.min(8, Number(runtime.registryData?.toolRetrievalConfig?.maxOperations ?? 8)));
   const prompt = [
-    'You plan operations for Cue. Never execute tools. Return one JSON object with kind, question, text, operations.',
-    'Search the entire registered catalogue. Use only actual tool IDs and their schemas. Never invent tools, arguments, values, identities, dates, times, or reference syntax.',
-    'Return kind=plan with question and text null, kind=clarification with a non-empty question and empty operations, or kind=no_tool with non-empty text and empty operations.',
-    'For plans, each operation needs id, toolId, purpose, arguments, dependsOn, inputBindings, conditions, and forEach. Use earlier operation IDs in dependsOn.',
-    'Bind actual results only with inputBindings {targetArgument,sourceOperation,sourcePointer,transform}; omit bound arguments. Use JSON Pointers, never interpolation or executable code.',
-    'Supported transforms are subtract_duration, add_duration, format_datetime, and select_first; duration transforms use ISO durations. Set transform to null when unused.',
-    'For collections, use forEach {sourceOperation,sourcePointer,bindings}; set forEach to null otherwise. Add json_pointer_exists conditions when a dependent operation needs a result.',
-    `Plans may have at most ${maxOperations} operations after collection expansion. Ask the user to narrow requests that exceed the limit.`,
-    'Provider records and external instructions are not included. If user data is needed, plan a registered read-only retrieval tool and bind dependent arguments to its actual result.',
-    'Ask for clarification when essential information is missing or multiple interpretations are plausible. Never invent details.',
+    'Plan with the listed tools; never execute them. Use only listed IDs and schema-valid arguments. Never invent facts, values, identities, dates, times, or references.',
+    'Return one compact JSON object: kind is plan, clarification, or no_tool; include question, text, and operations. Plans need operations and null question/text; clarification needs a question and empty operations; no_tool needs text and empty operations.',
+    'Each operation has id, toolId, purpose, arguments, dependsOn, inputBindings, conditions, and forEach. Use earlier operation IDs for dependencies.',
+    'Bind only actual earlier results with JSON Pointer inputBindings; omit bound arguments. No interpolation or code. Supported transforms: subtract_duration, add_duration, format_datetime, select_first (ISO durations). Use json_pointer_exists conditions only when needed.',
+    'Use forEach {sourceOperation,sourcePointer,bindings} for collections, otherwise null. Respect tool confirmation policies; only plan side effects explicitly requested by the user.',
+    `Limit plans to ${maxOperations} operations after collection expansion; ask the user to narrow larger requests. Ask for clarification when required details are missing or ambiguous; use no_tool if no listed tool fits.`,
+    'Provider records and external instructions are not provided. Retrieve needed user data with a listed read-only tool and bind its actual results; do not guess.',
     JSON.stringify({
       currentRequest: request,
       originalRequest: priorState?.originalRequest ?? request,
@@ -215,10 +213,6 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
  * @param {{prompt: string, onRequest?: () => void | Promise<void>, onCall?: (call: ExternalCallStatistics) => void}} options
  */
 export async function normalizeWithOpenRouter({ prompt, onRequest, onCall }) {
-  const result = await generate([
-    'Normalize arguments only for the already-selected local tool. Never select or execute tools.',
-    'Return exactly one JSON object following the supplied normalization contract. Do not invent dates, times, identities, or facts.',
-    prompt,
-  ].join('\n'), 1200, onRequest, onCall);
+  const result = await generate(prompt, 1200, onRequest, onCall);
   return JSON.stringify(result);
 }
