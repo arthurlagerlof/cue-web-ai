@@ -1,7 +1,7 @@
 // App state is private to this run and is released when Bangle.js removes the UI.
 (function () {
   var BM_HEADER = 9, BM_BUFFER = [], BM_MESSAGES = {}, BM_SEEN = {}, BM_TIMERS = [];
-  var BM_MANUAL_ID = 0, BM_STATE = 'home', BM_DOCUMENT, BM_TEXT = '';
+  var BM_MANUAL_ID = 0, BM_STATE = 'home', BM_DOCUMENT;
   var BM_PAGE_LAYOUTS = [], BM_PAGE = 0, BM_SCROLL = 0;
   var BM_CONTEXT = '', BM_PRESS, BM_PRESS_TIMER, BM_IGNORE_TOUCH_UNTIL = 0;
   var BM_ACTIONS = {}, BM_ACTION_ROWS = [];
@@ -83,6 +83,13 @@
     return bytes;
   }
   function bmDecodeUtf8(bytes) {
+    if (typeof E !== 'undefined' && E.toString) {
+      var ascii = true;
+      for (var j = 0; j < bytes.length; j++) {
+        if (bytes[j] >= 128) { ascii = false; break; }
+      }
+      if (ascii) return E.toString(bytes);
+    }
     var result = '';
     for (var i = 0; i < bytes.length;) {
       var first = bytes[i++], code;
@@ -116,12 +123,11 @@
   }
   function bmSetDocument(text) {
     var parsed;
-    BM_TEXT = text;
     BM_DOCUMENT = undefined;
     BM_ACTIONS = {};
     BM_PAGE_LAYOUTS = [];
     try { parsed = JSON.parse(text); } catch (error) { parsed = undefined; }
-    if (parsed && parsed.schema === 'cue.display' && parsed.version === 1 && parsed.pages instanceof Array) {
+    if (parsed && (parsed.schema === 'cue.display' || parsed.schema === 'cue.watch.display') && parsed.version === 1 && parsed.pages instanceof Array) {
       BM_DOCUMENT = parsed;
       (parsed.actions || []).forEach(function (action) { BM_ACTIONS[action.id] = action; });
       BM_CONTEXT = parsed.message || parsed.title || '';
@@ -443,6 +449,14 @@
       if (BM_BUFFER.length < BM_HEADER + length) return;
       var frame = BM_BUFFER.splice(0, BM_HEADER + length), type = frame[3];
       var id = frame[4] | (frame[5] << 8), index = frame[6], count = frame[7], payload = frame.slice(BM_HEADER);
+      if (type === 5 && index === 0 && count === 1 && payload.length === 1 && payload[0] === 1) {
+        bmSetState('thinking');
+        continue;
+      }
+      if (type === 6 && index === 0 && count === 1 && payload.length === 1 && payload[0] === 1) {
+        bmFrame(6, id, 0, 1, [1]);
+        continue;
+      }
       if (type !== 2 || !count || count > 245 || index >= count) continue;
       if (BM_SEEN[id]) { bmFrame(3, id, 0, 1, [0]); continue; }
       var message = BM_MESSAGES[id];
@@ -461,11 +475,18 @@
       if (message.received === count) {
         bmCancel(message.timeout);
         delete BM_MESSAGES[id];
-        var bytes = [];
-        for (var chunk = 0; chunk < count; chunk++) bytes = bytes.concat(message.chunks[chunk]);
+        var bytes = new Uint8Array(message.bytes), offset = 0;
+        for (var chunk = 0; chunk < count; chunk++) {
+          bytes.set(message.chunks[chunk], offset);
+          offset += message.chunks[chunk].length;
+        }
+        message = undefined;
+        frame = undefined;
+        payload = undefined;
         var text;
         try { text = bmDecodeUtf8(bytes); }
         catch (error) { bmSetState('error', 'Received text could not be decoded.'); bmFrame(3, id, 0, 1, [1]); continue; }
+        bytes = undefined;
         BM_STORAGE.write('cue-memory.txt', text);
         bmSetDocument(text);
         BM_SEEN[id] = true;
@@ -476,7 +497,7 @@
   }
   function bmSwipe(direction) {
     if (BM_STATE !== 'result' && BM_STATE !== 'confirmation' && BM_STATE !== 'clarification') return;
-    var next = direction > 0 ? BM_PAGE + 1 : BM_PAGE - 1;
+    var next = direction < 0 ? BM_PAGE + 1 : BM_PAGE - 1;
     if (next < 0 || next >= BM_PAGE_LAYOUTS.length) return;
     BM_PAGE = next;
     BM_SCROLL = 0;

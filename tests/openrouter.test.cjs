@@ -164,6 +164,33 @@ test('direct answers send the original request as conversational text even with 
   assert.match(upstreamRequests[2].messages[0].content, /"registeredTools":\[\]/);
 });
 
+test('direct text answers succeed without parsing or validating model JSON', async t => {
+  const { answerWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  const { handleOpenRouterRequest } = await import('../netlify/functions/openrouter.mjs');
+  const request = 'Why is the Mona Lisa special?';
+  const upstreamRequests = [];
+  t.mock.method(global, 'fetch', async (_url, options) => {
+    const response = await handleOpenRouterRequest({
+      method: 'POST', body: options.body, apiKey: 'test-key', clientIp: 'plain-text-answer-test',
+      fetchImpl: async (_upstreamUrl, upstreamOptions) => {
+        const body = JSON.parse(upstreamOptions.body);
+        upstreamRequests.push(body);
+        return new Response(JSON.stringify({
+          choices: [{ finish_reason: 'stop', message: { content: 'Its technique and mysterious expression make it distinctive.' } }],
+        }), { status: 200 });
+      },
+    });
+    return new Response(response.body, { status: response.statusCode, headers: response.headers });
+  });
+
+  const answer = await answerWithOpenRouter({ request });
+
+  assert.equal(answer, 'Its technique and mysterious expression make it distinctive.');
+  assert.equal(upstreamRequests.length, 1);
+  assert.equal(Object.hasOwn(upstreamRequests[0], 'response_format'), false);
+  assert.equal(upstreamRequests[0].messages[0].content, `Answer naturally and concisely. Do not use tools.\n\n${request}`);
+});
+
 test('clarification waits for a user response and retains context for a direct answer', async t => {
   const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
   const requests = [];

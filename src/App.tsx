@@ -6,7 +6,7 @@ import { createDisplayDocument, validateDisplayDocument } from './display/docume
 import { DisplayDocumentView } from './display/DisplayDocumentView';
 import { createDatabaseEnvironment } from './demo/databaseEnvironment.js';
 import { openBrowserDatabase } from './storage/userDatabase';
-import { normalizeWithOpenRouter, planWithOpenRouter } from './intelligence/openRouter.js';
+import { answerWithOpenRouter, normalizeWithOpenRouter, planWithOpenRouter } from './intelligence/openRouter.js';
 import { navigateTo } from './navigation';
 import watchAppSource from '../watch/bangle-app.js?raw';
 import type { StorageValue } from './storage/storage';
@@ -446,32 +446,51 @@ export default function App() {
     catch (error) { log(error instanceof Error ? error.message : String(error)); }
   }
 
-  async function showDocument(document: any) {
+  async function showDocument(document: any, lightweightLoading = false) {
     const validation = validateDisplayDocument(document, { registry: environment.current?.registry });
     if (!validation.valid) throw new TypeError(`Invalid display document: ${validation.errors.join('; ')}`);
     displayDocumentRef.current = document;
     setDisplayDocument(document);
     if (watch.connected) {
       watchConfirmationRef.current = document.state === 'confirmation_required';
-      await watch.sendDisplayDocument(document);
+      if (lightweightLoading && document.state === 'loading') await watch.sendThinking();
+      else await watch.sendDisplayDocument(document);
     }
   }
 
-  async function processDots3Request(request: string, runtime: any, context: any, resumedExecutionState?: any) {
+  async function processDots3Request(request: string, runtime: any, context: any, resumedExecutionState?: any, directAnswer = false) {
     let response;
     if (resumedExecutionState) {
       response = { kind: 'tool', plan: resumedExecutionState.plan };
       log('Resuming the saved execution plan');
     } else {
       const previous = await getConversationState();
-      log('OpenRouter planning started with the currently registered tool catalog; browser records remain local');
-      response = await planWithOpenRouter({
-        request,
-        context,
-        runtime,
-        priorState: previous,
-        onCall: onExternalCall,
-      });
+      if (directAnswer) {
+        log('OpenRouter direct answer started without a tool plan');
+        response = await answerWithOpenRouter({ request, onCall: onExternalCall }).then(text => ({
+          kind: 'direct_answer',
+          text,
+          state: {
+            conversationId: previous?.status === 'completed' || previous?.status === 'cancelled'
+              ? `conversation_${crypto.randomUUID()}`
+              : previous?.conversationId ?? `conversation_${crypto.randomUUID()}`,
+            status: 'completed',
+            originalRequest: request,
+            pendingQuestion: null,
+            pendingReasoning: false,
+            reasoningHistory: previous?.reasoningHistory ?? [],
+          },
+        }));
+      } else {
+        log('OpenRouter planning started with the currently registered tool catalog; browser records remain local');
+        response = await planWithOpenRouter({
+          request,
+          context,
+          runtime,
+          priorState: previous,
+          onCall: onExternalCall,
+        });
+      }
     }
     if (response.kind === 'clarification') {
       log('External planner requested clarification');
@@ -636,7 +655,7 @@ export default function App() {
     let requestFailed = false;
     setTranscription(clean); setTranscriptInput(clean); setBusy(true);
     try {
-      await showDocument(createDisplayDocument({ id: 'cue-loading', title: 'Working', source: { app: 'cue', name: 'Cue' }, state: 'loading', message: 'Discovering provider tools and preparing a local response.', elements: [{ type: 'text', text: clean, role: 'body' }] }));
+      await showDocument(createDisplayDocument({ id: 'cue-loading', title: 'Working', source: { app: 'cue', name: 'Cue' }, state: 'loading', message: 'Discovering provider tools and preparing a local response.', elements: [{ type: 'text', text: clean, role: 'body' }] }), true);
       const runtime = await getEnvironment(continuePendingLocally);
       const requestNow = clockForRuntime(runtime);
       const context = { now: requestNow, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn };
@@ -721,7 +740,7 @@ export default function App() {
             : outcome.kind === 'no_tool'
               ? 'Local retrieval found no matching tool; trying the configured Dots 3 fallback'
               : 'Tool choice remains uncertain; cross-encoder result unavailable for this outcome; trying the configured Dots 3 fallback');
-        await processDots3Request(clean, runtime, context);
+        await processDots3Request(clean, runtime, context, undefined, outcome.kind === 'no_tool');
         return;
       }
       if (outcome.normalizationError) log(`Argument normalization failed: ${outcome.normalizationError}`);

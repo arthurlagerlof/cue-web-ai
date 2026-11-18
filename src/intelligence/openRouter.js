@@ -100,6 +100,17 @@ async function generate(prompt, maxTokens = 3000, onRequest, onCall, responseFor
   catch { throw new Error('OpenRouter returned invalid JSON.'); }
 }
 
+/**
+ * @param {{request: string, onRequest?: () => void | Promise<void>, onCall?: (call: ExternalCallStatistics) => void}} options
+ */
+export async function answerWithOpenRouter({ request, onRequest, onCall }) {
+  if (typeof request !== 'string' || !request.trim() || request.length > 10000) {
+    throw new TypeError('A request of at most 10,000 characters is required.');
+  }
+  const prompt = `Answer naturally and concisely. Do not use tools.\n\n${request}`;
+  return generate(prompt, 3000, onRequest, onCall, 'text');
+}
+
 function assertOutcomeShape(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
     || !['tool', 'clarification', 'direct_answer'].includes(value.kind)

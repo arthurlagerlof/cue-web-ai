@@ -14,6 +14,7 @@ function loadWatch() {
   let now = 10000;
   let nextTimer = 1;
   let fontSize = 12;
+  let asciiDecodes = 0;
   const context = {
     Date: { now: () => now },
     setTimeout: (callback, delay) => {
@@ -28,6 +29,7 @@ function loadWatch() {
     decodeURIComponent: undefined,
     encodeURI: undefined,
     decodeURI: undefined,
+    E: { toString: bytes => { asciiDecodes++; return Buffer.from(bytes).toString('latin1'); } },
     require: () => ({ read: key => stored[key], write: (key, value) => { stored[key] = value; } }),
     LoopbackA: { setConsole: () => {} },
     Bangle: {
@@ -67,7 +69,7 @@ function loadWatch() {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'watch', 'bangle-app.js'), 'utf8'), context, { filename: 'bangle-app.js' });
   writes.length = 0;
   return {
-    context, listeners, uartListeners, writes, stored, drawings,
+    context, listeners, uartListeners, writes, stored, drawings, asciiDecodes: () => asciiDecodes,
     advance: ms => {
       const target = now + ms;
       while (true) {
@@ -136,12 +138,67 @@ test('display protocol reassembles UTF-8 chunks, acknowledges and persists lates
   const emit = data => watch.uartListeners.data[0](data);
   for (let i = chunks.length - 1; i >= 0; i--) emit(frame(2, 42, i, chunks.length, chunks[i]));
   assert.equal(watch.stored['cue-memory.txt'], 'A memória é importante e muito longa.');
+  assert.equal(watch.asciiDecodes(), 0);
   assert.equal(watch.writes.length, 1);
   assert.equal(watch.writes[0].charCodeAt(3), 3);
   assert.ok(watch.drawings.some(line => line.includes('memória')));
   emit(frame(2, 42, 0, chunks.length, chunks[0]));
   assert.equal(watch.writes.length, 2, 'duplicate delivery is acknowledged without reprocessing');
   assert.equal(watch.writes[1].charCodeAt(3), 3);
+});
+
+test('ASCII payloads use the native byte-to-string fast path', () => {
+  const watch = loadWatch();
+  watch.uartListeners.data[0](frame(2, 46, 0, 1, Array.from(Buffer.from('hello'))));
+  assert.equal(watch.stored['cue-memory.txt'], 'hello');
+  assert.equal(watch.asciiDecodes(), 1);
+  assert.equal(watch.writes[0].charCodeAt(9), 0);
+});
+
+test('lightweight thinking status updates the watch without an acknowledgement', () => {
+  const watch = loadWatch();
+  watch.uartListeners.data[0](frame(5, 47, 0, 1, [1]));
+  assert.ok(watch.drawings.includes('THINKING...'));
+  assert.equal(watch.writes.length, 0);
+  sendDocument(watch, {
+    schema: 'cue.watch.display', version: 1, title: 'Result', state: 'ready',
+    pages: [{ elements: [{ type: 'text', text: 'Finished' }] }], actions: [], assets: [],
+  }, 50);
+  watch.drawings.length = 0;
+  watch.advance(1000);
+  watch.context.ui.redraw();
+  assert.ok(watch.drawings.includes('Finished'));
+  assert.ok(!watch.drawings.includes('THINKING...'));
+});
+
+test('watch advertises support for compact display documents', () => {
+  const watch = loadWatch();
+  watch.uartListeners.data[0](frame(6, 48, 0, 1, [1]));
+  assert.equal(watch.writes.length, 1);
+  assert.deepEqual(Array.from(watch.writes[0], character => character.charCodeAt(0)),
+    [0x42, 0x4d, 1, 6, 48, 0, 0, 1, 1, 1]);
+});
+
+test('compact watch documents preserve text, image placeholders, and action IDs', () => {
+  const watch = loadWatch();
+  sendDocument(watch, {
+    schema: 'cue.watch.display', version: 1, title: 'Compact', state: 'ready',
+    pages: [{ elements: [
+      { type: 'action', actionId: 'open', label: 'Open' },
+      { type: 'text', text: 'Visible text', style: { emphasis: 'strong' } },
+      { type: 'image', assetId: 'diagram' },
+    ] }],
+    actions: [{ id: 'open', label: 'Open' }],
+    assets: [{ id: 'diagram', alt: 'Diagram' }],
+  }, 49);
+  assert.ok(watch.drawings.includes('Compact'));
+  assert.ok(watch.drawings.includes('Visible text'));
+  assert.ok(watch.drawings.includes('Diagram'));
+  watch.writes.length = 0;
+  watch.listeners.touch[0](1, { x: 20, y: 42 });
+  const action = watch.writes.find(value => value.charCodeAt(3) === 4);
+  assert.ok(action);
+  assert.equal(action.slice(9), 'open');
 });
 
 test('slow transfers remain available while chunks are still arriving', () => {
@@ -208,12 +265,12 @@ test('display documents preserve pages and image placeholders while scrolling', 
   assert.ok(watch.drawings.some(line => line.includes('Paragraph 2')), JSON.stringify(watch.drawings));
   assert.ok(!watch.drawings.some(line => line.includes('Paragraph 1')));
 
-  watch.context.ui.swipe(1);
+  watch.context.ui.swipe(-1);
   assert.ok(watch.drawings.includes('Page two'));
   assert.ok(watch.drawings.includes('2 / 3'));
-  watch.context.ui.swipe(1);
-  assert.ok(watch.drawings.includes('Page three'));
   watch.context.ui.swipe(-1);
+  assert.ok(watch.drawings.includes('Page three'));
+  watch.context.ui.swipe(1);
   assert.ok(watch.drawings.includes('Page two'));
 });
 

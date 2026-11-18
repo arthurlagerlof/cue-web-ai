@@ -13,6 +13,25 @@ const MAX_DISPLAY_BYTES = 2450;
 const GATT_CONNECTION_TIMEOUT_MS = 20000;
 let nextMessageId = 1;
 
+function watchDisplayDocument(document: object) {
+  const value = document as Record<string, unknown>;
+  const isRecord = (item: unknown): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item);
+  if (value.schema !== 'cue.display' || value.version !== 1
+    || !Array.isArray(value.pages) || !value.pages.every(isRecord)
+    || !Array.isArray(value.actions) || !value.actions.every(isRecord)
+    || !Array.isArray(value.assets) || !value.assets.every(isRecord)) return document;
+  return {
+    schema: 'cue.watch.display',
+    version: value.version,
+    title: value.title,
+    state: value.state,
+    message: value.message,
+    pages: value.pages.map(page => ({ title: page.title, elements: page.elements })),
+    actions: value.actions.map(action => ({ id: action.id, label: action.label })),
+    assets: value.assets.map(asset => ({ id: asset.id, alt: asset.alt })),
+  };
+}
+
 export class BangleConnection {
   private device?: BangleDevice;
   private characteristic?: GattCharacteristic;
@@ -32,6 +51,9 @@ export class BangleConnection {
   private messages = new Map<number, { count: number; chunks: Map<number, Uint8Array>; timer: number }>();
   private seen = new Set<number>();
   private pendingAcks = new Map<number, (received: boolean) => void>();
+  private pendingCapabilities = new Map<number, () => void>();
+  private projectionSupported?: boolean;
+  private projectionProbe?: Promise<boolean>;
   private rawTestResolver?: (received: boolean) => void;
   private rawTestBuffer = '';
   get connected() { return this.ready && !!this.device?.gatt?.connected; }
@@ -139,6 +161,8 @@ export class BangleConnection {
     this.disconnectListener = undefined;
     this.notificationCharacteristic = undefined;
     this.notificationListener = undefined;
+    this.projectionSupported = undefined;
+    this.projectionProbe = undefined;
   }
 
   private parseFrames(data: Uint8Array) {
@@ -151,6 +175,10 @@ export class BangleConnection {
       const type = this.incoming[3], id = this.incoming[4] | this.incoming[5] << 8;
       const index = this.incoming[6], count = this.incoming[7];
       const payload = this.incoming.slice(HEADER_SIZE, HEADER_SIZE + size); this.incoming = this.incoming.slice(HEADER_SIZE + size);
+      if (type === 6 && count === 1 && index === 0 && payload.length === 1 && payload[0] === 1) {
+        this.pendingCapabilities.get(id)?.();
+        continue;
+      }
       if (type === 3 && count === 1 && index === 0 && payload.length === 1) {
         this.onDiagnostic?.(`ACK frame: id=${id}, status=${payload[0]}, waiting=${this.pendingAcks.has(id)}`);
         this.pendingAcks.get(id)?.(payload[0] === 0);
@@ -297,7 +325,42 @@ export class BangleConnection {
 
   async sendDisplayDocument(document: unknown) {
     if (!document || typeof document !== 'object') throw new TypeError('A Cue Display Document is required.');
-    return this.sendDisplayText(JSON.stringify(document));
+    const supported = await this.supportsWatchProjection();
+    return this.sendDisplayText(JSON.stringify(supported ? watchDisplayDocument(document) : document));
+  }
+
+  private async supportsWatchProjection() {
+    if (!this.characteristic) throw new Error('Connect the Bangle.js before sending a display document.');
+    if (this.projectionSupported !== undefined) return this.projectionSupported;
+    if (this.projectionProbe) return this.projectionProbe;
+    const characteristic = this.characteristic;
+    const probe = (async () => {
+      const id = nextMessageId++ & 0xffff;
+      let timer: number | undefined;
+      const response = new Promise<boolean>(resolve => {
+        this.pendingCapabilities.set(id, () => resolve(true));
+        timer = window.setTimeout(() => resolve(false), 1500);
+      });
+      try {
+        await this.sendFrame(6, id, new Uint8Array([1]));
+        const supported = await response;
+        if (this.characteristic !== characteristic) throw new Error('Watch connection changed during capability detection.');
+        this.projectionSupported = supported;
+        this.onDiagnostic?.(supported ? 'Watch supports compact display documents.' : 'Watch capability probe timed out; using full v1 display documents.');
+        return supported;
+      } finally {
+        if (timer !== undefined) window.clearTimeout(timer);
+        this.pendingCapabilities.delete(id);
+      }
+    })();
+    this.projectionProbe = probe;
+    try { return await probe; }
+    finally { if (this.projectionProbe === probe) this.projectionProbe = undefined; }
+  }
+
+  async sendThinking() {
+    if (!this.characteristic) throw new Error('Connect the Bangle.js before sending a watch status.');
+    await this.sendFrame(5, nextMessageId++ & 0xffff, new Uint8Array([1]));
   }
 
   async sendDisplayText(text: string) {
@@ -306,6 +369,7 @@ export class BangleConnection {
     if (bytes.length > MAX_DISPLAY_BYTES) throw new Error(`Watch display document exceeds ${MAX_DISPLAY_BYTES} UTF-8 bytes.`);
     const chunkSize = 10;
     const id = nextMessageId++ & 0xffff, count = Math.max(1, Math.ceil(bytes.length / chunkSize));
+    const ackTimeoutMs = 10000 + count * 50;
     this.onDiagnostic?.(`Sending ${bytes.length} UTF-8 bytes as ${count} frame(s), id=${id}`);
     let ackStatus: boolean | undefined;
     const acknowledged = new Promise<boolean>(resolve => {
@@ -331,7 +395,7 @@ export class BangleConnection {
         const received = await Promise.race([
           acknowledged,
           new Promise<undefined>(resolve => {
-            timer = window.setTimeout(() => resolve(undefined), 10000);
+            timer = window.setTimeout(() => resolve(undefined), ackTimeoutMs);
           }),
         ]);
         if (timer !== undefined) window.clearTimeout(timer);

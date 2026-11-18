@@ -45,6 +45,7 @@ Without that function and database configuration, Cue continues to work and keep
 - `src/intelligence/openRouter.js` sends bounded prompts to the same-origin server proxy. The Netlify function or local Vite middleware adds the server-only key; plans are checked against the locally registered tool catalog and execution-plan contract before dispatch.
 - `src/display/schema/cue-display-v1.schema.json` defines Cue Display Document v1. The shared validator checks nested elements, actions, asset references, and registered-tool arguments before rendering.
 - `/landing` and `/app` are client-side routes. A shared Bangle connection manager keeps watch state alive across route changes; the watch is optional.
+- The browser negotiates a compact watch-only representation of Display Documents; older watch apps receive the original v1 document instead. Request loading uses a lightweight watch status frame. Display transfers still have a 2,450-byte UTF-8 limit, and larger results are not yet streamed to the watch.
 
 ## Tests and limitations
 
