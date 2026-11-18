@@ -158,10 +158,41 @@ test('direct answers send the original request as conversational text even with 
   for (const index of [0, 2]) {
     assert.deepEqual(upstreamRequests[index].response_format, { type: 'json_object' });
     assert.match(upstreamRequests[index].messages[0].content, /direct_answer/);
-    assert.equal(upstreamRequests[index + 1].messages[0].content, request);
+    assert.equal(upstreamRequests[index + 1].messages[0].content, `Answer naturally and concisely. Do not use tools.\n\n${request}`);
     assert.equal(Object.hasOwn(upstreamRequests[index + 1], 'response_format'), false);
   }
   assert.match(upstreamRequests[2].messages[0].content, /"registeredTools":\[\]/);
+});
+
+test('planner direct answers with text are returned without another model call', async t => {
+  const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  let calls = 0;
+  t.mock.method(global, 'fetch', async () => {
+    calls++;
+    return new Response(JSON.stringify({
+      choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({
+        kind: 'direct_answer', question: null, text: "That's wonderful to hear!", operations: [],
+      }) } }],
+    }), { status: 200 });
+  });
+  const result = await planWithOpenRouter({ request: 'I feel great', context: {}, runtime: testRuntime() });
+  assert.equal(result.text, "That's wonderful to hear!");
+  assert.equal(result.state.status, 'completed');
+  assert.equal(calls, 1);
+});
+
+test('planner rejects direct answers with empty text or operations', async t => {
+  const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  for (const response of [
+    { kind: 'direct_answer', question: null, text: ' ', operations: [] },
+    { kind: 'direct_answer', question: null, text: 'Answer', operations: [{}] },
+  ]) {
+    const fetch = t.mock.method(global, 'fetch', async () => new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify(response) } }],
+    }), { status: 200 }));
+    await assert.rejects(planWithOpenRouter({ request: 'Hello', context: {}, runtime: testRuntime() }), /invalid direct-answer response/);
+    fetch.mock.restore();
+  }
 });
 
 test('direct text answers succeed without parsing or validating model JSON', async t => {
@@ -213,7 +244,7 @@ test('clarification waits for a user response and retains context for a direct a
   const answer = await planWithOpenRouter({ request: 'The Mona Lisa', context: {}, runtime, priorState: clarification.state });
   assert.equal(answer.kind, 'direct_answer');
   assert.equal(answer.state.pendingReasoning, false);
-  assert.equal(requests[2].prompt, 'Why is that painting special?\n\nWhich painting?\nThe Mona Lisa');
+  assert.equal(requests[2].prompt, 'Answer naturally and concisely. Do not use tools.\n\nWhy is that painting special?\n\nWhich painting?\nThe Mona Lisa');
 });
 
 test('web search is selected and dispatched as a registered tool', async t => {

@@ -14,7 +14,7 @@ Cue is a browser-first assistant demo for trusted, registered tools. Normal app 
 
 OpenRouter requests time out after 55 seconds at the proxy, with a 60-second browser limit. Hosting platforms may impose shorter limits. If requests continue timing out, retry or use **Web AI** mode.
 
-For Dots 3 Note Preview, Cue requests non-reasoning mode and asks for JSON planning responses to reduce latency. When no tool is needed, it sends the request to Dots 3 for a conversational answer. Actual latency and support for this setting depend on the OpenRouter provider; other configured models keep their default reasoning settings.
+For Dots 3 Note Preview, Cue requests non-reasoning mode and asks for JSON planning responses to reduce latency. When no tool is needed, it uses the planner's conversational answer, or requests one separately if the planner returns no answer text. Actual latency and support for this setting depend on the OpenRouter provider; other configured models keep their default reasoning settings.
 
 Python is not required for app operation. The browser seeds from version-controlled synthetic JSON fixtures; the old SQLite baseline and Python backend have been removed.
 
@@ -45,7 +45,7 @@ Without that function and database configuration, Cue continues to work and keep
 - `src/intelligence/openRouter.js` sends bounded prompts to the same-origin server proxy. The Netlify function or local Vite middleware adds the server-only key; plans are checked against the locally registered tool catalog and execution-plan contract before dispatch.
 - `src/display/schema/cue-display-v1.schema.json` defines Cue Display Document v1. The shared validator checks nested elements, actions, asset references, and registered-tool arguments before rendering.
 - `/landing` and `/app` are client-side routes. A shared Bangle connection manager keeps watch state alive across route changes; the watch is optional.
-- The browser negotiates a compact watch-only representation of Display Documents; older watch apps receive the original v1 document instead. Request loading uses a lightweight watch status frame. Display transfers still have a 2,450-byte UTF-8 limit, and larger results are not yet streamed to the watch.
+- The browser negotiates a compact watch-only representation of Display Documents; older watch apps receive the original v1 document instead. Plain Dots 3 answers are sent as text to avoid duplicating them in the watch document. The watch shows thinking while a request runs, then loading while a response is transferred. Display transfers still have a 2,450-byte UTF-8 limit, and larger results are not yet streamed to the watch. Reinstall the watch app after updating it.
 
 ## Tests and limitations
 

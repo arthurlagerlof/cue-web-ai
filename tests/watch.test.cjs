@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 
-function loadWatch() {
+function loadWatch({ parseJson } = {}) {
   const listeners = {};
   const uartListeners = {};
   const writes = [];
@@ -17,6 +17,7 @@ function loadWatch() {
   let asciiDecodes = 0;
   const context = {
     Date: { now: () => now },
+    ...(parseJson ? { JSON: { parse: parseJson } } : {}),
     setTimeout: (callback, delay) => {
       const id = nextTimer++;
       timers.set(id, { callback, due: now + delay });
@@ -100,7 +101,7 @@ function sendDocument(watch, document, id = 42) {
 test('ready screen shows tap and hold instructions', () => {
   const watch = loadWatch();
   assert.ok(watch.drawings.includes('Cue.'));
-  assert.ok(watch.drawings.includes('cue_logo.png'));
+  assert.ok(!watch.drawings.includes('cue_logo.png'));
   assert.ok(watch.drawings.includes('Tap for last 10 seconds'));
   assert.ok(watch.drawings.includes('Hold for a longer'));
   assert.ok(watch.drawings.includes('recording'));
@@ -155,6 +156,33 @@ test('ASCII payloads use the native byte-to-string fast path', () => {
   assert.equal(watch.writes[0].charCodeAt(9), 0);
 });
 
+test('plain conversational answers render without a display document', () => {
+  const watch = loadWatch();
+  const text = "That's wonderful to hear! I'm glad you're feeling better.";
+  const bytes = Array.from(new TextEncoder().encode(text));
+  const chunks = [];
+  for (let i = 0; i < bytes.length; i += 10) chunks.push(bytes.slice(i, i + 10));
+  chunks.forEach((chunk, index) => watch.uartListeners.data[0](frame(2, 51, index, chunks.length, chunk)));
+  assert.equal(watch.stored['cue-memory.txt'], text);
+  assert.ok(watch.drawings.some(line => line.includes("wonderful")));
+  assert.equal(watch.writes[0].charCodeAt(9), 0);
+});
+
+test('failed display document parsing reports an error instead of showing raw JSON', () => {
+  const watch = loadWatch({ parseJson: () => { throw new Error('parse failure'); } });
+  const document = {
+    schema: 'cue.watch.display', version: 1, title: 'Dots 3 response', state: 'ready',
+    pages: [{ elements: [{ type: 'text', text: 'Answer' }] }], actions: [], assets: [],
+  };
+  sendDocument(watch, document, 52);
+  assert.ok(watch.drawings.includes('ERROR'));
+  assert.ok(!watch.drawings.some(line => line.includes('cue.watch.display')));
+  assert.equal(watch.writes[0].charCodeAt(9), 1);
+  assert.equal(watch.stored['cue-memory.txt'], undefined);
+  sendDocument(watch, document, 52);
+  assert.equal(watch.writes[1].charCodeAt(9), 1);
+});
+
 test('lightweight thinking status updates the watch without an acknowledgement', () => {
   const watch = loadWatch();
   watch.uartListeners.data[0](frame(5, 47, 0, 1, [1]));
@@ -169,6 +197,40 @@ test('lightweight thinking status updates the watch without an acknowledgement',
   watch.context.ui.redraw();
   assert.ok(watch.drawings.includes('Finished'));
   assert.ok(!watch.drawings.includes('THINKING...'));
+});
+
+test('watch shows loading while a response is arriving, then shows the result', () => {
+  const watch = loadWatch();
+  const emit = data => watch.uartListeners.data[0](data);
+  emit(frame(5, 47, 0, 1, [1]));
+  watch.drawings.length = 0;
+  emit(frame(2, 53, 1, 2, Array.from(Buffer.from(' world'))));
+  assert.ok(watch.drawings.includes('LOADING...'));
+  assert.match(watch.drawings.join(' '), /Response ready\. Sending to watch\./);
+  assert.equal(watch.writes.length, 0);
+
+  watch.drawings.length = 0;
+  emit(frame(2, 53, 0, 2, Array.from(Buffer.from('Hello'))));
+  assert.ok(watch.drawings.includes('Hello world'));
+  assert.equal(watch.writes[0].charCodeAt(9), 0);
+  watch.drawings.length = 0;
+  emit(frame(2, 53, 1, 2, Array.from(Buffer.from(' world'))));
+  assert.ok(!watch.drawings.includes('LOADING...'), 'retries of a completed message do not replace the result');
+});
+
+test('an interrupted transfer reports a timeout and can load a retry', () => {
+  const watch = loadWatch();
+  const emit = data => watch.uartListeners.data[0](data);
+  emit(frame(2, 54, 0, 2, Array.from(Buffer.from('Hello'))));
+  watch.drawings.length = 0;
+  watch.advance(10000);
+  assert.ok(watch.drawings.includes('ERROR'));
+  assert.match(watch.drawings.join(' '), /Transfer timed out/);
+  watch.drawings.length = 0;
+  emit(frame(2, 54, 0, 2, Array.from(Buffer.from('Hello'))));
+  assert.ok(watch.drawings.includes('LOADING...'));
+  emit(frame(2, 54, 1, 2, Array.from(Buffer.from(' world'))));
+  assert.ok(watch.drawings.includes('Hello world'));
 });
 
 test('watch advertises support for compact display documents', () => {

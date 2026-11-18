@@ -446,7 +446,7 @@ export default function App() {
     catch (error) { log(error instanceof Error ? error.message : String(error)); }
   }
 
-  async function showDocument(document: any, lightweightLoading = false) {
+  async function showDocument(document: any, lightweightLoading = false, watchText?: string) {
     const validation = validateDisplayDocument(document, { registry: environment.current?.registry });
     if (!validation.valid) throw new TypeError(`Invalid display document: ${validation.errors.join('; ')}`);
     displayDocumentRef.current = document;
@@ -454,6 +454,7 @@ export default function App() {
     if (watch.connected) {
       watchConfirmationRef.current = document.state === 'confirmation_required';
       if (lightweightLoading && document.state === 'loading') await watch.sendThinking();
+      else if (watchText !== undefined) await watch.sendDisplayText(watchText);
       else await watch.sendDisplayDocument(document);
     }
   }
@@ -526,7 +527,7 @@ export default function App() {
         state: 'ready',
         message: response.text,
         elements: [{ type: 'text', text: response.text, role: 'body' }],
-      }));
+      }), false, response.text);
       return;
     }
     if (response.kind !== 'tool' || !response.plan) throw new TypeError('Dots 3 returned an unsupported reasoning outcome.');

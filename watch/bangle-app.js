@@ -1,7 +1,7 @@
 // App state is private to this run and is released when Bangle.js removes the UI.
 (function () {
   var BM_HEADER = 9, BM_BUFFER = [], BM_MESSAGES = {}, BM_SEEN = {}, BM_TIMERS = [];
-  var BM_MANUAL_ID = 0, BM_STATE = 'home', BM_DOCUMENT;
+  var BM_MANUAL_ID = 0, BM_STATE = 'home', BM_DOCUMENT, BM_LOADING_ID;
   var BM_PAGE_LAYOUTS = [], BM_PAGE = 0, BM_SCROLL = 0;
   var BM_CONTEXT = '', BM_PRESS, BM_PRESS_TIMER, BM_IGNORE_TOUCH_UNTIL = 0;
   var BM_ACTIONS = {}, BM_ACTION_ROWS = [];
@@ -28,7 +28,7 @@
     if (BM_PRESS_TIMER !== undefined) bmCancel(BM_PRESS_TIMER);
     BM_PRESS_TIMER = undefined;
     BM_PRESS = undefined;
-    if (state === 'home' || state === 'recording' || state === 'thinking') BM_DOCUMENT = undefined;
+    if (state === 'home' || state === 'recording' || state === 'thinking' || state === 'loading') BM_DOCUMENT = undefined;
     BM_STATE = state;
     BM_CONTEXT = context || '';
     BM_SCROLL = 0;
@@ -148,6 +148,10 @@
         bmAddElements(layout, page.elements || [], 0);
         BM_PAGE_LAYOUTS.push(layout);
       });
+    } else if ((parsed && (parsed.schema === 'cue.display' || parsed.schema === 'cue.watch.display'))
+      || /^\s*\{\s*"schema"\s*:\s*"cue\.(watch\.)?display"/.test(text)) {
+      bmSetState('error', 'Could not parse display document.');
+      return false;
     } else {
       BM_STATE = 'result';
       var layout = { rows: [], cursor: 0 };
@@ -158,6 +162,7 @@
     BM_PAGE = 0;
     BM_SCROLL = 0;
     bmDraw();
+    return true;
   }
   function bmSummary(elements) {
     var lines = [];
@@ -306,9 +311,7 @@
     g.setFontAlign(-1, -1);
     g.drawString('Cue.', 12, 10);
     g.fillCircle(BM_SCREEN_WIDTH / 2, 73, 7);
-    g.setFont('Vector', 9);
     g.setFontAlign(0, -1);
-    g.drawString('cue_logo.png', BM_SCREEN_WIDTH / 2, 86);
     g.setFont('Vector', 13);
     g.drawString('Tap for last 10 seconds', BM_SCREEN_WIDTH / 2, 111);
     g.setFont('Vector', 12);
@@ -424,6 +427,7 @@
     if (BM_STATE === 'home') bmDrawHome();
     else if (BM_STATE === 'recording') bmDrawRecording();
     else if (BM_STATE === 'thinking') bmDrawThinking();
+    else if (BM_STATE === 'loading') bmDrawState('LOADING...', 'Response ready. Sending to watch.');
     else if (BM_STATE === 'confirmation') bmDrawConfirmation();
     else if (BM_STATE === 'clarification') {
       bmDrawResult();
@@ -462,11 +466,18 @@
       var message = BM_MESSAGES[id];
       if (!message) {
         message = BM_MESSAGES[id] = { count: count, chunks: {}, received: 0, bytes: 0 };
+        if (count > 1) {
+          BM_LOADING_ID = id;
+          bmSetState('loading');
+        }
       }
       if (message.count !== count || message.chunks[index]) continue;
       bmCancel(message.timeout);
       (function (messageId, currentMessage) {
-        currentMessage.timeout = bmSchedule(function () { delete BM_MESSAGES[messageId]; }, 10000);
+        currentMessage.timeout = bmSchedule(function () {
+          delete BM_MESSAGES[messageId];
+          if (BM_STATE === 'loading' && BM_LOADING_ID === messageId) bmSetState('error', 'Transfer timed out. Retrying may help.');
+        }, 10000);
       })(id, message);
       message.bytes += payload.length;
       if (message.bytes > 2450) { bmCancel(message.timeout); delete BM_MESSAGES[id]; continue; }
@@ -487,8 +498,8 @@
         try { text = bmDecodeUtf8(bytes); }
         catch (error) { bmSetState('error', 'Received text could not be decoded.'); bmFrame(3, id, 0, 1, [1]); continue; }
         bytes = undefined;
+        if (!bmSetDocument(text)) { bmFrame(3, id, 0, 1, [1]); continue; }
         BM_STORAGE.write('cue-memory.txt', text);
-        bmSetDocument(text);
         BM_SEEN[id] = true;
         (function (seenId) { bmSchedule(function () { delete BM_SEEN[seenId]; }, 60000); })(id);
         bmFrame(3, id, 0, 1, [0]);
