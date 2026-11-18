@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { RollingAudio } from './services/audio';
 import { watch } from './services/watch';
 import { ASR_MODELS, type ASRModelSize } from './services/asrModels';
-import { createDisplayDocument, validateDisplayDocument } from './display/document.js';
+import { createDisplayDocument, parseDisplayDocument, validateDisplayDocument } from './display/document.js';
 import { DisplayDocumentView } from './display/DisplayDocumentView';
 import { createDatabaseEnvironment } from './demo/databaseEnvironment.js';
 import { openBrowserDatabase } from './storage/userDatabase';
@@ -514,6 +514,11 @@ export default function App() {
       setPendingClarification(false);
       await saveConversationState(response.state);
       runtime.intelligence.cancelPendingOperation();
+      const answerDocument = parseDisplayDocument(response.text, { registry: runtime.registry });
+      if (answerDocument) {
+        await showDocument(answerDocument);
+        return;
+      }
       await showDocument(createDisplayDocument({
         id: 'cue-dots3-direct-answer',
         title: 'Dots 3 response',
