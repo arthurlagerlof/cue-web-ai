@@ -14,7 +14,7 @@ Cue is a browser-first assistant demo for trusted, registered tools. Normal app 
 
 OpenRouter requests time out after 55 seconds at the proxy, with a 60-second browser limit. Hosting platforms may impose shorter limits. If requests continue timing out, retry or use **Web AI** mode.
 
-For Dots 3 Note Preview, Cue requests non-reasoning mode and asks for direct JSON responses to reduce latency. Actual latency and support for this setting depend on the OpenRouter provider; other configured models keep their default reasoning settings.
+For Dots 3 Note Preview, Cue requests non-reasoning mode and asks for JSON planning responses to reduce latency. When no tool is needed, it sends the request to Dots 3 for a conversational answer. Actual latency and support for this setting depend on the OpenRouter provider; other configured models keep their default reasoning settings.
 
 Python is not required for app operation. The browser seeds from version-controlled synthetic JSON fixtures; the old SQLite baseline and Python backend have been removed.
 

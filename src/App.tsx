@@ -460,7 +460,7 @@ export default function App() {
   async function processDots3Request(request: string, runtime: any, context: any, resumedExecutionState?: any) {
     let response;
     if (resumedExecutionState) {
-      response = { kind: 'plan', plan: resumedExecutionState.plan };
+      response = { kind: 'tool', plan: resumedExecutionState.plan };
       log('Resuming the saved execution plan');
     } else {
       const previous = await getConversationState();
@@ -489,12 +489,14 @@ export default function App() {
       }));
       return;
     }
-    if (response.kind === 'no_tool') {
-      log('External planner found no registered tool for the request');
+    if (response.kind === 'direct_answer') {
+      log('Dots 3 answered without using a tool');
       updatePendingConfirmation(undefined);
       setPendingClarification(false);
+      await saveConversationState(response.state);
+      runtime.intelligence.cancelPendingOperation();
       await showDocument(createDisplayDocument({
-        id: 'cue-dots3-no-tool',
+        id: 'cue-dots3-direct-answer',
         title: 'Dots 3 response',
         source: { app: 'openrouter', name: 'Dots3' },
         state: 'ready',
@@ -503,7 +505,7 @@ export default function App() {
       }));
       return;
     }
-    if (response.kind !== 'plan' || !response.plan) throw new TypeError('Dots 3 returned an unsupported reasoning outcome.');
+    if (response.kind !== 'tool' || !response.plan) throw new TypeError('Dots 3 returned an unsupported reasoning outcome.');
     markMultiStep(activeRequest.current, response.plan.operations.length);
     for (const operation of response.plan.operations) {
       log(`Validated plan proposal: ${operation.toolId}; dependencies=${operation.dependsOn.length}; bindings=${operation.inputBindings.length}; fan-out=${Boolean(operation.forEach)}`);

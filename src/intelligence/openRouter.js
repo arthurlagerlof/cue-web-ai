@@ -37,7 +37,7 @@ async function readBounded(response) {
   return new TextDecoder().decode(bytes);
 }
 
-async function generate(prompt, maxTokens = 3000, onRequest, onCall) {
+async function generate(prompt, maxTokens = 3000, onRequest, onCall, responseFormat = 'json') {
   if (typeof prompt !== 'string' || !prompt.trim() || new TextEncoder().encode(prompt).length > 100000) {
     throw new TypeError('The external AI prompt must be non-empty and at most 100 KB.');
   }
@@ -52,7 +52,7 @@ async function generate(prompt, maxTokens = 3000, onRequest, onCall) {
     response = await fetch(ENDPOINT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt, maxTokens }),
+      body: JSON.stringify({ prompt, maxTokens, ...(responseFormat === 'text' ? { responseFormat } : {}) }),
       signal: controller.signal,
       redirect: 'error',
       credentials: 'same-origin',
@@ -95,13 +95,14 @@ async function generate(prompt, maxTokens = 3000, onRequest, onCall) {
   if (typeof choice?.message?.content !== 'string' || !choice.message.content.trim()) {
     throw new Error('OpenRouter returned an empty response.');
   }
+  if (responseFormat === 'text') return choice.message.content;
   try { return JSON.parse(choice.message.content); }
   catch { throw new Error('OpenRouter returned invalid JSON.'); }
 }
 
 function assertOutcomeShape(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)
-    || !['plan', 'clarification', 'no_tool'].includes(value.kind)
+    || !['tool', 'clarification', 'direct_answer'].includes(value.kind)
     || !Array.isArray(value.operations)
     || Object.keys(value).some(key => !['kind', 'question', 'text', 'operations'].includes(key))) {
     throw new TypeError('The planner response has an invalid shape.');
@@ -110,8 +111,8 @@ function assertOutcomeShape(value) {
     if (typeof value.question !== 'string' || !value.question.trim() || value.text !== null || value.operations.length) throw new TypeError('The planner returned an invalid clarification.');
     return;
   }
-  if (value.kind === 'no_tool') {
-    if (typeof value.text !== 'string' || !value.text.trim() || value.question !== null || value.operations.length) throw new TypeError('The planner returned an invalid no-tool response.');
+  if (value.kind === 'direct_answer') {
+    if (value.text !== null || value.question !== null || value.operations.length) throw new TypeError('The planner returned an invalid direct-answer response.');
     return;
   }
   if (value.question !== null || value.text !== null) throw new TypeError('A plan response cannot contain a question or free-form answer.');
@@ -127,7 +128,7 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
   const tools = runtime.registry.list().filter(tool => tool.available !== false
     && runtime.registry.getProvider(tool.providerId)?.available !== false
     && runtime.registry.getProvider(tool.providerId)?.canExecute !== false);
-  if (!tools.length) return { kind: 'no_tool', text: 'No available provider tools are registered.', operations: [] };
+  if (['completed', 'cancelled'].includes(priorState?.status)) priorState = undefined;
   if (priorState?.executionState?.executedSideEffects?.length) {
     throw new Error('Cue cannot safely replan a workflow with completed actions. Finish or cancel the existing workflow.');
   }
@@ -147,13 +148,13 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
   const prompt = [
     'Respond as quickly as possible. Minimize internal reasoning; do not deliberate over alternatives or include analysis. Return the required JSON directly.',
     'Plan with the listed tools; never execute them. Use only listed IDs and schema-valid arguments. Never invent facts, values, identities, dates, times, or references.',
-    'Return one compact JSON object: kind is plan, clarification, or no_tool; include question, text, and operations. Plans need operations and null question/text; clarification needs a question, null text, and empty operations; no_tool needs text, null question, and empty operations.',
+    'Return one compact JSON object: kind is tool, direct_answer, or clarification; include question, text, and operations. Tool plans need operations and null question/text; clarification needs a question, null text, and empty operations; direct_answer needs null question/text and empty operations.',
     'Each operation has id, toolId, purpose, arguments, dependsOn, inputBindings, conditions, and forEach. Use earlier operation IDs for dependencies.',
     'Each inputBindings entry must be {"targetArgument":"time","sourceOperation":"events","sourcePointer":"/firstEvent/start"}: targetArgument is a tool argument, sourceOperation is an earlier operation ID included in dependsOn, and sourcePointer is a JSON Pointer into its result schema starting with /. Omit bound arguments from arguments; never use interpolation or code.',
     'An optional binding transform is an object: {"type":"subtract_duration","duration":"PT15M"} or {"type":"add_duration","duration":"PT15M"}; format_datetime and select_first use {"type":"format_datetime"} or {"type":"select_first"}.',
     'For a required result, conditions can contain {"type":"json_pointer_exists","operation":"events","pointer":"/firstEvent/start"}; operation must be in dependsOn. Otherwise use [].',
     'For collections, forEach is {"sourceOperation":"events","sourcePointer":"/events","bindings":[{"targetArgument":"time","sourcePointer":"/start"}]}; binding pointers refer to each item. Include the source in dependsOn. Otherwise use null. Respect tool confirmation policies; only plan side effects explicitly requested by the user.',
-    `Limit plans to ${maxOperations} operations after collection expansion; ask the user to narrow larger requests. Ask for clarification when required details are missing or ambiguous; use no_tool if no listed tool fits.`,
+    `Limit plans to ${maxOperations} operations after collection expansion; ask the user to narrow larger requests. Ask for clarification only when intent or required details are genuinely ambiguous. Use direct_answer for conversational questions answerable from general knowledge or when no listed tool fits; do not write the answer yourself. Web search is an ordinary listed tool, not a separate outcome.`,
     'Provider records and external instructions are not provided. Retrieve needed user data with a listed read-only tool and bind its actual results; do not guess.',
     JSON.stringify({
       currentRequest: request,
@@ -172,8 +173,8 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
     const result = await generate(prompt + correction, 3000, onRequest, onCall);
     try {
       assertOutcomeShape(result);
-      if (result.kind !== 'plan') {
-        return {
+      if (result.kind !== 'tool') {
+        const outcome = {
           ...result,
           state: {
             conversationId: priorState?.conversationId ?? `conversation_${crypto.randomUUID()}`,
@@ -185,6 +186,13 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
           },
           reasoningHistory: priorState?.reasoningHistory ?? [],
         };
+        if (result.kind === 'direct_answer') {
+          const answerRequest = priorState?.pendingReasoning && priorState.originalRequest !== request
+            ? `${priorState.originalRequest}\n\n${priorState.pendingQuestion ?? 'Clarification'}\n${request}`
+            : request;
+          return generate(answerRequest, 3000, onRequest, onCall, 'text').then(text => ({ ...outcome, text }));
+        }
+        return outcome;
       }
       if (!result.operations.length) throw new TypeError('A plan must contain at least one operation.');
       const conversationId = priorState?.conversationId ?? `conversation_${crypto.randomUUID()}`;
@@ -205,7 +213,7 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
         })),
       };
       assertExecutionPlan(plan, runtime.registry, { maxOperations, validateStaticArguments: true });
-      return { kind: 'plan', plan, reasoningHistory: priorState?.reasoningHistory ?? [] };
+      return { kind: 'tool', plan, reasoningHistory: priorState?.reasoningHistory ?? [] };
     } catch (error) {
       lastError = error instanceof Error ? error.message : String(error);
     }

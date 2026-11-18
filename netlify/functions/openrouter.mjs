@@ -95,10 +95,11 @@ export async function handleOpenRouterRequest({
   try { request = JSON.parse(body); }
   catch { return jsonResponse(400, { error: 'Request body must be valid JSON.' }); }
   if (!request || typeof request !== 'object' || Array.isArray(request)
-    || Object.keys(request).some(key => !['prompt', 'maxTokens'].includes(key))
+    || Object.keys(request).some(key => !['prompt', 'maxTokens', 'responseFormat'].includes(key))
     || typeof request.prompt !== 'string' || !request.prompt.trim()
     || new TextEncoder().encode(request.prompt).byteLength > MAX_PROMPT_BYTES
-    || !Number.isSafeInteger(request.maxTokens) || request.maxTokens < 1 || request.maxTokens > MAX_TOKENS) {
+    || !Number.isSafeInteger(request.maxTokens) || request.maxTokens < 1 || request.maxTokens > MAX_TOKENS
+    || (request.responseFormat !== undefined && request.responseFormat !== 'text')) {
     return jsonResponse(400, { error: 'The OpenRouter request is invalid.' });
   }
   if (typeof model !== 'string' || !model.trim() || model.length > 200 || /[\r\n]/.test(model)) {
@@ -126,7 +127,7 @@ export async function handleOpenRouterRequest({
           : {}),
         max_tokens: request.maxTokens,
         temperature: 0.1,
-        response_format: { type: 'json_object' },
+        ...(request.responseFormat === 'text' ? {} : { response_format: { type: 'json_object' } }),
       }),
       signal: controller.signal,
       redirect: 'error',

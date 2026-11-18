@@ -50,8 +50,19 @@ test('OpenRouter plan request contains the tool catalog but no local provider re
   assert.doesNotMatch(browserClient, /OPENROUTER_API_KEY|Authorization|apiKey/);
   const runtime = testRuntime();
   const tool = runtime.registry.get('anki.search_cards');
+  const { ToolDispatcher } = await import('../src/intelligence/dispatcher.js');
+  const executions = [];
+  runtime.registry.getProvider('anki').execute = async (toolId, args) => {
+    executions.push({ toolId, args });
+    return {
+      schema: 'cue.display', version: 1, id: 'anki-results', title: 'Results',
+      source: { app: 'anki', name: 'Anki' }, state: 'ready',
+      pages: [{ id: 'results', elements: [{ type: 'text', text: 'Found a card.' }] }],
+      actions: [], assets: [],
+    };
+  };
   const output = {
-    kind: 'plan',
+    kind: 'tool',
     question: null,
     text: null,
     operations: [{
@@ -85,9 +96,12 @@ test('OpenRouter plan request contains the tool catalog but no local provider re
       runtime,
       onRequest: async () => { usageCalls++; },
     });
-    assert.equal(result.kind, 'plan');
+    assert.equal(result.kind, 'tool');
     assert.equal(result.plan.operations[0].toolId, tool.id);
     assert.equal(result.plan.operations[0].requiresConfirmation, false);
+    const execution = await new ToolDispatcher(runtime.registry).dispatchPlan(result.plan);
+    assert.equal(execution.state, 'completed');
+    assert.deepEqual(executions, [{ toolId: tool.id, args: { query: 'photosynthesis' } }]);
     assert.equal(endpoint, '/api/openrouter');
     assert.equal(headers.Authorization, undefined);
     assert.equal(requestBody.maxTokens, 3000);
@@ -97,6 +111,8 @@ test('OpenRouter plan request contains the tool catalog but no local provider re
     assert.match(prompt, /Minimize internal reasoning/);
     assert.match(prompt, /Return the required JSON directly/);
     assert.match(prompt, /anki\.search_cards/);
+    assert.match(prompt, /web\.search/);
+    assert.match(prompt, /Web search is an ordinary listed tool/);
     assert.match(prompt, /Search my Anki cards about photosynthesis/);
     assert.match(prompt, /Etsi Anki-kortti fotosynteesistä/);
     assert.doesNotMatch(prompt, /Find the card about chloroplasts/);
@@ -108,6 +124,111 @@ test('OpenRouter plan request contains the tool catalog but no local provider re
   }
 });
 
+test('direct answers send the original request as conversational text even with no registered tools', async t => {
+  const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  const { handleOpenRouterRequest } = await import('../netlify/functions/openrouter.mjs');
+  const { ToolRegistry } = await import('../src/intelligence/toolRegistry.js');
+  const request = 'Why is the Mona Lisa special?';
+  const upstreamRequests = [];
+  t.mock.method(global, 'fetch', async (_url, options) => {
+    const response = await handleOpenRouterRequest({
+      method: 'POST', body: options.body, apiKey: 'test-key', clientIp: 'direct-answer-test',
+      fetchImpl: async (_upstreamUrl, upstreamOptions) => {
+        const body = JSON.parse(upstreamOptions.body);
+        upstreamRequests.push(body);
+        const content = body.response_format
+          ? JSON.stringify({ kind: 'direct_answer', question: null, text: null, operations: [] })
+          : 'Its technique and mysterious expression make it distinctive.';
+        return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content } }] }), { status: 200 });
+      },
+    });
+    return new Response(response.body, { status: response.statusCode, headers: response.headers });
+  });
+  for (const runtime of [testRuntime(), { registry: new ToolRegistry() }]) {
+    const result = await planWithOpenRouter({
+      request, context: {}, runtime,
+      priorState: { status: 'completed', originalRequest: 'An older request' },
+    });
+    assert.equal(result.kind, 'direct_answer');
+    assert.match(result.text, /technique and mysterious expression/);
+    assert.equal(result.state.originalRequest, request);
+    assert.equal(result.state.status, 'completed');
+  }
+  assert.equal(upstreamRequests.length, 4);
+  for (const index of [0, 2]) {
+    assert.deepEqual(upstreamRequests[index].response_format, { type: 'json_object' });
+    assert.match(upstreamRequests[index].messages[0].content, /direct_answer/);
+    assert.equal(upstreamRequests[index + 1].messages[0].content, request);
+    assert.equal(Object.hasOwn(upstreamRequests[index + 1], 'response_format'), false);
+  }
+  assert.match(upstreamRequests[2].messages[0].content, /"registeredTools":\[\]/);
+});
+
+test('clarification waits for a user response and retains context for a direct answer', async t => {
+  const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  const requests = [];
+  t.mock.method(global, 'fetch', async (_url, options) => {
+    const body = JSON.parse(options.body);
+    requests.push(body);
+    const content = requests.length === 1
+      ? JSON.stringify({ kind: 'clarification', question: 'Which painting?', text: null, operations: [] })
+      : requests.length === 2
+        ? JSON.stringify({ kind: 'direct_answer', question: null, text: null, operations: [] })
+        : 'It is famous for its technique.';
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content } }] }), { status: 200 });
+  });
+  const runtime = testRuntime();
+  const clarification = await planWithOpenRouter({ request: 'Why is that painting special?', context: {}, runtime });
+  assert.equal(clarification.kind, 'clarification');
+  assert.equal(clarification.question, 'Which painting?');
+  assert.equal(clarification.state.pendingReasoning, true);
+  assert.equal(requests.length, 1);
+  const answer = await planWithOpenRouter({ request: 'The Mona Lisa', context: {}, runtime, priorState: clarification.state });
+  assert.equal(answer.kind, 'direct_answer');
+  assert.equal(answer.state.pendingReasoning, false);
+  assert.equal(requests[2].prompt, 'Why is that painting special?\n\nWhich painting?\nThe Mona Lisa');
+});
+
+test('web search is selected and dispatched as a registered tool', async t => {
+  const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  const { ToolDispatcher } = await import('../src/intelligence/dispatcher.js');
+  const runtime = testRuntime();
+  let executed;
+  runtime.registry.getProvider('web').execute = async (toolId, args) => {
+    executed = { toolId, args };
+    return {
+      schema: 'cue.display', version: 1, id: 'web-results', title: 'Results',
+      source: { app: 'web', name: 'Web' }, state: 'ready',
+      pages: [{ id: 'results', elements: [{ type: 'text', text: 'Found a result.' }] }],
+      actions: [], assets: [],
+    };
+  };
+  t.mock.method(global, 'fetch', async () => new Response(JSON.stringify({
+    choices: [{ message: { content: JSON.stringify({
+      kind: 'tool', question: null, text: null,
+      operations: [{ id: 'search', toolId: 'web.search', purpose: 'Search the web', arguments: { query: 'recent art news' }, dependsOn: [], inputBindings: [], conditions: [], forEach: null }],
+    }) } }],
+  }), { status: 200 }));
+  const result = await planWithOpenRouter({ request: 'Search the web for recent art news', context: {}, runtime });
+  assert.equal(result.kind, 'tool');
+  assert.equal((await new ToolDispatcher(runtime.registry).dispatchPlan(result.plan)).state, 'completed');
+  assert.deepEqual(executed, { toolId: 'web.search', args: { query: 'recent art news' } });
+});
+
+test('direct-answer failures surface without retrying the planner', async t => {
+  const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  let calls = 0;
+  t.mock.method(global, 'fetch', async () => {
+    calls++;
+    if (calls === 1) return new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ kind: 'direct_answer', question: null, text: null, operations: [] }) } }],
+    }), { status: 200 });
+    return new Response(JSON.stringify({ error: 'Conversational answer failed.' }), { status: 503 });
+  });
+  await assert.rejects(planWithOpenRouter({ request: 'Explain art', context: {}, runtime: testRuntime() }), /Conversational answer failed/);
+  assert.equal(calls, 2);
+});
+
 test('OpenRouter response validation retries malformed plans and surfaces backend configuration errors', async () => {
   const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
   const runtime = testRuntime();
@@ -117,7 +238,7 @@ test('OpenRouter response validation retries malformed plans and surfaces backen
     calls++;
     return new Response(JSON.stringify({
       choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({
-        kind: 'plan', question: null, text: null,
+        kind: 'tool', question: null, text: null,
         operations: [{ id: 'bad', toolId: 'unknown.tool', purpose: 'invalid', arguments: {}, dependsOn: [], inputBindings: [], conditions: [], forEach: null }],
       }) } }],
     }), { status: 200 });
@@ -162,7 +283,7 @@ test('planner binding instructions provide a valid example and preserve strict v
     }
     return new Response(JSON.stringify({
       choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({
-        kind: 'plan', question: null, text: null,
+        kind: 'tool', question: null, text: null,
         operations: [
           { id: 'events', toolId: 'calendar.find_events', purpose: 'Find events', arguments: { date: '2026-11-18' }, dependsOn: [], inputBindings: [], conditions: [], forEach: null },
           { id: 'alarm', toolId: 'alarm.create', purpose: 'Set an alarm', arguments: { label: 'Meeting' }, dependsOn: ['events'], inputBindings: [binding], conditions: [], forEach: null },
@@ -188,7 +309,7 @@ test('OpenRouter reports only safe model, latency, and token metadata for real u
   const runtime = testRuntime();
   const tool = runtime.registry.get('anki.search_cards');
   const resultBody = {
-    kind: 'plan',
+    kind: 'tool',
     question: null,
     text: null,
     operations: [{
