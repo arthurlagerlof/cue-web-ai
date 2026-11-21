@@ -4,6 +4,7 @@ import { normalizeArgumentsWithModel } from '../intelligence/argumentNormalizati
 import { buildProviderDataIndex, searchProviderData as searchLocalProviderData } from '../intelligence/retrieval/providerData.js';
 import { discoverTools } from '../intelligence/retrieval/semanticTools.js';
 import { ToolRegistry } from '../intelligence/toolRegistry.js';
+import { EMBEDDING_CACHE_VERSION } from '../intelligence/embeddingModel.js';
 import alarmAdapter from '../providers/alarm/index.js';
 import ankiAdapter from '../providers/anki/index.js';
 import calendarAdapter from '../providers/calendar/index.js';
@@ -15,7 +16,7 @@ const providerAdapters = new Map([
   alarmAdapter, ankiAdapter, calendarAdapter, knowledgeAdapter, notificationsAdapter, webAdapter,
 ].map(adapter => [adapter.id, adapter]));
 
-export async function createDatabaseEnvironment({ database, registryData, embed, rerankTools, onRerankDecision, onUsage, onToolExecution, normalizeArguments, argumentNormalizerEnabled, threshold = undefined, plausibleThreshold = undefined, ambiguityMargin = undefined, initialState, initializeRetrieval = true }) {
+export async function createDatabaseEnvironment({ database, registryData, embed, rerankTools, onRerankDecision, onUsage, onToolExecution, onIndexStart, normalizeArguments, argumentNormalizerEnabled, threshold = undefined, plausibleThreshold = undefined, ambiguityMargin = undefined, initialState, initializeRetrieval = true }) {
   if (!database || typeof database.getRegistryData !== 'function') throw new TypeError('A browser-local database is required.');
   registryData ??= await database.getRegistryData();
   if (!registryData || !Array.isArray(registryData.providers) || !Array.isArray(registryData.tools)) {
@@ -32,29 +33,32 @@ export async function createDatabaseEnvironment({ database, registryData, embed,
   const registry = new ToolRegistry();
   const toolsById = new Map(registryData.tools.map(tool => [tool.id, tool]));
   const providersById = new Map(registryData.providers.map(provider => [provider.id, provider]));
-  const embedCached = async text => {
+  const validVector = vector => Array.isArray(vector) && vector.length === EMBEDDING_DIMENSIONS
+    && vector.every(Number.isFinite) && Math.abs(Math.hypot(...vector) - 1) <= 0.002;
+  const embedCached = async (text, purpose = 'request') => {
     const cached = await database.getCachedEmbedding(text, EMBEDDING_MODEL);
-    if (cached?.dimensions === EMBEDDING_DIMENSIONS && cached.vector?.length === EMBEDDING_DIMENSIONS) {
+    if (cached?.model === EMBEDDING_MODEL && cached.version === EMBEDDING_CACHE_VERSION
+      && cached.dimensions === EMBEDDING_DIMENSIONS && validVector(cached.vector)) {
       return { vector: cached.vector, dimensions: cached.dimensions };
     }
-    const result = await embed(text);
+    const result = await embed(text, { purpose });
     const vector = Array.isArray(result) ? result : result.vector;
     const dimensions = result.dimensions ?? vector?.length;
-    if (!Array.isArray(vector) || dimensions !== EMBEDDING_DIMENSIONS || vector.length !== EMBEDDING_DIMENSIONS
-      || vector.some(value => !Number.isFinite(value))) {
-      throw new Error(`Unexpected embedding: expected ${EMBEDDING_DIMENSIONS} finite dimensions.`);
+    if (dimensions !== EMBEDDING_DIMENSIONS || !validVector(vector)) {
+      throw new Error(`Unexpected embedding: expected ${EMBEDDING_DIMENSIONS} finite, normalized dimensions.`);
     }
     await database.cacheEmbedding(text, EMBEDDING_MODEL, dimensions, vector);
     return { vector, dimensions };
   };
   let providerDataIndex = [];
   let retrievalReady = false;
+  const embedForIndex = text => embedCached(text, 'index');
   const indexProviderData = async () => {
     const freshRegistry = await database.getRegistryData();
     providerDataIndex = await buildProviderDataIndex({
       providers: freshRegistry.providers,
       data: freshRegistry.data,
-      embed: embedCached,
+      embed: embedForIndex,
       dimensions: EMBEDDING_DIMENSIONS,
     });
   };
@@ -92,7 +96,10 @@ export async function createDatabaseEnvironment({ database, registryData, embed,
         }
         await onUsage?.('executions');
         await onUsage?.('successes');
-        if (tool.confirmation === 'required' && retrievalReady) await indexProviderData();
+        if (tool.confirmation === 'required' && retrievalReady) {
+          const finishIndex = onIndexStart?.();
+          try { await indexProviderData(); } finally { finishIndex?.(); }
+        }
         return result;
       },
     });
@@ -108,13 +115,16 @@ export async function createDatabaseEnvironment({ database, registryData, embed,
     if (retrievalReady) return;
     if (!retrievalAttempt) {
       retrievalAttempt = (async () => {
-        const examples = await buildToolExampleIndex(
-          registry.list().filter(tool => tool.available !== false && registry.getProvider(tool.providerId)?.available !== false),
-          embedCached,
-        );
-        await indexProviderData();
-        exampleIndex.splice(0, exampleIndex.length, ...examples);
-        retrievalReady = true;
+        const finishIndex = onIndexStart?.();
+        try {
+          const examples = await buildToolExampleIndex(
+            registry.list().filter(tool => tool.available !== false && registry.getProvider(tool.providerId)?.available !== false),
+            embedForIndex,
+          );
+          await indexProviderData();
+          exampleIndex.splice(0, exampleIndex.length, ...examples);
+          retrievalReady = true;
+        } finally { finishIndex?.(); }
       })();
     }
     const attempt = retrievalAttempt;

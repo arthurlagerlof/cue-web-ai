@@ -1,4 +1,5 @@
 import pg from 'pg';
+import { DEMO_SCENARIOS } from '../../src/demo/demoScenarios.js';
 
 const { Pool } = pg;
 const MAX_BODY_BYTES = 700000;
@@ -104,7 +105,7 @@ export function parseRequestStatistic(body) {
     || value.outputTokens !== externalModels.reduce((total, call) => total + (call.outputTokens ?? 0), 0)
     || value.tokenUsageCalls !== externalModels.filter(call => call.inputTokens !== null || call.outputTokens !== null).length
     || value.externalAiMs !== externalModels.reduce((total, call) => total + call.latencyMs, 0)
-    || value.responseMs !== Date.parse(value.completedAt) - Date.parse(value.startedAt)
+    || value.responseMs > Date.parse(value.completedAt) - Date.parse(value.startedAt)
     || value.toolFailures > value.toolCalls || typeof value.multiStep !== 'boolean'
     || (value.selectedMode !== null && !SELECTED_MODES.includes(value.selectedMode))
     || (value.requestText !== null && (typeof value.requestText !== 'string' || Buffer.byteLength(value.requestText, 'utf8') > 100000))
@@ -152,7 +153,10 @@ function safeInteger(value, label) {
   return number;
 }
 
-async function loadAggregate(database) {
+async function loadAggregate(database, requestText) {
+  const where = requestText === null ? '' : 'WHERE request_text = $1';
+  const localWhere = requestText === null ? '' : 'WHERE local_stats.request_text = $1';
+  const params = requestText === null ? [] : [requestText];
   const totalsResult = await database.query(`
     SELECT
       COUNT(*)::text AS sample_size,
@@ -160,7 +164,8 @@ async function loadAggregate(database) {
       MAX(completed_at)::text AS period_end,
       (SELECT COALESCE(array_agg(DISTINCT local_model ORDER BY local_model), ARRAY[]::text[])
         FROM cue_request_statistics AS local_stats
-        CROSS JOIN LATERAL unnest(local_stats.local_models) AS models(local_model)) AS local_models,
+        CROSS JOIN LATERAL unnest(local_stats.local_models) AS models(local_model)
+        ${localWhere}) AS local_models,
       COALESCE(SUM(external_calls), 0)::text AS total_external_api_calls,
       AVG(external_calls)::float8 AS average_external_api_calls,
       AVG(response_ms)::float8 AS average_response_ms,
@@ -176,7 +181,8 @@ async function loadAggregate(database) {
       COALESCE(SUM(output_tokens), 0)::text AS output_tokens,
       COALESCE(SUM(token_usage_calls), 0)::text AS token_usage_calls
     FROM cue_request_statistics
-  `);
+    ${where}
+  `, params);
   const modeResult = await database.query(`
     SELECT
       execution_mode,
@@ -190,8 +196,9 @@ async function loadAggregate(database) {
       CASE WHEN SUM(tool_calls) = 0 THEN NULL
         ELSE (SUM(tool_calls) - SUM(tool_failures))::float8 / SUM(tool_calls) END AS tool_success_rate
     FROM cue_request_statistics
+    ${where}
     GROUP BY execution_mode
-  `);
+  `, params);
   const modelResult = await database.query(`
     SELECT
       model_call->>'provider' AS provider,
@@ -204,9 +211,10 @@ async function loadAggregate(database) {
       COUNT(*) FILTER (WHERE model_call->>'inputTokens' IS NOT NULL OR model_call->>'outputTokens' IS NOT NULL)::text AS token_usage_calls
     FROM cue_request_statistics
     CROSS JOIN LATERAL jsonb_array_elements(external_models) AS calls(model_call)
+    ${where}
     GROUP BY model_call->>'provider', model_call->>'model'
     ORDER BY COUNT(*) DESC, model_call->>'model'
-  `);
+  `, params);
   const selectedModeResult = await database.query(`
     WITH measured AS (
       SELECT selected_mode, completed_at, external_calls, external_ai_ms, response_ms,
@@ -217,6 +225,7 @@ async function loadAggregate(database) {
         ) AS tokens_complete
       FROM cue_request_statistics
       WHERE selected_mode IS NOT NULL
+      ${requestText === null ? '' : 'AND request_text = $1'}
     )
     SELECT selected_mode, COUNT(*)::text AS requests,
       MIN(completed_at)::text AS period_start, MAX(completed_at)::text AS period_end,
@@ -232,7 +241,7 @@ async function loadAggregate(database) {
       AVG(output_tokens) FILTER (WHERE tokens_complete)::float8 AS average_output_tokens,
       COUNT(*) FILTER (WHERE tokens_complete)::text AS token_sample_size
     FROM measured GROUP BY selected_mode
-  `);
+  `, params);
   const row = totalsResult.rows[0];
   const sampleSize = safeInteger(row.sample_size, 'request count');
   const totalExternalApiCalls = safeInteger(row.total_external_api_calls, 'external API call');
@@ -310,6 +319,8 @@ async function loadAggregate(database) {
 
 export const handleGlobalStats = async (event, connectionString) => {
   if (event.httpMethod !== 'GET' && event.httpMethod !== 'POST') return response(405, { error: 'Method not allowed.' });
+  const requestText = event.httpMethod === 'GET' ? event.queryStringParameters?.request ?? null : null;
+  if (requestText !== null && !DEMO_SCENARIOS.includes(requestText)) return response(400, { error: 'Unknown demo request.' });
   let statistic;
   if (event.httpMethod === 'POST') {
     try { statistic = parseRequestStatistic(event.body ?? ''); }
@@ -339,7 +350,7 @@ export const handleGlobalStats = async (event, connectionString) => {
       ]);
       return response(200, { accepted: true, duplicate: result.rowCount === 0 });
     }
-    return response(200, await loadAggregate(database));
+    return response(200, await loadAggregate(database, requestText));
   } catch (error) {
     console.error('Request statistics service failed.');
     return response(503, { error: 'Global statistics are temporarily unavailable.' });

@@ -4,9 +4,10 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 
-function loadWatch() {
+function loadWatch({ parseJson, connected = true } = {}) {
   const listeners = {};
   const uartListeners = {};
+  const bleListeners = {};
   const writes = [];
   const stored = {};
   const drawings = [];
@@ -14,8 +15,10 @@ function loadWatch() {
   let now = 10000;
   let nextTimer = 1;
   let fontSize = 12;
+  let asciiDecodes = 0;
   const context = {
     Date: { now: () => now },
+    ...(parseJson ? { JSON: { parse: parseJson } } : {}),
     setTimeout: (callback, delay) => {
       const id = nextTimer++;
       timers.set(id, { callback, due: now + delay });
@@ -28,6 +31,7 @@ function loadWatch() {
     decodeURIComponent: undefined,
     encodeURI: undefined,
     decodeURI: undefined,
+    E: { toString: bytes => { asciiDecodes++; return Buffer.from(bytes).toString('latin1'); } },
     require: () => ({ read: key => stored[key], write: (key, value) => { stored[key] = value; } }),
     LoopbackA: { setConsole: () => {} },
     Bangle: {
@@ -44,6 +48,11 @@ function loadWatch() {
       removeListener: (name, fn) => { uartListeners[name] = (uartListeners[name] || []).filter(listener => listener !== fn); },
       println: value => writes.push(value),
       write: value => writes.push(value),
+    },
+    NRF: {
+      getSecurityStatus: () => ({ connected }),
+      on: (name, fn) => { (bleListeners[name] ||= []).push(fn); },
+      removeListener: (name, fn) => { bleListeners[name] = (bleListeners[name] || []).filter(listener => listener !== fn); },
     },
     g: {
       getWidth: () => 176,
@@ -67,7 +76,7 @@ function loadWatch() {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'watch', 'bangle-app.js'), 'utf8'), context, { filename: 'bangle-app.js' });
   writes.length = 0;
   return {
-    context, listeners, uartListeners, writes, stored, drawings,
+    context, listeners, uartListeners, bleListeners, writes, stored, drawings, asciiDecodes: () => asciiDecodes,
     advance: ms => {
       const target = now + ms;
       while (true) {
@@ -95,16 +104,59 @@ function sendDocument(watch, document, id = 42) {
   chunks.forEach((chunk, index) => watch.uartListeners.data[0](frame(2, id, index, chunks.length, chunk)));
 }
 
-test('ready screen shows tap and hold instructions', () => {
+test('ready screen shows only the tap instruction', () => {
   const watch = loadWatch();
   assert.ok(watch.drawings.includes('Cue.'));
-  assert.ok(watch.drawings.includes('cue_logo.png'));
+  assert.ok(!watch.drawings.includes('cue_logo.png'));
   assert.ok(watch.drawings.includes('Tap for last 10 seconds'));
-  assert.ok(watch.drawings.includes('Hold for a longer'));
-  assert.ok(watch.drawings.includes('recording'));
+  assert.ok(!watch.drawings.includes('Hold for a longer'));
 });
 
-test('short tap sends exactly one existing trigger and never becomes a long press', () => {
+test('disconnected watch blocks input and shows the tap instruction only after connecting', () => {
+  const watch = loadWatch({ connected: false });
+  assert.ok(watch.drawings.includes('DISCONNECTED'));
+  assert.ok(watch.drawings.some(line => line.includes('Connect Cue over')));
+  assert.ok(!watch.drawings.includes('Tap for last 10 seconds'));
+  watch.listeners.touch[0](1, { x: 88, y: 73 });
+  assert.equal(watch.writes.length, 0);
+
+  watch.drawings.length = 0;
+  watch.bleListeners.connect[0]('peer');
+  assert.ok(watch.drawings.includes('Tap for last 10 seconds'));
+  watch.listeners.touch[0](1, { x: 88, y: 73 });
+  assert.equal(watch.writes[0].charCodeAt(3), 1);
+  assert.ok(watch.drawings.includes('THINKING...'));
+
+  watch.drawings.length = 0;
+  watch.writes.length = 0;
+  watch.bleListeners.disconnect[0]();
+  assert.ok(watch.drawings.includes('DISCONNECTED'));
+  assert.ok(!watch.drawings.includes('Tap for last 10 seconds'));
+  watch.listeners.touch[0](1, { x: 88, y: 73 });
+  assert.equal(watch.writes.length, 0);
+  watch.drawings.length = 0;
+  watch.bleListeners.connect[0]('peer');
+  assert.ok(watch.drawings.includes('Tap for last 10 seconds'));
+  assert.ok(!watch.drawings.includes('THINKING...'));
+});
+
+test('disconnect clears incomplete transfers and removes Bluetooth listeners on cleanup', () => {
+  const watch = loadWatch();
+  watch.uartListeners.data[0](frame(2, 42, 0, 2, Array.from(Buffer.from('hello'))));
+  assert.ok(watch.drawings.includes('LOADING...'));
+  watch.bleListeners.disconnect[0]();
+  watch.advance(10001);
+  watch.bleListeners.connect[0]('peer');
+  assert.ok(!watch.drawings.includes('Transfer timed out. Retrying may help.'));
+  watch.uartListeners.data[0](frame(2, 42, 1, 2, Array.from(Buffer.from('world'))));
+  assert.equal(watch.stored['cue-memory.txt'], undefined);
+  watch.context.ui.remove();
+  assert.equal(watch.bleListeners.connect.length, 0);
+  assert.equal(watch.bleListeners.disconnect.length, 0);
+  assert.equal(watch.uartListeners.data.length, 0);
+});
+
+test('tap sends exactly one existing trigger', () => {
   const watch = loadWatch();
   watch.listeners.drag[0]({ b: true, x: 88, y: 73 });
   watch.advance(449);
@@ -116,13 +168,13 @@ test('short tap sends exactly one existing trigger and never becomes a long pres
   assert.ok(watch.drawings.includes('THINKING...'));
 });
 
-test('long press shows recording state and sends one trigger on release', () => {
+test('holding the watch does not start a longer recording or send a trigger', () => {
   const watch = loadWatch();
   watch.listeners.drag[0]({ b: true, x: 88, y: 73 });
-  watch.advance(450);
-  assert.ok(watch.drawings.includes('RECORDING'));
-  assert.ok(watch.drawings.includes('Release to finish'));
+  watch.advance(1500);
+  assert.ok(!watch.drawings.includes('RECORDING'));
   watch.listeners.drag[0]({ b: false, x: 88, y: 73 });
+  assert.equal(watch.writes.length, 0);
   watch.listeners.touch[0](1, { x: 88, y: 73 });
   assert.equal(watch.writes.length, 1);
   assert.equal(watch.writes[0].charCodeAt(3), 1);
@@ -136,12 +188,128 @@ test('display protocol reassembles UTF-8 chunks, acknowledges and persists lates
   const emit = data => watch.uartListeners.data[0](data);
   for (let i = chunks.length - 1; i >= 0; i--) emit(frame(2, 42, i, chunks.length, chunks[i]));
   assert.equal(watch.stored['cue-memory.txt'], 'A memória é importante e muito longa.');
+  assert.equal(watch.asciiDecodes(), 0);
   assert.equal(watch.writes.length, 1);
   assert.equal(watch.writes[0].charCodeAt(3), 3);
   assert.ok(watch.drawings.some(line => line.includes('memória')));
   emit(frame(2, 42, 0, chunks.length, chunks[0]));
   assert.equal(watch.writes.length, 2, 'duplicate delivery is acknowledged without reprocessing');
   assert.equal(watch.writes[1].charCodeAt(3), 3);
+});
+
+test('ASCII payloads use the native byte-to-string fast path', () => {
+  const watch = loadWatch();
+  watch.uartListeners.data[0](frame(2, 46, 0, 1, Array.from(Buffer.from('hello'))));
+  assert.equal(watch.stored['cue-memory.txt'], 'hello');
+  assert.equal(watch.asciiDecodes(), 1);
+  assert.equal(watch.writes[0].charCodeAt(9), 0);
+});
+
+test('plain conversational answers render without a display document', () => {
+  const watch = loadWatch();
+  const text = "That's wonderful to hear! I'm glad you're feeling better.";
+  const bytes = Array.from(new TextEncoder().encode(text));
+  const chunks = [];
+  for (let i = 0; i < bytes.length; i += 10) chunks.push(bytes.slice(i, i + 10));
+  chunks.forEach((chunk, index) => watch.uartListeners.data[0](frame(2, 51, index, chunks.length, chunk)));
+  assert.equal(watch.stored['cue-memory.txt'], text);
+  assert.ok(watch.drawings.some(line => line.includes("wonderful")));
+  assert.equal(watch.writes[0].charCodeAt(9), 0);
+});
+
+test('failed display document parsing reports an error instead of showing raw JSON', () => {
+  const watch = loadWatch({ parseJson: () => { throw new Error('parse failure'); } });
+  const document = {
+    schema: 'cue.watch.display', version: 1, title: 'Dots 3 response', state: 'ready',
+    pages: [{ elements: [{ type: 'text', text: 'Answer' }] }], actions: [], assets: [],
+  };
+  sendDocument(watch, document, 52);
+  assert.ok(watch.drawings.includes('ERROR'));
+  assert.ok(!watch.drawings.some(line => line.includes('cue.watch.display')));
+  assert.equal(watch.writes[0].charCodeAt(9), 1);
+  assert.equal(watch.stored['cue-memory.txt'], undefined);
+  sendDocument(watch, document, 52);
+  assert.equal(watch.writes[1].charCodeAt(9), 1);
+});
+
+test('lightweight thinking status updates the watch without an acknowledgement', () => {
+  const watch = loadWatch();
+  watch.uartListeners.data[0](frame(5, 47, 0, 1, [1]));
+  assert.ok(watch.drawings.includes('THINKING...'));
+  assert.equal(watch.writes.length, 0);
+  sendDocument(watch, {
+    schema: 'cue.watch.display', version: 1, title: 'Result', state: 'ready',
+    pages: [{ elements: [{ type: 'text', text: 'Finished' }] }], actions: [], assets: [],
+  }, 50);
+  watch.drawings.length = 0;
+  watch.advance(1000);
+  watch.context.ui.redraw();
+  assert.ok(watch.drawings.includes('Finished'));
+  assert.ok(!watch.drawings.includes('THINKING...'));
+});
+
+test('watch shows loading while a response is arriving, then shows the result', () => {
+  const watch = loadWatch();
+  const emit = data => watch.uartListeners.data[0](data);
+  emit(frame(5, 47, 0, 1, [1]));
+  watch.drawings.length = 0;
+  emit(frame(2, 53, 1, 2, Array.from(Buffer.from(' world'))));
+  assert.ok(watch.drawings.includes('LOADING...'));
+  assert.match(watch.drawings.join(' '), /Response ready\. Sending to watch\./);
+  assert.equal(watch.writes.length, 0);
+
+  watch.drawings.length = 0;
+  emit(frame(2, 53, 0, 2, Array.from(Buffer.from('Hello'))));
+  assert.ok(watch.drawings.includes('Hello world'));
+  assert.equal(watch.writes[0].charCodeAt(9), 0);
+  watch.drawings.length = 0;
+  emit(frame(2, 53, 1, 2, Array.from(Buffer.from(' world'))));
+  assert.ok(!watch.drawings.includes('LOADING...'), 'retries of a completed message do not replace the result');
+});
+
+test('an interrupted transfer reports a timeout and can load a retry', () => {
+  const watch = loadWatch();
+  const emit = data => watch.uartListeners.data[0](data);
+  emit(frame(2, 54, 0, 2, Array.from(Buffer.from('Hello'))));
+  watch.drawings.length = 0;
+  watch.advance(10000);
+  assert.ok(watch.drawings.includes('ERROR'));
+  assert.match(watch.drawings.join(' '), /Transfer timed out/);
+  watch.drawings.length = 0;
+  emit(frame(2, 54, 0, 2, Array.from(Buffer.from('Hello'))));
+  assert.ok(watch.drawings.includes('LOADING...'));
+  emit(frame(2, 54, 1, 2, Array.from(Buffer.from(' world'))));
+  assert.ok(watch.drawings.includes('Hello world'));
+});
+
+test('watch advertises support for compact display documents', () => {
+  const watch = loadWatch();
+  watch.uartListeners.data[0](frame(6, 48, 0, 1, [1]));
+  assert.equal(watch.writes.length, 1);
+  assert.deepEqual(Array.from(watch.writes[0], character => character.charCodeAt(0)),
+    [0x42, 0x4d, 1, 6, 48, 0, 0, 1, 1, 1]);
+});
+
+test('compact watch documents preserve text, image placeholders, and action IDs', () => {
+  const watch = loadWatch();
+  sendDocument(watch, {
+    schema: 'cue.watch.display', version: 1, title: 'Compact', state: 'ready',
+    pages: [{ elements: [
+      { type: 'action', actionId: 'open', label: 'Open' },
+      { type: 'text', text: 'Visible text', style: { emphasis: 'strong' } },
+      { type: 'image', assetId: 'diagram' },
+    ] }],
+    actions: [{ id: 'open', label: 'Open' }],
+    assets: [{ id: 'diagram', alt: 'Diagram' }],
+  }, 49);
+  assert.ok(watch.drawings.includes('Compact'));
+  assert.ok(watch.drawings.includes('Visible text'));
+  assert.ok(watch.drawings.includes('Diagram'));
+  watch.writes.length = 0;
+  watch.listeners.touch[0](1, { x: 20, y: 42 });
+  const action = watch.writes.find(value => value.charCodeAt(3) === 4);
+  assert.ok(action);
+  assert.equal(action.slice(9), 'open');
 });
 
 test('slow transfers remain available while chunks are still arriving', () => {
@@ -208,12 +376,12 @@ test('display documents preserve pages and image placeholders while scrolling', 
   assert.ok(watch.drawings.some(line => line.includes('Paragraph 2')), JSON.stringify(watch.drawings));
   assert.ok(!watch.drawings.some(line => line.includes('Paragraph 1')));
 
-  watch.context.ui.swipe(1);
+  watch.context.ui.swipe(-1);
   assert.ok(watch.drawings.includes('Page two'));
   assert.ok(watch.drawings.includes('2 / 3'));
-  watch.context.ui.swipe(1);
-  assert.ok(watch.drawings.includes('Page three'));
   watch.context.ui.swipe(-1);
+  assert.ok(watch.drawings.includes('Page three'));
+  watch.context.ui.swipe(1);
   assert.ok(watch.drawings.includes('Page two'));
 });
 
@@ -273,7 +441,7 @@ test('result actions, confirmation buttons, and logo navigation remain explicit'
   watch.context.ui.swipe(1);
   assert.equal(watch.writes.length, 0, 'page navigation never confirms an action');
   watch.listeners.touch[0](1, { x: 12, y: 12 });
-  assert.ok(watch.drawings.includes('Hold for a longer'));
+  assert.ok(watch.drawings.includes('Tap for last 10 seconds'));
   assert.equal(watch.writes.length, 0, 'the top-left logo only returns home');
 
   sendDocument(watch, {
@@ -346,4 +514,18 @@ test('clarification screen offers Speak instead using the recording trigger', ()
   assert.equal(watch.writes.length, 1);
   assert.equal(watch.writes[0].charCodeAt(3), 1);
   assert.equal(watch.writes[0].charCodeAt(9), 1);
+  assert.ok(watch.drawings.includes('Start over'));
+  sendDocument(watch, {
+    schema: 'cue.display', version: 1, id: 'clarification-again', title: 'Clarification needed',
+    source: { app: 'cue', name: 'Cue' }, state: 'clarification_required',
+    pages: [{ id: 'clarification', elements: [{ type: 'text', text: 'Which card?' }] }],
+    actions: [], assets: [],
+  }, 111);
+  watch.writes.length = 0;
+  watch.listeners.touch[0](1, { x: 30, y: 155 });
+  const restart = watch.writes.find(value => value.charCodeAt(3) === 4);
+  assert.equal(new TextDecoder().decode(Uint8Array.from(restart.slice(9), character => character.charCodeAt(0))), '__cue_restart');
+  watch.writes.length = 0;
+  watch.listeners.touch[0](1, { x: 130, y: 155 });
+  assert.equal(watch.writes[0].charCodeAt(3), 1);
 });

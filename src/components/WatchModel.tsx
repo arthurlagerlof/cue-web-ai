@@ -99,6 +99,7 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
     let frame = 0;
     let screenTexture: CanvasTexture | undefined;
     let clonedScreenMaterials: Material[] = [];
+    let smoothedBodyGeometries: Mesh['geometry'][] = [];
     let model: Group | undefined;
     let fitSize: Vector3 | undefined;
     let introStart: number | undefined;
@@ -289,12 +290,18 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
         });
         model.rotation.set(Math.PI / 2, -0.55, 0);
         const bounds = new Box3();
+        const watchBody = model.getObjectByName('body');
+        if (!watchBody) throw new Error('The Bangle.js 2 GLB is missing the body mesh.');
+        watchBody.traverse(object => {
+          if (!(object instanceof Mesh)) return;
+          object.geometry = object.geometry.clone();
+          object.geometry.computeVertexNormals();
+          smoothedBodyGeometries.push(object.geometry);
+          if (mode === 'demo') watchMeshes.push(object);
+        });
         if (mode === 'demo') {
-          const watchBody = model.getObjectByName('body');
-          if (!watchBody) throw new Error('The Bangle.js 2 GLB is missing the body mesh.');
           bounds.expandByObject(watchBody);
           bounds.expandByObject(screen);
-          watchBody.traverse(object => { if (object instanceof Mesh) watchMeshes.push(object); });
           watchMeshes.push(...screenMeshes);
         } else {
           bounds.setFromObject(model);
@@ -330,6 +337,7 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
       }
       screenTexture?.dispose();
       clonedScreenMaterials.forEach(material => material.dispose());
+      smoothedBodyGeometries.forEach(geometry => geometry.dispose());
       renderer.dispose();
       renderer.domElement.remove();
       finishIntro();

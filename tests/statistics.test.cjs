@@ -9,6 +9,7 @@ const {
   markMultiStep,
   recordClarification,
   recordExternalCall,
+  recordIndexInitialization,
   recordLocalInference,
   recordLocalProcessing,
   recordToolExecution,
@@ -21,6 +22,17 @@ const { createMemoryStorage } = require('../src/storage/storage.ts');
 function measuredRequest(id, startedAt, mode = 'web_ai') {
   return beginRequestMeasurement(mode, startedAt, id);
 }
+
+test('index initialization time is excluded from request latency and survives restoration', () => {
+  const measurement = measuredRequest('index-test', 1000);
+  recordIndexInitialization(measurement, 200);
+  recordLocalInference(measurement, 'query-model', 25);
+  const restored = restoreRequestMeasurement(serializeRequestMeasurement(measurement));
+  const result = completeRequestMeasurement(restored, 'completed', 1500);
+  assert.equal(result.responseMs, 300);
+  assert.equal(result.localInferenceMs, 25);
+  assert.deepEqual(result.localModels, ['query-model']);
+});
 
 test('request statistics preserve measured modes, latency, model calls, tool outcomes, and averages', () => {
   const local = measuredRequest('10000000-0000-4000-8000-000000000001', 1000);
@@ -112,6 +124,21 @@ test('empty groups and legacy records do not produce invented mode comparisons',
   const legacy = { ...completeRequestMeasurement(measurement, 'completed', 40), selectedMode: undefined };
   assert.equal(calculateStatistics([legacy]).bySelectedMode.reduce((n, group) => n + group.requests, 0), 0);
   assert.equal(calculateStatistics([]).completionRate, null);
+});
+
+test('statistics filter by exact original request across modes and exclude missing request text', () => {
+  const records = [
+    { ...completeRequestMeasurement(measuredRequest('a', 100, 'web_ai'), 'completed', 200), requestText: 'Demo request' },
+    { ...completeRequestMeasurement(measuredRequest('b', 200, 'dots3_always'), 'completed', 500), requestText: 'Demo request' },
+    { ...completeRequestMeasurement(measuredRequest('c', 300, 'automatic'), 'failed', 400), requestText: 'Demo request changed' },
+    { ...completeRequestMeasurement(measuredRequest('d', 400), 'completed', 500), requestText: null },
+  ];
+  assert.equal(calculateStatistics(records).sampleSize, 4);
+  const stats = calculateStatistics(records, 'Demo request');
+  assert.equal(stats.sampleSize, 2);
+  assert.equal(stats.averageResponseMs, 200);
+  assert.deepEqual(stats.bySelectedMode.map(mode => mode.requests), [1, 0, 1]);
+  assert.equal(calculateStatistics(records, 'Unmatched request').sampleSize, 0);
 });
 
 test('pending measurements preserve the original request and selected mode', () => {

@@ -39,9 +39,8 @@ export function shouldNormalizeArguments({ tool, request, originalRequest, resol
   const text = `${originalRequest ?? ''}\n${request ?? ''}`.trim();
   if (!text) return false;
   if (tool.id === 'anki.create_card') {
-    if (/\b(?:front|question|back|answer)\s*[:=]/i.test(text)) return false;
     const explicitCardTask = /\b(?:create|make|write|generate)\b.{0,30}\b(?:flash\s*card|anki card|study card)\b/i.test(text);
-    const hasTopicOrSource = /\b(?:about|on|topic|based on|from|what is|why does|how does)\b/i.test(text) || text.split(/\s+/).length >= 9;
+    const hasTopicOrSource = /\b(?:about|on|topic|based on|from|what is|why does|how does|invent|generate)\b/i.test(text) || text.split(/\s+/).length >= 9;
     return explicitCardTask && hasTopicOrSource;
   }
   if (tool.id === 'calendar.create_event') {
@@ -66,9 +65,10 @@ export function buildArgumentNormalizationPrompt({
   currentDate,
 }) {
   return [
+    'Respond as quickly as possible. Minimize internal reasoning; do not deliberate over alternatives or include analysis. Return the required JSON directly.',
     'Handle arguments only for the selected tool; never choose or execute an action.',
-    'Return one JSON object with status, arguments, missing, ambiguous, provenance; no markdown or extra keys. Follow the supplied schema, preserve explicit values, and never invent dates, times, people, IDs, or facts.',
-    'Transform source text using only its facts. For explicit flashcard generation about a topic, concise front/back content may be model_generated and must be reviewed by the user.',
+    'Return one JSON object with status, arguments, missing, ambiguous, provenance; no markdown or extra keys. Follow the supplied schema and preserve explicit values. Never invent user-specific facts, dates, times, people, or IDs.',
+    'For a request to create a flashcard about a topic, or an explicit request to invent its content, generate concise front/back content from the topic or general knowledge instead of asking for it. Mark generated content model_generated; it must be reviewed by the user. For other fields, use only supplied facts.',
     JSON.stringify({
       originalRequest,
       currentRequest: request,

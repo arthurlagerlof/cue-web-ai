@@ -105,6 +105,14 @@ export function assertDisplayDocument(document, options) {
   return document;
 }
 
+export function parseDisplayDocument(text, options) {
+  let document;
+  try { document = JSON.parse(text); }
+  catch { return null; }
+  if (document?.schema !== 'cue.display') return null;
+  return assertDisplayDocument(document, options);
+}
+
 export function hasMessageElement(document) {
   if (typeof document?.message !== 'string') return false;
   const containsMessage = elements => Array.isArray(elements) && elements.some(element =>

@@ -34,6 +34,17 @@ export function splitActionClauses(request) {
   return [request.trim()];
 }
 
+export function clarificationRestart(text) {
+  const trimmed = text.trim();
+  if (/^(?:go back|start over|restart|cancel|stop|never mind|nevermind)[.!?]*$/i.test(trimmed)) return '';
+  const match = trimmed.match(/^(?:no[, ]+)?(?:i meant|i mean|what i meant was|instead[, ]+i (?:meant|mean))\s*[,:\-]?\s+(.+)$/i);
+  return match ? match[1].trim() : undefined;
+}
+
+export function clarificationHasCompletedSideEffects(state) {
+  return Boolean(state?.seenSideEffects?.length || state?.executionState?.executedSideEffects?.length);
+}
+
 export function requiresExternalPlanning(request) {
   const text = request.toLocaleLowerCase();
   if (splitActionClauses(request).length > 1) return 'multiple dependent actions';
