@@ -1,6 +1,7 @@
 export class RollingAudio {
   private context?: AudioContext;
   private stream?: MediaStream;
+  private streamEnded?: () => void;
   private processor?: ScriptProcessorNode;
   private outputGain?: GainNode;
   private chunks: Float32Array[] = [];
@@ -22,9 +23,13 @@ export class RollingAudio {
     if (this.active) return;
     if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone capture is unavailable in this browser/context.');
     this.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, channelCount: 1 } });
+    const stream = this.stream;
+    this.streamEnded = () => { if (this.stream === stream) this.stop(); };
+    stream.getAudioTracks().forEach(track => track.addEventListener('ended', this.streamEnded!));
     try {
       this.context = new AudioContext();
       await this.context.resume();
+      if (this.stream !== stream) throw new Error('The microphone stopped while starting.');
       this.targetSamples = Math.round(this.durationSeconds * this.context.sampleRate);
       const source = this.context.createMediaStreamSource(this.stream);
       this.processor = this.context.createScriptProcessor(4096, 1, 1);
@@ -82,6 +87,10 @@ export class RollingAudio {
   stop() {
     this.processor?.disconnect(); this.processor = undefined;
     this.outputGain?.disconnect(); this.outputGain = undefined;
+    this.stream?.getAudioTracks().forEach(track => {
+      if (this.streamEnded) track.removeEventListener('ended', this.streamEnded);
+    });
+    this.streamEnded = undefined;
     this.stream?.getTracks().forEach(track => track.stop()); this.stream = undefined;
     void this.context?.close(); this.context = undefined;
     this.chunks = []; this.samples = 0; this.changed();

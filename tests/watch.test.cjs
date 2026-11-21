@@ -4,9 +4,10 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const path = require('node:path');
 
-function loadWatch({ parseJson } = {}) {
+function loadWatch({ parseJson, connected = true } = {}) {
   const listeners = {};
   const uartListeners = {};
+  const bleListeners = {};
   const writes = [];
   const stored = {};
   const drawings = [];
@@ -48,6 +49,11 @@ function loadWatch({ parseJson } = {}) {
       println: value => writes.push(value),
       write: value => writes.push(value),
     },
+    NRF: {
+      getSecurityStatus: () => ({ connected }),
+      on: (name, fn) => { (bleListeners[name] ||= []).push(fn); },
+      removeListener: (name, fn) => { bleListeners[name] = (bleListeners[name] || []).filter(listener => listener !== fn); },
+    },
     g: {
       getWidth: () => 176,
       getHeight: () => 176,
@@ -70,7 +76,7 @@ function loadWatch({ parseJson } = {}) {
   vm.runInContext(fs.readFileSync(path.join(__dirname, '..', 'watch', 'bangle-app.js'), 'utf8'), context, { filename: 'bangle-app.js' });
   writes.length = 0;
   return {
-    context, listeners, uartListeners, writes, stored, drawings, asciiDecodes: () => asciiDecodes,
+    context, listeners, uartListeners, bleListeners, writes, stored, drawings, asciiDecodes: () => asciiDecodes,
     advance: ms => {
       const target = now + ms;
       while (true) {
@@ -98,16 +104,59 @@ function sendDocument(watch, document, id = 42) {
   chunks.forEach((chunk, index) => watch.uartListeners.data[0](frame(2, id, index, chunks.length, chunk)));
 }
 
-test('ready screen shows tap and hold instructions', () => {
+test('ready screen shows only the tap instruction', () => {
   const watch = loadWatch();
   assert.ok(watch.drawings.includes('Cue.'));
   assert.ok(!watch.drawings.includes('cue_logo.png'));
   assert.ok(watch.drawings.includes('Tap for last 10 seconds'));
-  assert.ok(watch.drawings.includes('Hold for a longer'));
-  assert.ok(watch.drawings.includes('recording'));
+  assert.ok(!watch.drawings.includes('Hold for a longer'));
 });
 
-test('short tap sends exactly one existing trigger and never becomes a long press', () => {
+test('disconnected watch blocks input and shows the tap instruction only after connecting', () => {
+  const watch = loadWatch({ connected: false });
+  assert.ok(watch.drawings.includes('DISCONNECTED'));
+  assert.ok(watch.drawings.some(line => line.includes('Connect Cue over')));
+  assert.ok(!watch.drawings.includes('Tap for last 10 seconds'));
+  watch.listeners.touch[0](1, { x: 88, y: 73 });
+  assert.equal(watch.writes.length, 0);
+
+  watch.drawings.length = 0;
+  watch.bleListeners.connect[0]('peer');
+  assert.ok(watch.drawings.includes('Tap for last 10 seconds'));
+  watch.listeners.touch[0](1, { x: 88, y: 73 });
+  assert.equal(watch.writes[0].charCodeAt(3), 1);
+  assert.ok(watch.drawings.includes('THINKING...'));
+
+  watch.drawings.length = 0;
+  watch.writes.length = 0;
+  watch.bleListeners.disconnect[0]();
+  assert.ok(watch.drawings.includes('DISCONNECTED'));
+  assert.ok(!watch.drawings.includes('Tap for last 10 seconds'));
+  watch.listeners.touch[0](1, { x: 88, y: 73 });
+  assert.equal(watch.writes.length, 0);
+  watch.drawings.length = 0;
+  watch.bleListeners.connect[0]('peer');
+  assert.ok(watch.drawings.includes('Tap for last 10 seconds'));
+  assert.ok(!watch.drawings.includes('THINKING...'));
+});
+
+test('disconnect clears incomplete transfers and removes Bluetooth listeners on cleanup', () => {
+  const watch = loadWatch();
+  watch.uartListeners.data[0](frame(2, 42, 0, 2, Array.from(Buffer.from('hello'))));
+  assert.ok(watch.drawings.includes('LOADING...'));
+  watch.bleListeners.disconnect[0]();
+  watch.advance(10001);
+  watch.bleListeners.connect[0]('peer');
+  assert.ok(!watch.drawings.includes('Transfer timed out. Retrying may help.'));
+  watch.uartListeners.data[0](frame(2, 42, 1, 2, Array.from(Buffer.from('world'))));
+  assert.equal(watch.stored['cue-memory.txt'], undefined);
+  watch.context.ui.remove();
+  assert.equal(watch.bleListeners.connect.length, 0);
+  assert.equal(watch.bleListeners.disconnect.length, 0);
+  assert.equal(watch.uartListeners.data.length, 0);
+});
+
+test('tap sends exactly one existing trigger', () => {
   const watch = loadWatch();
   watch.listeners.drag[0]({ b: true, x: 88, y: 73 });
   watch.advance(449);
@@ -119,13 +168,13 @@ test('short tap sends exactly one existing trigger and never becomes a long pres
   assert.ok(watch.drawings.includes('THINKING...'));
 });
 
-test('long press shows recording state and sends one trigger on release', () => {
+test('holding the watch does not start a longer recording or send a trigger', () => {
   const watch = loadWatch();
   watch.listeners.drag[0]({ b: true, x: 88, y: 73 });
-  watch.advance(450);
-  assert.ok(watch.drawings.includes('RECORDING'));
-  assert.ok(watch.drawings.includes('Release to finish'));
+  watch.advance(1500);
+  assert.ok(!watch.drawings.includes('RECORDING'));
   watch.listeners.drag[0]({ b: false, x: 88, y: 73 });
+  assert.equal(watch.writes.length, 0);
   watch.listeners.touch[0](1, { x: 88, y: 73 });
   assert.equal(watch.writes.length, 1);
   assert.equal(watch.writes[0].charCodeAt(3), 1);
@@ -392,7 +441,7 @@ test('result actions, confirmation buttons, and logo navigation remain explicit'
   watch.context.ui.swipe(1);
   assert.equal(watch.writes.length, 0, 'page navigation never confirms an action');
   watch.listeners.touch[0](1, { x: 12, y: 12 });
-  assert.ok(watch.drawings.includes('Hold for a longer'));
+  assert.ok(watch.drawings.includes('Tap for last 10 seconds'));
   assert.equal(watch.writes.length, 0, 'the top-left logo only returns home');
 
   sendDocument(watch, {
@@ -465,4 +514,18 @@ test('clarification screen offers Speak instead using the recording trigger', ()
   assert.equal(watch.writes.length, 1);
   assert.equal(watch.writes[0].charCodeAt(3), 1);
   assert.equal(watch.writes[0].charCodeAt(9), 1);
+  assert.ok(watch.drawings.includes('Start over'));
+  sendDocument(watch, {
+    schema: 'cue.display', version: 1, id: 'clarification-again', title: 'Clarification needed',
+    source: { app: 'cue', name: 'Cue' }, state: 'clarification_required',
+    pages: [{ id: 'clarification', elements: [{ type: 'text', text: 'Which card?' }] }],
+    actions: [], assets: [],
+  }, 111);
+  watch.writes.length = 0;
+  watch.listeners.touch[0](1, { x: 30, y: 155 });
+  const restart = watch.writes.find(value => value.charCodeAt(3) === 4);
+  assert.equal(new TextDecoder().decode(Uint8Array.from(restart.slice(9), character => character.charCodeAt(0))), '__cue_restart');
+  watch.writes.length = 0;
+  watch.listeners.touch[0](1, { x: 130, y: 155 });
+  assert.equal(watch.writes[0].charCodeAt(3), 1);
 });

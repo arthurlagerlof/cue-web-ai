@@ -312,8 +312,9 @@ function average(values: number[]) {
   return values.length ? values.reduce((total, value) => total + value, 0) / values.length : null;
 }
 
-export function calculateStatistics(records: RequestStatistic[]): StatisticsSummary {
-  const ordered = [...records].sort((left, right) => left.completedAt.localeCompare(right.completedAt));
+export function calculateStatistics(records: RequestStatistic[], requestText?: string): StatisticsSummary {
+  const ordered = records.filter(record => requestText === undefined || record.requestText === requestText)
+    .sort((left, right) => left.completedAt.localeCompare(right.completedAt));
   const averageExternalApiCalls = average(ordered.map(record => record.externalCalls));
   const averageResponseMs = average(ordered.map(record => record.responseMs));
   const totalExternalApiCalls = ordered.reduce((total, record) => total + record.externalCalls, 0);

@@ -24,6 +24,18 @@ function loadFailure(error: unknown) {
   return `loading error: ${detail}`;
 }
 
+async function hasWebGpu(notice: (message: string) => void, label: string) {
+  try {
+    const gpu = (navigator as Navigator & { gpu?: { requestAdapter: () => Promise<unknown> } }).gpu;
+    const available = Boolean(gpu && await gpu.requestAdapter());
+    if (!available) notice(`${label} WebGPU unavailable; using WASM`);
+    return available;
+  } catch (error) {
+    notice(`${label} WebGPU availability check failed: ${errorDetail(error)}; using WASM`);
+    return false;
+  }
+}
+
 async function rerank(id: number, modelId: string, text: string, candidates: Array<{ toolId: string; text: string }>) {
   const started = Date.now();
   const notice = (message: string, statusOnly = false) => postMessage({ id, stage: 'rerank', status: 'notice', model: modelId, message, statusOnly });
@@ -53,15 +65,7 @@ async function rerank(id: number, modelId: string, text: string, candidates: Arr
   };
   let entry = pipelines.rerank;
   if (!entry || entry.modelId !== modelId) {
-    let webgpuAvailable = false;
-    try {
-      const gpu = (navigator as Navigator & { gpu?: { requestAdapter: () => Promise<unknown> } }).gpu;
-      webgpuAvailable = Boolean(gpu && await gpu.requestAdapter());
-      if (!webgpuAvailable) notice('Cross-encoder WebGPU unavailable; using WASM');
-    } catch (error) {
-      notice(`Cross-encoder WebGPU availability check failed: ${errorDetail(error)}; using WASM`);
-    }
-    if (webgpuAvailable) {
+    if (await hasWebGpu(notice, 'Cross-encoder')) {
       try {
         entry = await load('webgpu');
       } catch (error) {
@@ -110,6 +114,55 @@ async function rerank(id: number, modelId: string, text: string, candidates: Arr
   return scores;
 }
 
+async function transcribe(id: number, modelId: string, audio: Float32Array) {
+  const notice = (message: string) => postMessage({ id, stage: 'transcribe', status: 'notice', model: modelId, message });
+  const load = async (device: 'webgpu' | 'wasm') => {
+    notice(`Whisper loading on ${device === 'wasm' ? 'CPU (WASM)' : 'WebGPU'}`);
+    try {
+      const instance = await pipeline('automatic-speech-recognition', modelId, { device, dtype: device === 'wasm' ? 'q8' : 'q4' });
+      return pipelines.transcribe = { modelId, instance, device };
+    } catch (error) {
+      throw new Error(`Whisper ${device} ${loadFailure(error)}`);
+    }
+  };
+  let entry = pipelines.transcribe;
+  if (!entry || entry.modelId !== modelId) {
+    if (await hasWebGpu(notice, 'Whisper')) {
+      try {
+        entry = await load('webgpu');
+      } catch (error) {
+        notice(`${errorDetail(error)}; retrying on CPU (WASM)`);
+        entry = await load('wasm');
+      }
+    } else {
+      entry = await load('wasm');
+    }
+  }
+  postMessage({ id, stage: 'transcribe', status: 'running', model: modelId });
+  const run = async (current: NonNullable<typeof entry>) => {
+    const result = await current.instance(audio, { sampling_rate: 16000, return_timestamps: false });
+    return (result as { text?: string }).text ?? '';
+  };
+  try {
+    return await run(entry);
+  } catch (error) {
+    if (entry.device !== 'webgpu') throw new Error(`Whisper wasm inference error: ${errorDetail(error)}`);
+    notice(`Whisper WebGPU inference error: ${errorDetail(error)}; retrying on CPU (WASM)`);
+    delete pipelines.transcribe;
+    try {
+      await entry.instance.dispose();
+    } catch (disposeError) {
+      notice(`Whisper WebGPU cleanup failed: ${errorDetail(disposeError)}`);
+    }
+    entry = await load('wasm');
+    try {
+      return await run(entry);
+    } catch (wasmError) {
+      throw new Error(`Whisper wasm inference error: ${errorDetail(wasmError)}`);
+    }
+  }
+}
+
 self.onmessage = async (event: MessageEvent<RequestMessage>) => {
   const { id, stage } = event.data;
   let modelId: string | undefined;
@@ -127,15 +180,6 @@ self.onmessage = async (event: MessageEvent<RequestMessage>) => {
       return;
     }
     postMessage({ id, stage, status: 'loading', model: modelId });
-    if (!pipelines[stage] || pipelines[stage].modelId !== modelId) {
-      const task = stage === 'transcribe' ? 'automatic-speech-recognition' : 'feature-extraction';
-      const device = 'webgpu';
-      const dtype = stage === 'embed' ? 'q8' : 'q4';
-      const instance = await pipeline(task as never, modelId, { device, dtype, ...(stage === 'embed' ? { revision: EMBEDDING_REVISION } : {}) } as never);
-      pipelines[stage] = { modelId, instance };
-    }
-    const modelPipeline = pipelines[stage]!.instance;
-    postMessage({ id, stage, status: 'running', model: modelId });
     let result: unknown;
     if (stage === 'transcribe') {
       if (!event.data.audio || !event.data.sampleRate) throw new Error('Audio data is missing.');
@@ -153,10 +197,15 @@ self.onmessage = async (event: MessageEvent<RequestMessage>) => {
           audio[i] = (source[left] ?? 0) * (1 - fraction) + (source[left + 1] ?? source[left] ?? 0) * fraction;
         }
       }
-      result = await modelPipeline(audio, { sampling_rate: targetRate, return_timestamps: false });
-      result = (result as { text?: string }).text ?? '';
+      result = await transcribe(id, modelId, audio);
     } else if (stage === 'embed') {
       if (!event.data.text?.trim()) throw new Error('Text to embed is empty.');
+      if (!pipelines.embed || pipelines.embed.modelId !== modelId) {
+        const instance = await pipeline('feature-extraction', modelId, { device: 'webgpu', dtype: 'q8', revision: EMBEDDING_REVISION });
+        pipelines.embed = { modelId, instance };
+      }
+      const modelPipeline = pipelines.embed.instance;
+      postMessage({ id, stage, status: 'running', model: modelId });
       const output = await modelPipeline(event.data.text, { pooling: 'mean', normalize: true });
       const vector = Array.from(output.data as Float32Array);
       result = { vector, dimensions: output.dims?.at(-1) ?? vector.length };

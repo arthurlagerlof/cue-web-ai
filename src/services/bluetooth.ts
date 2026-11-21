@@ -40,6 +40,9 @@ export class BangleConnection {
   private disconnectListener?: () => void;
   private connectionAttempt?: Promise<string>;
   private ready = false;
+  private microphoneActive = false;
+  private installing = false;
+  private writeQueue: Promise<void> = Promise.resolve();
   private currentStatus = 'Not connected';
   private statusListeners = new Set<(message: string) => void>();
   onCommand?: (command: string) => void;
@@ -141,6 +144,7 @@ export class BangleConnection {
       await tx.startNotifications();
       this.ready = true;
       const name = this.device.name ?? 'Bangle.js';
+      await this.sendMicrophoneStatus();
       this.setStatus(`Connected: ${name}`);
       this.onDiagnostic?.('Notifications enabled on UART TX');
       return name;
@@ -179,6 +183,10 @@ export class BangleConnection {
         this.pendingCapabilities.get(id)?.();
         continue;
       }
+      if (type === 8 && count === 1 && index === 0 && payload.length === 1 && payload[0] === 1) {
+        if (!this.installing) void this.sendMicrophoneStatus().catch(error => this.onDiagnostic?.(`Could not sync microphone status: ${error instanceof Error ? error.message : String(error)}`));
+        continue;
+      }
       if (type === 3 && count === 1 && index === 0 && payload.length === 1) {
         this.onDiagnostic?.(`ACK frame: id=${id}, status=${payload[0]}, waiting=${this.pendingAcks.has(id)}`);
         this.pendingAcks.get(id)?.(payload[0] === 0);
@@ -203,15 +211,46 @@ export class BangleConnection {
     }
   }
 
+  private async writeCharacteristic(characteristic: GattCharacteristic, data: Uint8Array) {
+    const write = this.writeQueue.then(async () => {
+      if (this.characteristic !== characteristic) throw new Error('Watch connection changed before writing.');
+      if (characteristic.writeValueWithoutResponse) await characteristic.writeValueWithoutResponse(data);
+      else await characteristic.writeValue(data);
+    });
+    this.writeQueue = write.catch(() => {});
+    await write;
+  }
+
   private async sendFrame(type: number, id: number, payload: Uint8Array) {
-    if (!this.characteristic) return;
+    const characteristic = this.characteristic;
+    if (!characteristic) return;
     const frame = new Uint8Array(HEADER_SIZE + payload.length);
     frame.set([0x42, 0x4d, 1, type, id & 255, id >> 8, 0, 1, payload.length]); frame.set(payload, HEADER_SIZE);
-    if (this.characteristic.writeValueWithoutResponse) await this.characteristic.writeValueWithoutResponse(frame);
-    else await this.characteristic.writeValue(frame);
+    await this.writeCharacteristic(characteristic, frame);
+  }
+
+  async setMicrophoneActive(active: boolean) {
+    if (this.microphoneActive === active) return;
+    this.microphoneActive = active;
+    if (this.connected && !this.installing) await this.sendMicrophoneStatus();
+  }
+
+  private async sendMicrophoneStatus() {
+    await this.sendFrame(7, nextMessageId++ & 0xffff, new Uint8Array([this.microphoneActive ? 1 : 0]));
   }
 
   async installWatchApp(appSource: string, onProgress: (message: string) => void) {
+    if (!this.characteristic) throw new Error('Connect the Bangle.js before installing the app.');
+    this.installing = true;
+    try {
+      await this.installWatchAppFiles(appSource, onProgress);
+    } finally {
+      this.installing = false;
+    }
+    await this.sendMicrophoneStatus();
+  }
+
+  private async installWatchAppFiles(appSource: string, onProgress: (message: string) => void) {
     if (!this.characteristic) throw new Error('Connect the Bangle.js before installing the app.');
     const rx = this.characteristic;
     const tx = await this.device!.gatt!.connect().then(server => server.getPrimaryService(UART_SERVICE)).then(service => service.getCharacteristic(UART_TX));
@@ -234,8 +273,7 @@ export class BangleConnection {
       const bytes = new TextEncoder().encode(text);
       for (let offset = 0; offset < bytes.length; offset += 20) {
         const chunk = bytes.slice(offset, offset + 20);
-        if (rx.writeValueWithoutResponse) await rx.writeValueWithoutResponse(chunk);
-        else await rx.writeValue(chunk);
+        await this.writeCharacteristic(rx, chunk);
       }
     };
     const waitFor = (token: string) => new Promise<void>((resolve, reject) => {
@@ -314,8 +352,7 @@ export class BangleConnection {
     const bytes = new TextEncoder().encode('TEST');
     this.onDiagnostic?.(`Writing raw UART text to ${UART_RX}: ${Array.from(bytes).map(byte => byte.toString(16).padStart(2, '0')).join(' ')}`);
     try {
-      if (this.characteristic.writeValueWithoutResponse) await this.characteristic.writeValueWithoutResponse(bytes);
-      else await this.characteristic.writeValue(bytes);
+      await this.writeCharacteristic(this.characteristic, bytes);
     } catch (error) {
       resolveRaw(false);
       throw error;
@@ -386,8 +423,7 @@ export class BangleConnection {
           const payload = bytes.slice(i * chunkSize, (i + 1) * chunkSize);
           const frame = new Uint8Array(HEADER_SIZE + payload.length);
           frame.set([0x42, 0x4d, 1, 2, id & 255, id >> 8, i, count, payload.length]); frame.set(payload, HEADER_SIZE);
-          if (this.characteristic.writeValueWithoutResponse) await this.characteristic.writeValueWithoutResponse(frame);
-          else await this.characteristic.writeValue(frame);
+          await this.writeCharacteristic(this.characteristic, frame);
           this.onDiagnostic?.(`Wrote RX frame id=${id}, chunk=${i + 1}/${count}, bytes=${Array.from(frame, byte => byte.toString(16).padStart(2, '0')).join(' ')}`);
           if (i + 1 < count && ackStatus === undefined) await new Promise(resolve => window.setTimeout(resolve, 20));
         }
@@ -412,8 +448,7 @@ export class BangleConnection {
   async send(message: string) {
     if (!this.characteristic) return;
     const data = new TextEncoder().encode(`${message}\n`);
-    if (this.characteristic.writeValueWithoutResponse) await this.characteristic.writeValueWithoutResponse(data);
-    else await this.characteristic.writeValue(data);
+    await this.writeCharacteristic(this.characteristic, data);
   }
 
   disconnect() {

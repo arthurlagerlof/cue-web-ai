@@ -126,6 +126,21 @@ test('empty groups and legacy records do not produce invented mode comparisons',
   assert.equal(calculateStatistics([]).completionRate, null);
 });
 
+test('statistics filter by exact original request across modes and exclude missing request text', () => {
+  const records = [
+    { ...completeRequestMeasurement(measuredRequest('a', 100, 'web_ai'), 'completed', 200), requestText: 'Demo request' },
+    { ...completeRequestMeasurement(measuredRequest('b', 200, 'dots3_always'), 'completed', 500), requestText: 'Demo request' },
+    { ...completeRequestMeasurement(measuredRequest('c', 300, 'automatic'), 'failed', 400), requestText: 'Demo request changed' },
+    { ...completeRequestMeasurement(measuredRequest('d', 400), 'completed', 500), requestText: null },
+  ];
+  assert.equal(calculateStatistics(records).sampleSize, 4);
+  const stats = calculateStatistics(records, 'Demo request');
+  assert.equal(stats.sampleSize, 2);
+  assert.equal(stats.averageResponseMs, 200);
+  assert.deepEqual(stats.bySelectedMode.map(mode => mode.requests), [1, 0, 1]);
+  assert.equal(calculateStatistics(records, 'Unmatched request').sampleSize, 0);
+});
+
 test('pending measurements preserve the original request and selected mode', () => {
   const measurement = measuredRequest('25000000-0000-4000-8000-000000000001', 500);
   measurement.requestText = 'Find my meeting';

@@ -2,8 +2,9 @@ import { lazy, Suspense, useEffect, useRef, useState } from 'react';
 import watchAppSource from '../watch/bangle-app.js?raw';
 import { navigateTo } from './navigation';
 import { watch } from './services/watch';
+import { DEMO_SCENARIOS } from './demo/demoScenarios.js';
 import type { UserDatabase } from './storage/userDatabase';
-import { calculateStatistics, flushTelemetryQueue, type ModeStatistics, type StatisticsSummary } from './statistics';
+import { calculateStatistics, flushTelemetryQueue, type ModeStatistics, type RequestStatistic, type StatisticsSummary } from './statistics';
 
 const WatchModel = lazy(() => import('./components/WatchModel'));
 
@@ -33,8 +34,9 @@ function parseStatistics(value: unknown): StatisticsSummary {
   return value as StatisticsSummary;
 }
 
-async function requestGlobalUsage() {
-  const response = await fetch('/.netlify/functions/global-stats', {
+async function requestGlobalUsage(request: string) {
+  const query = request ? `?${new URLSearchParams({ request })}` : '';
+  const response = await fetch(`/.netlify/functions/global-stats${query}`, {
     method: 'GET',
     cache: 'no-store',
     credentials: 'omit',
@@ -80,23 +82,16 @@ const comparisonMetrics: Array<{
   { label: 'Output tokens per request', field: 'averageOutputTokens', unit: 'tokens', sample: mode => mode.tokenSampleSize },
 ];
 
-function ModeComparisons({ modes }: { modes: ModeStatistics[] }) {
+function ModeComparisons({ modes, filtered }: { modes: ModeStatistics[]; filtered: boolean }) {
   return <>
     <h4>Measured comparisons by selected mode</h4>
-    <p>These are unpaired requests, not controlled runs of the same request. Small samples may be unreliable. Token averages include requests with complete reported token counts, including zero for requests without external calls.</p>
+    <p>{filtered ? 'These are unpaired runs of the selected request, not controlled experiments.' : 'These are unpaired requests, not controlled runs of the same request.'} Small samples may be unreliable. Token averages include requests with complete reported token counts, including zero for requests without external calls.</p>
     {comparisonMetrics.map(metric => {
       const values = modes.map(mode => {
         const value = mode[metric.field];
         return typeof value === 'number' ? value * (metric.scale ?? 1) : null;
       });
       const max = Math.max(0, ...values.filter((value): value is number => value !== null));
-      const differences = modes.flatMap((mode, index) => modes.slice(index + 1).flatMap((other, offset) => {
-        const otherIndex = index + offset + 1;
-        const left = values[index];
-        const right = values[otherIndex];
-        if (left === null || right === null || !metric.sample(mode) || !metric.sample(other)) return [];
-        return [`${modeLabels[mode.mode]} − ${modeLabels[other.mode]}: ${formatAverage(left - right)} ${metric.unit === '%' ? 'percentage points' : metric.unit}`];
-      }));
       return <div className="statistics-comparison" key={metric.field}>
         <h5>{metric.label}</h5>
         {modes.map((mode, index) => <div className="statistics-bar-row" key={mode.mode}>
@@ -104,14 +99,13 @@ function ModeComparisons({ modes }: { modes: ModeStatistics[] }) {
           <div className="statistics-bar-track" aria-hidden="true"><div className="statistics-bar" style={{ width: `${max && values[index] !== null ? values[index]! / max * 100 : 0}%` }} /></div>
           <span>{values[index] === null ? '—' : `${formatAverage(values[index])} ${metric.unit}`} (n={metric.sample(mode)})</span>
         </div>)}
-        {differences.length > 0 && <p>{differences.join(' · ')}</p>}
       </div>;
     })}
     <p>{modes.map(mode => `${modeLabels[mode.mode]}: ${mode.requests} requests (${mode.periodStart && mode.periodEnd ? `${new Date(mode.periodStart).toLocaleDateString()} – ${new Date(mode.periodEnd).toLocaleDateString()}` : 'no data'})`).join(' · ')}</p>
   </>;
 }
 
-function StatisticsSummaryView({ title, stats, local = false }: { title: string; stats: StatisticsSummary; local?: boolean }) {
+function StatisticsSummaryView({ title, stats, local = false, filtered = false }: { title: string; stats: StatisticsSummary; local?: boolean; filtered?: boolean }) {
   const period = stats.periodStart && stats.periodEnd
     ? `${new Date(stats.periodStart).toLocaleDateString()} – ${new Date(stats.periodEnd).toLocaleDateString()}`
     : 'No completed requests yet';
@@ -124,7 +118,7 @@ function StatisticsSummaryView({ title, stats, local = false }: { title: string;
       <div><dt>Completion rate</dt><dd>{formatPercent(stats.completionRate === null ? null : stats.completionRate * 100)}</dd></div>
       <div><dt>Tool success rate</dt><dd>{formatPercent(stats.toolSuccessRate === null ? null : stats.toolSuccessRate * 100)}</dd></div>
     </dl>
-    <ModeComparisons modes={stats.bySelectedMode} />
+    <ModeComparisons modes={stats.bySelectedMode} filtered={filtered} />
     <h4>Average timing by execution mode</h4>
     {stats.byMode.length
       ? <div className="statistics-table-wrap"><table className="statistics-table">
@@ -160,12 +154,15 @@ export default function Landing() {
   const [installed, setInstalled] = useState(false);
   const [installStatus, setInstallStatus] = useState('');
   const [database, setDatabase] = useState<UserDatabase>();
-  const [localUsage, setLocalUsage] = useState<StatisticsSummary>();
+  const [localRecords, setLocalRecords] = useState<RequestStatistic[]>();
+  const [selectedRequest, setSelectedRequest] = useState('');
+  const [globalRefresh, setGlobalRefresh] = useState(0);
   const [sharingEnabled, setSharingEnabled] = useState(false);
   const [sharingStatus, setSharingStatus] = useState('');
-  const [globalUsage, setGlobalUsage] = useState<StatisticsSummary>();
+  const [globalUsage, setGlobalUsage] = useState<{ request: string; stats: StatisticsSummary }>();
   const [globalBusy, setGlobalBusy] = useState(true);
   const [globalError, setGlobalError] = useState('');
+  const localUsage = localRecords && calculateStatistics(localRecords, selectedRequest || undefined);
 
   const connected = watch.connected;
   const connectionStage = watchStatus.startsWith('Requesting')
@@ -253,26 +250,12 @@ export default function Landing() {
         if (!active) return;
         telemetryDatabase = openedDatabase;
         setDatabase(openedDatabase);
-        setLocalUsage(calculateStatistics(records));
+        setLocalRecords(records);
         setSharingEnabled(sharing === true);
         retryTelemetry();
       })
       .catch(error => {
         if (active) setSharingStatus(`Local browser storage is unavailable: ${error instanceof Error ? error.message : String(error)}`);
-      });
-
-    void requestGlobalUsage()
-      .then(stats => {
-        if (active) {
-          setGlobalUsage(stats);
-          setGlobalError('');
-        }
-      })
-      .catch(error => {
-        if (active) setGlobalError(error instanceof Error ? error.message : String(error));
-      })
-      .finally(() => {
-        if (active) setGlobalBusy(false);
       });
 
     return () => {
@@ -281,6 +264,17 @@ export default function Landing() {
       unsubscribe();
     };
   }, []);
+
+  useEffect(() => {
+    let active = true;
+    setGlobalBusy(true);
+    setGlobalError('');
+    void requestGlobalUsage(selectedRequest)
+      .then(stats => { if (active) setGlobalUsage({ request: selectedRequest, stats }); })
+      .catch(error => { if (active) setGlobalError(error instanceof Error ? error.message : String(error)); })
+      .finally(() => { if (active) setGlobalBusy(false); });
+    return () => { active = false; };
+  }, [selectedRequest, globalRefresh]);
 
   async function connectWatch() {
     setConnecting(true);
@@ -308,16 +302,8 @@ export default function Landing() {
     }
   }
 
-  async function loadGlobalUsage() {
-    setGlobalBusy(true);
-    setGlobalError('');
-    try {
-      setGlobalUsage(await requestGlobalUsage());
-    } catch (error) {
-      setGlobalError(error instanceof Error ? error.message : String(error));
-    } finally {
-      setGlobalBusy(false);
-    }
+  function loadGlobalUsage() {
+    setGlobalRefresh(count => count + 1);
   }
 
   async function toggleSharing(enabled: boolean) {
@@ -409,19 +395,26 @@ export default function Landing() {
       <div className="statistics-inner">
         <h2 id="statistics-title">Statistics</h2>
         <p>Request averages are shown with sample size and period. Public statistics show aggregates; opted-in request records are also stored on the server.</p>
+        <label>Filter by demo request
+          <select value={selectedRequest} onChange={event => setSelectedRequest(event.target.value)}>
+            <option value="">All requests</option>
+            {DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}
+          </select>
+        </label>
+        {selectedRequest && <p>Showing only records whose original request exactly matches the selected demo request. Older records without request text are excluded.</p>}
         {globalBusy
           ? <p role="status">Loading global statistics…</p>
           : globalError
             ? <div role="status"><p>Global statistics are unavailable: {globalError}</p><button onClick={() => void loadGlobalUsage()}>Retry</button></div>
-            : globalUsage && <StatisticsSummaryView title="Community aggregates" stats={globalUsage} />}
-        {localUsage && <StatisticsSummaryView title="Your browser (local only)" stats={localUsage} local />}
+            : globalUsage?.request === selectedRequest && <StatisticsSummaryView title="Community aggregates" stats={globalUsage.stats} filtered={Boolean(selectedRequest)} />}
+        {localUsage && <StatisticsSummaryView title="Your browser (local only)" stats={localUsage} local filtered={Boolean(selectedRequest)} />}
 
         <div className="statistics-sharing">
           <label>
             <input type="checkbox" checked={sharingEnabled} disabled={!database} onChange={event => void toggleSharing(event.target.checked)} />
             Opt in to automatic public telemetry.
           </label>
-          <p>Off by default. When enabled, Cue uploads the actual request text, including transcribed speech, together with execution mode, model names, timing, token and tool counts, completion status, and a random request ID. Request text may contain sensitive information; do not opt in if you do not want it stored. Requests over 100 KB are not shared. Existing telemetry users must opt in again.</p>
+          <p>Off by default. When enabled, Cue uploads the actual request text, including transcribed speech, together with execution mode, model names, timing, token and tool counts, completion status, and a random request ID. Request text may contain sensitive information; do not opt in if you do not want it stored. Requests over 100 KB are not shared.</p>
           <p>Records are stored in the database until manually deleted and can be accessed by database administrators; the public statistics endpoint shows aggregates only. Responses, tool arguments, provider records, account details and browser identifiers are not included. Failed uploads retry; turning sharing off removes queued uploads but does not delete records already sent. No extra AI calls are made for statistics.</p>
           {sharingStatus && <p role="status">{sharingStatus}</p>}
           <p>Global aggregates include opted-in records only. Use Refresh to fetch the latest public aggregate.</p>

@@ -3,10 +3,11 @@
   var BM_HEADER = 9, BM_BUFFER = [], BM_MESSAGES = {}, BM_SEEN = {}, BM_TIMERS = [];
   var BM_MANUAL_ID = 0, BM_STATE = 'home', BM_DOCUMENT, BM_LOADING_ID;
   var BM_PAGE_LAYOUTS = [], BM_PAGE = 0, BM_SCROLL = 0;
-  var BM_CONTEXT = '', BM_PRESS, BM_PRESS_TIMER, BM_IGNORE_TOUCH_UNTIL = 0;
+  var BM_CONTEXT = '', BM_PRESS;
   var BM_ACTIONS = {}, BM_ACTION_ROWS = [];
-  var BM_CONFIRM_ACTION = '__cue_confirm', BM_CANCEL_ACTION = '__cue_cancel';
-  var BM_LONG_PRESS_MS = 450, BM_SCREEN_WIDTH = g.getWidth(), BM_SCREEN_HEIGHT = g.getHeight();
+  var BM_CONFIRM_ACTION = '__cue_confirm', BM_CANCEL_ACTION = '__cue_cancel', BM_RESTART_ACTION = '__cue_restart';
+  var BM_CONNECTED = false;
+  var BM_SCREEN_WIDTH = g.getWidth(), BM_SCREEN_HEIGHT = g.getHeight();
   var BM_STORAGE = require('Storage');
 
   function bmSchedule(callback, delay) {
@@ -25,10 +26,8 @@
     if (index >= 0) BM_TIMERS.splice(index, 1);
   }
   function bmSetState(state, context) {
-    if (BM_PRESS_TIMER !== undefined) bmCancel(BM_PRESS_TIMER);
-    BM_PRESS_TIMER = undefined;
     BM_PRESS = undefined;
-    if (state === 'home' || state === 'recording' || state === 'thinking' || state === 'loading') BM_DOCUMENT = undefined;
+    if (state === 'home' || state === 'thinking' || state === 'loading') BM_DOCUMENT = undefined;
     BM_STATE = state;
     BM_CONTEXT = context || '';
     BM_SCROLL = 0;
@@ -314,18 +313,6 @@
     g.setFontAlign(0, -1);
     g.setFont('Vector', 13);
     g.drawString('Tap for last 10 seconds', BM_SCREEN_WIDTH / 2, 111);
-    g.setFont('Vector', 12);
-    g.drawString('Hold for a longer', BM_SCREEN_WIDTH / 2, 130);
-    g.drawString('recording', BM_SCREEN_WIDTH / 2, 145);
-  }
-  function bmDrawRecording() {
-    bmLogo();
-    g.fillCircle(BM_SCREEN_WIDTH / 2, 66, 6);
-    g.setFont('Vector', 16);
-    g.setFontAlign(0, -1);
-    g.drawString('RECORDING', BM_SCREEN_WIDTH / 2, 84);
-    g.setFont('Vector', 12);
-    g.drawString('Release to finish', BM_SCREEN_WIDTH / 2, 109);
   }
   function bmDrawThinking() {
     bmLogo();
@@ -424,16 +411,18 @@
     g.clear(1);
     g.setColor(0, 0, 0);
     g.setFontAlign(-1, -1);
-    if (BM_STATE === 'home') bmDrawHome();
-    else if (BM_STATE === 'recording') bmDrawRecording();
+    if (!BM_CONNECTED) bmDrawState('DISCONNECTED', 'Connect Cue over Bluetooth.');
+    else if (BM_STATE === 'home') bmDrawHome();
     else if (BM_STATE === 'thinking') bmDrawThinking();
     else if (BM_STATE === 'loading') bmDrawState('LOADING...', 'Response ready. Sending to watch.');
     else if (BM_STATE === 'confirmation') bmDrawConfirmation();
     else if (BM_STATE === 'clarification') {
       bmDrawResult();
       g.setFont('Vector', 9);
-      g.setFontAlign(0, -1);
-      g.drawString('Speak instead', BM_SCREEN_WIDTH / 2, BM_SCREEN_HEIGHT - 25);
+      g.setFontAlign(-1, -1);
+      g.drawString('Start over', 10, BM_SCREEN_HEIGHT - 25);
+      g.setFontAlign(1, -1);
+      g.drawString('Speak instead', BM_SCREEN_WIDTH - 10, BM_SCREEN_HEIGHT - 25);
     }
     else if (BM_STATE === 'empty') bmDrawState('NO RESULTS', BM_CONTEXT);
     else if (BM_STATE === 'error') bmDrawState('ERROR', BM_CONTEXT);
@@ -507,6 +496,7 @@
     }
   }
   function bmSwipe(direction) {
+    if (!BM_CONNECTED) return;
     if (BM_STATE !== 'result' && BM_STATE !== 'confirmation' && BM_STATE !== 'clarification') return;
     var next = direction < 0 ? BM_PAGE + 1 : BM_PAGE - 1;
     if (next < 0 || next >= BM_PAGE_LAYOUTS.length) return;
@@ -515,7 +505,7 @@
     bmDraw();
   }
   function bmTap(button, xy) {
-    if (!xy || Date.now() < BM_IGNORE_TOUCH_UNTIL) return;
+    if (!BM_CONNECTED || !xy) return;
     if (BM_STATE !== 'home' && xy.x < 52 && xy.y < 28) {
       bmSetState('home');
       return;
@@ -532,6 +522,11 @@
       return;
     }
     if (BM_STATE === 'clarification') {
+      if (xy.y >= BM_SCREEN_HEIGHT - 34) {
+        if (xy.x < BM_SCREEN_WIDTH / 2) bmSendAction(BM_RESTART_ACTION);
+        else bmSendTrigger();
+        return;
+      }
       for (var optionIndex = 0; optionIndex < BM_ACTION_ROWS.length; optionIndex++) {
         var optionRow = BM_ACTION_ROWS[optionIndex];
         if (xy.x >= optionRow.x1 && xy.x <= optionRow.x2 && xy.y >= optionRow.y1 && xy.y <= optionRow.y2) {
@@ -552,27 +547,13 @@
     }
   }
   function bmDrag(event) {
+    if (!BM_CONNECTED) return;
     if (event.b && !BM_PRESS) {
-      BM_PRESS = { x: event.x, y: event.y, lastY: event.y, long: false, moved: false };
-      if (BM_STATE === 'home' && event.y >= 42 && event.y <= 144 && event.x >= 18 && event.x <= BM_SCREEN_WIDTH - 18) {
-        BM_PRESS_TIMER = bmSchedule(function () {
-          if (!BM_PRESS || BM_PRESS.moved) return;
-          BM_PRESS.long = true;
-          BM_STATE = 'recording';
-          BM_CONTEXT = '';
-          bmDraw();
-          Bangle.buzz(30);
-        }, BM_LONG_PRESS_MS);
-      }
+      BM_PRESS = { x: event.x, y: event.y, lastY: event.y };
       return;
     }
     if (event.b && BM_PRESS) {
       var dx = event.x - BM_PRESS.x, dy = event.y - BM_PRESS.y;
-      if (Math.abs(dx) + Math.abs(dy) > 16 && !BM_PRESS.long) {
-        BM_PRESS.moved = true;
-        if (BM_PRESS_TIMER !== undefined) bmCancel(BM_PRESS_TIMER);
-        BM_PRESS_TIMER = undefined;
-      }
       if ((BM_STATE === 'result' || BM_STATE === 'confirmation') && Math.abs(dy) >= Math.abs(dx)) {
         BM_SCROLL -= event.y - BM_PRESS.lastY;
         BM_PRESS.lastY = event.y;
@@ -580,23 +561,29 @@
       }
       return;
     }
-    if (!event.b && BM_PRESS) {
-      var press = BM_PRESS;
-      if (BM_PRESS_TIMER !== undefined) bmCancel(BM_PRESS_TIMER);
-      BM_PRESS_TIMER = undefined;
-      BM_PRESS = undefined;
-      if (press.long) {
-        BM_IGNORE_TOUCH_UNTIL = Date.now() + 500;
-        bmSendTrigger();
-      }
-    }
+    if (!event.b && BM_PRESS) BM_PRESS = undefined;
+  }
+  function bmConnected() {
+    BM_CONNECTED = true;
+    bmDraw();
+  }
+  function bmDisconnected() {
+    BM_CONNECTED = false;
+    BM_PRESS = undefined;
+    while (BM_TIMERS.length) clearTimeout(BM_TIMERS.pop());
+    BM_MESSAGES = {};
+    BM_SEEN = {};
+    BM_BUFFER = [];
+    if (BM_STATE === 'thinking' || BM_STATE === 'loading') bmSetState('home');
+    else bmDraw();
   }
   function bmCleanup() {
     Bluetooth.removeListener('data', bmReceive);
+    NRF.removeListener('connect', bmConnected);
+    NRF.removeListener('disconnect', bmDisconnected);
     Bangle.removeListener('drag', bmDrag);
     Bangle.removeListener('touch', bmTap);
     BM_PRESS = undefined;
-    BM_PRESS_TIMER = undefined;
     while (BM_TIMERS.length) clearTimeout(BM_TIMERS.pop());
     BM_MESSAGES = {};
     BM_SEEN = {};
@@ -608,6 +595,9 @@
   Bangle.on('drag', bmDrag);
   Bangle.on('touch', bmTap);
   Bluetooth.on('data', bmReceive);
+  NRF.on('connect', bmConnected);
+  NRF.on('disconnect', bmDisconnected);
+  BM_CONNECTED = NRF.getSecurityStatus().connected;
   bmDraw();
   Bluetooth.write('BM_BLE_READY\n');
 })();

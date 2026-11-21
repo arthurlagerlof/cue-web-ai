@@ -155,18 +155,95 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
 .statistics-sharing input[type="checkbox"] { width: 18px; height: 18px; margin: 4px 0 0; accent-color: var(--cue-ink); }
 .statistics-sharing p { font-size: 0.9rem; }
 
-.app-shell { width: min(1120px, 100%); margin: 0 auto; padding: clamp(24px, 6vw, 80px) clamp(18px, 5vw, 64px) 96px; }
-.app-shell > h1 { margin: 0; font-size: clamp(3.5rem, 8vw, 7rem); font-weight: 500; letter-spacing: -0.08em; line-height: 1; }
-.app-shell > p { max-width: 62em; }
-.app-shell > section { margin: 28px 0 0; padding: 26px 0; border: 0; border-top: 1px solid var(--cue-line); background: var(--cue-paper); }
-.app-shell > section h2 { margin: 0 0 12px; font-size: clamp(1.5rem, 3vw, 2.25rem); font-weight: 500; letter-spacing: -0.04em; }
-.app-shell label { display: block; margin: 18px 0 8px; font-weight: 600; }
-.app-shell select, .app-shell textarea { display: block; width: 100%; max-width: 760px; min-height: 44px; margin-top: 6px; padding: 10px; border: 1px solid var(--cue-ink); border-radius: 0; background: var(--cue-paper); color: var(--cue-ink); }
-.app-shell textarea { min-height: 100px; }
-.app-shell pre { max-height: 260px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
-.app-shell details { margin: 12px 0; }
-.app-shell button { margin: 6px 8px 6px 0; }
-.app-shell a { text-decoration-thickness: 1px; text-underline-offset: 3px; }
+.app-shell.app-shell-centered {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  min-height: 100svh;
+  margin: 0;
+  padding: clamp(18px, 4vw, 48px);
+  background: var(--cue-blue);
+}
+.app-shell.app-shell-centered button { margin: 0; }
+.app-header { display: flex; align-items: center; justify-content: space-between; width: min(100%, 1120px); margin: 0 auto; }
+.app-brand { display: flex; align-items: baseline; gap: 12px; text-decoration: none; }
+.app-brand > span { font-size: clamp(2.5rem, 5vw, 4rem); font-weight: 500; letter-spacing: -0.08em; line-height: 1; }
+.app-brand small, .app-kicker { font-size: 0.72rem; font-weight: 700; letter-spacing: 0.12em; }
+.app-header-actions { display: flex; gap: 10px; }
+.app-icon-button { display: grid; width: 48px; min-height: 48px; padding: 10px; place-items: center; background: var(--cue-paper); }
+.app-icon-button svg { width: 24px; height: 24px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.8; }
+.app-content { width: min(100%, 920px); margin: auto; padding: clamp(32px, 6vh, 72px) 0; }
+.app-shell.app-shell-centered > .app-content > .app-panel {
+  margin: 0;
+  padding: clamp(22px, 5vw, 56px);
+  border: 2px solid var(--cue-ink);
+  background: var(--cue-paper);
+  --app-shadow-offset: 12px;
+  box-shadow: var(--app-shadow-offset) var(--app-shadow-offset) 0 var(--cue-yellow);
+  animation: app-shadow-enter 700ms ease-out both;
+}
+@keyframes app-shadow-enter {
+  from { box-shadow: 0 0 0 var(--cue-yellow); }
+  to { box-shadow: var(--app-shadow-offset) var(--app-shadow-offset) 0 var(--cue-yellow); }
+}
+.app-shell.app-shell-centered > section h2 { margin: 0; font-size: clamp(1.5rem, 3vw, 2rem); font-weight: 500; letter-spacing: -0.05em; }
+.app-shell.app-shell-centered label { display: block; margin: 0; font-weight: 600; }
+.app-shell.app-shell-centered select,
+.app-shell.app-shell-centered textarea { display: block; width: 100%; max-width: none; min-height: 44px; margin-top: 6px; padding: 10px 12px; border: 1px solid var(--cue-ink); border-radius: 0; background: var(--cue-paper); color: var(--cue-ink); }
+.app-intro { max-width: 720px; margin-bottom: 30px; }
+.app-kicker { margin: 0 0 12px; }
+.app-intro h1 { margin: 0; font-size: clamp(2.8rem, 7vw, 5.75rem); font-weight: 500; letter-spacing: -0.075em; line-height: 0.98; }
+.app-intro > p:last-child { max-width: 38em; margin: 18px 0 0; font-size: clamp(1rem, 1.5vw, 1.2rem); }
+.app-message-label { font-size: 0.95rem; }
+.app-shell.app-shell-centered .app-message-input { min-height: 170px; padding: 16px; border-width: 2px; font-size: 1.15rem; line-height: 1.5; resize: vertical; }
+.app-shell.app-shell-centered .app-message-input:disabled { background: #f3f1e9; opacity: 0.8; }
+.app-compose-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: end; margin-top: 16px; }
+.app-scenario-select { max-width: 400px; font-size: 0.88rem; }
+.app-primary-action { min-height: 48px; padding-inline: 24px; background: var(--cue-ink); color: var(--cue-paper); }
+.app-primary-action:hover:not(:disabled) { background: transparent; color: var(--cue-ink); }
+.app-clarification { margin: 14px 0 0; font-size: 0.92rem; }
+.app-previous-message { margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--cue-line); }
+.app-previous-message strong { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.08em; }
+.app-previous-message p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+.app-microphone { margin-top: 34px; padding: 22px 0 0; border-top: 2px solid var(--cue-ink); }
+.app-microphone-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.app-microphone-heading .app-kicker { margin-bottom: 4px; }
+.app-microphone-status { display: flex; align-items: center; gap: 8px; font-size: 0.72rem; font-weight: 600; }
+.app-recording-dot { width: 10px; height: 10px; border-radius: 50%; background: #777; }
+.app-microphone-status.is-recording .app-recording-dot { background: #c62828; box-shadow: 0 0 0 4px rgba(198, 40, 40, 0.14); }
+.app-buffer-status { margin: 8px 0 14px; font-size: 0.85rem; }
+.app-microphone-actions, .app-modal-actions { display: flex; flex-wrap: wrap; gap: 10px; }
+.app-microphone-actions { margin-top: 12px; }
+.app-microphone-actions button, .app-modal-actions button { flex: 1 1 auto; }
+.app-hold-capture { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-top: 16px; padding: 14px 16px; background: var(--cue-yellow); }
+.app-hold-capture p { margin: 0; font-size: 0.9rem; }
+.app-capture-instructions { flex: 1; }
+.app-tap-label { display: none; }
+.app-secondary-action { font-weight: 600; touch-action: none; }
+.app-stage-status { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--cue-line); }
+.app-stage-status p { display: grid; grid-template-columns: minmax(100px, 0.4fr) minmax(0, 1fr) auto; gap: 12px; align-items: center; margin: 6px 0; font-size: 0.88rem; }
+.app-stage-status p > span:first-child { font-weight: 600; text-transform: capitalize; }
+.app-stage-status button { min-height: 36px; padding: 6px 10px; font-size: 0.8rem; }
+.app-result { margin-top: 24px; }
+.app-embedding-status { margin: 22px 0 0; color: #444; font-size: 0.8rem; }
+.app-status-log { margin: 28px 0 0; }
+.app-status-log summary { width: fit-content; cursor: pointer; font-weight: 600; }
+.app-status-log pre { max-height: 260px; overflow: auto; padding: 14px; border: 1px solid var(--cue-ink); background: var(--cue-paper); white-space: pre-wrap; overflow-wrap: anywhere; }
+.app-modal { position: fixed; inset: 0; width: min(100% - 40px, 600px); max-height: min(88svh, 760px); margin: auto; overflow: auto; padding: clamp(20px, 4vw, 36px); border: 2px solid var(--cue-ink); background: var(--cue-paper); color: var(--cue-ink); box-shadow: 10px 10px 0 var(--cue-yellow); }
+.app-modal::backdrop { background: rgba(0, 0, 0, 0.62); }
+.app-modal-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 24px; }
+.app-modal-heading .app-kicker { margin-bottom: 8px; }
+.app-modal-heading h2 { margin: 0; font-size: clamp(1.8rem, 4vw, 2.5rem); font-weight: 500; letter-spacing: -0.06em; }
+.app-shell.app-shell-centered .app-microphone-heading h2.app-kicker { margin: 0; font-size: 0.72rem; line-height: 1.5; letter-spacing: 0.12em; }
+.app-modal label { margin: 18px 0; }
+.app-modal-note { max-width: 48em; margin: 10px 0 18px; font-size: 0.9rem; }
+.app-modal-status { margin: -8px 0 18px; font-weight: 600; }
+.app-download-options { margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--cue-line); }
+.app-download-options summary { cursor: pointer; font-weight: 600; }
+.app-download-options p { margin: 12px 0; }
+.app-download-options a { display: inline-block; margin: 12px 0; color: inherit; }
+.app-utility-actions { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--cue-line); }
+.app-shell.app-shell-centered a { text-decoration-thickness: 1px; text-underline-offset: 3px; }
 
 @media (max-width: 700px) {
   .landing-hero {
@@ -196,6 +273,24 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
   .statistics-bar-row { grid-template-columns: 82px minmax(40px, 1fr) 100px; gap: 6px; font-size: 0.8rem; }
   .statistics-highlights > div { padding: 12px 0; }
   .statistics-highlights dd { font-size: 1.5rem; }
+  .app-shell.app-shell-centered { padding: 18px 16px 30px; }
+  .app-brand { gap: 8px; }
+  .app-brand > span { font-size: 2.5rem; }
+  .app-header-actions { gap: 6px; }
+  .app-content { padding: 36px 0; }
+  .app-shell.app-shell-centered > .app-content > .app-panel { padding: 22px 18px; --app-shadow-offset: 7px; }
+  .app-intro { margin-bottom: 24px; }
+  .app-intro h1 { font-size: clamp(2.7rem, 12vw, 4rem); }
+  .app-compose-actions { grid-template-columns: 1fr; }
+  .app-scenario-select { max-width: none; }
+  .app-compose-actions .app-primary-action { width: 100%; }
+  .app-microphone-heading { align-items: flex-start; flex-direction: column; gap: 8px; }
+  .app-microphone-actions button { flex-basis: 100%; }
+  .app-hold-capture { align-items: stretch; flex-direction: column; }
+  .app-click-label { display: none; }
+  .app-tap-label { display: inline; }
+  .app-stage-status p { grid-template-columns: 95px minmax(0, 1fr) auto; gap: 8px; font-size: 0.8rem; }
+  .app-modal-actions button { flex-basis: 100%; }
 }
 
 @media (prefers-reduced-motion: reduce) {

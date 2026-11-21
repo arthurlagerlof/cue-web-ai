@@ -129,6 +129,15 @@ function assertOutcomeShape(value) {
   if (value.question !== null || value.text !== null) throw new TypeError('A plan response cannot contain a question or free-form answer.');
 }
 
+function needsCardGenerationRetry(result, request, priorState) {
+  const task = `${priorState?.originalRequest ?? ''}\n${request}`;
+  return result.kind === 'clarification'
+    && /\b(?:anki|flash\s*cards?|study\s*cards?)\b/i.test(task)
+    && /\b(?:invent|make up|come up with|generate|write)\b/i.test(task)
+    && /\b(?:front|back|question|answer)\b/i.test(result.question)
+    && !/\b(?:topic|subject|deck)\b/i.test(result.question);
+}
+
 /**
  * @param {{request: string, context: any, runtime: any, priorState?: any, onRequest?: () => void | Promise<void>, onCall?: (call: ExternalCallStatistics) => void}} options
  */
@@ -158,7 +167,8 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
   const maxOperations = Math.max(1, Math.min(8, Number(runtime.registryData?.toolRetrievalConfig?.maxOperations ?? 8)));
   const prompt = [
     'Respond as quickly as possible. Minimize internal reasoning; do not deliberate over alternatives or include analysis. Return the required JSON directly.',
-    'Plan with the listed tools; never execute them. Use only listed IDs and schema-valid arguments. Never invent facts, values, identities, dates, times, or references.',
+    'Plan with the listed tools; never execute them. Use only listed IDs and schema-valid arguments. Do not invent user-specific facts, identities, dates, times, IDs, or references.',
+    'When the user asks to create a flashcard about a topic or explicitly asks you to invent its content, generate a suitable front and back from the supplied topic or general knowledge instead of asking the user to provide them. Preserve any explicitly supplied content. Do not invent private data or other operational details; ask when those are needed. The proposed card remains subject to the tool confirmation policy.',
     'Return one compact JSON object: kind is tool, direct_answer, or clarification; include question, text, and operations. Tool plans need operations and null question/text; clarification needs a question, null text, and empty operations; direct_answer needs null question, empty operations, and a concise answer in text.',
     'Each operation has id, toolId, purpose, arguments, dependsOn, inputBindings, conditions, and forEach. Use earlier operation IDs for dependencies.',
     'Each inputBindings entry must be {"targetArgument":"time","sourceOperation":"events","sourcePointer":"/firstEvent/start"}: targetArgument is a tool argument, sourceOperation is an earlier operation ID included in dependsOn, and sourcePointer is a JSON Pointer into its result schema starting with /. Omit bound arguments from arguments; never use interpolation or code.',
@@ -185,6 +195,9 @@ export async function planWithOpenRouter({ request, context, runtime, priorState
     try {
       assertOutcomeShape(result);
       if (result.kind !== 'tool') {
+        if (attempt === 0 && needsCardGenerationRetry(result, request, priorState)) {
+          throw new TypeError('The user explicitly requested generated card content. Generate the front and back instead of asking for them; ask only for genuinely missing context.');
+        }
         const outcome = {
           ...result,
           state: {

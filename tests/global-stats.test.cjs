@@ -134,6 +134,22 @@ test('request ingestion deduplicates IDs and GET exposes aggregate data only', a
     assert.doesNotMatch(result.body, /Find my meeting|requestText|4bf92f35/);
     assert.equal(queries.filter(query => /^(SELECT|WITH)/.test(query.sql.trimStart())).length, 4);
     assert.ok(queries.every(query => !/SELECT\s+\*/i.test(query.sql)));
+    const { DEMO_SCENARIOS } = await import('../src/demo/demoScenarios.js');
+    const beforeFiltered = queries.length;
+    const filtered = await handler({ httpMethod: 'GET', queryStringParameters: { request: DEMO_SCENARIOS[0] } });
+    assert.equal(filtered.statusCode, 200);
+    const filteredQueries = queries.slice(beforeFiltered);
+    assert.equal(filteredQueries.length, 4);
+    for (const query of filteredQueries) {
+      assert.deepEqual(query.values, [DEMO_SCENARIOS[0]]);
+      assert.match(query.sql, /request_text = \$1/);
+    }
+    assert.match(filteredQueries[0].sql, /local_stats\.request_text = \$1/);
+    assert.doesNotMatch(filtered.body, /requestText|4bf92f35/);
+    const beforeInvalid = queries.length;
+    const invalid = await handler({ httpMethod: 'GET', queryStringParameters: { request: 'Find my meeting' } });
+    assert.equal(invalid.statusCode, 400);
+    assert.equal(queries.length, beforeInvalid);
   } finally {
     Pool.prototype.connect = originalConnect;
     if (originalDatabaseUrl === undefined) delete process.env.DATABASE_URL;

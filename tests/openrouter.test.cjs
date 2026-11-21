@@ -124,6 +124,59 @@ test('OpenRouter plan request contains the tool catalog but no local provider re
   }
 });
 
+test('planner allows generated Anki content while retaining confirmation and private-data safeguards', async t => {
+  const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  const { ToolDispatcher } = await import('../src/intelligence/dispatcher.js');
+  const runtime = testRuntime();
+  let prompt;
+  let executions = 0;
+  runtime.registry.getProvider('anki').execute = async () => { executions++; };
+  t.mock.method(global, 'fetch', async (_url, options) => {
+    prompt = JSON.parse(options.body).prompt;
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({
+      kind: 'tool', question: null, text: null,
+      operations: [{ id: 'card', toolId: 'anki.create_card', purpose: 'Create a card', arguments: { front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.' }, dependsOn: [], inputBindings: [], conditions: [], forEach: null }],
+    }) } }] }), { status: 200 });
+  });
+  const result = await planWithOpenRouter({ request: 'Create an Anki card about photosynthesis; invent the question and answer.', context: {}, runtime });
+  assert.match(prompt, /generate a suitable front and back/);
+  assert.match(prompt, /Do not invent private data or other operational details/);
+  assert.equal(result.plan.operations[0].requiresConfirmation, true);
+  const outcome = await new ToolDispatcher(runtime.registry).dispatchPlan(result.plan);
+  assert.equal(outcome.state, 'confirmation_required');
+  assert.equal(executions, 0);
+});
+
+test('planner retries a request for card content the user explicitly asked it to invent', async t => {
+  const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  const prompts = [];
+  t.mock.method(global, 'fetch', async (_url, options) => {
+    prompts.push(JSON.parse(options.body).prompt);
+    const result = prompts.length === 1
+      ? { kind: 'clarification', question: 'What should the front and back say?', text: null, operations: [] }
+      : { kind: 'tool', question: null, text: null, operations: [{ id: 'card', toolId: 'anki.create_card', purpose: 'Create a card', arguments: { front: 'What is photosynthesis?', back: 'Plants convert light into chemical energy.' }, dependsOn: [], inputBindings: [], conditions: [], forEach: null }] };
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify(result) } }] }), { status: 200 });
+  });
+  const result = await planWithOpenRouter({ request: 'Create an Anki card about photosynthesis and invent the question and answer', context: {}, runtime: testRuntime() });
+  assert.equal(result.kind, 'tool');
+  assert.equal(prompts.length, 2);
+  assert.match(prompts[1], /explicitly requested generated card content/);
+});
+
+test('planner retains clarification when the card topic is genuinely missing', async t => {
+  const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
+  let calls = 0;
+  t.mock.method(global, 'fetch', async () => {
+    calls++;
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { content: JSON.stringify({
+      kind: 'clarification', question: 'What topic should the question and answer cover?', text: null, operations: [],
+    }) } }] }), { status: 200 });
+  });
+  const result = await planWithOpenRouter({ request: 'Invent an Anki card', context: {}, runtime: testRuntime() });
+  assert.equal(result.kind, 'clarification');
+  assert.equal(calls, 1);
+});
+
 test('direct answers send the original request as conversational text even with no registered tools', async t => {
   const { planWithOpenRouter } = await import('../src/intelligence/openRouter.js');
   const { handleOpenRouterRequest } = await import('../netlify/functions/openrouter.mjs');
