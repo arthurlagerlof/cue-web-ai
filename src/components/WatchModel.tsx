@@ -104,6 +104,10 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
     let introStart: number | undefined;
     let previousFrame: number | undefined;
     let hoverBlend = 0;
+    let demoExit = 1;
+    let demoExitFrom = 1;
+    let demoExitTarget = 1;
+    let demoAnimationStart = 0;
     let pointer: Vector2 | undefined;
     const hero = mode === 'hero' ? host.closest<HTMLElement>('.landing-hero') : null;
     const demo = mode === 'demo' ? host.closest<HTMLElement>('.landing-demo') : null;
@@ -229,9 +233,16 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
           hoverBlend += ((hovering ? 1 : 0) - hoverBlend) * (1 - Math.exp(-7 * delta));
 
           const bounds = demo?.getBoundingClientRect();
-          const distance = bounds ? Math.max(0, bounds.top, window.innerHeight - bounds.bottom) : 0;
-          const scroll = reduceMotion ? 0 : Math.min(distance / window.innerHeight, 1);
-          const exit = scroll * scroll * (3 - 2 * scroll);
+          const target = reduceMotion || !bounds || (bounds.top < window.innerHeight && bounds.bottom > 0) ? 0 : 1;
+          if (target !== demoExitTarget) {
+            demoExitFrom = demoExit;
+            demoExitTarget = target;
+            demoAnimationStart = time;
+          }
+          const progress = reduceMotion ? 1 : Math.min((time - demoAnimationStart) / 700, 1);
+          const ease = progress * progress * (3 - 2 * progress);
+          demoExit = demoExitFrom + (demoExitTarget - demoExitFrom) * ease;
+          const exit = demoExit;
           demoWatch?.style.setProperty('--demo-exit', String(exit));
 
           const idle = narrow || reduceMotion ? 0 : 1 - hoverBlend;
