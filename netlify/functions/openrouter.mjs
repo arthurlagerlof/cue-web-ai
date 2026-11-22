@@ -1,5 +1,5 @@
 const ENDPOINT = 'https://openrouter.ai/api/v1/chat/completions';
-const DEFAULT_MODEL = 'dots-studio/dots-3-note-preview:free';
+const DEFAULT_MODEL = 'openrouter/free';
 const MAX_BODY_BYTES = 102400;
 const MAX_PROMPT_BYTES = 100000;
 const MAX_RESPONSE_BYTES = 262144;

@@ -51,6 +51,7 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
 .landing-stage { position: relative; isolation: isolate; }
 .landing-hero, .landing-demo, .landing-statistics { scroll-snap-align: start; }
 .landing-hero, .landing-demo { scroll-snap-stop: always; }
+.section-snap-anchor { display: none; }
 
 .landing-hero {
   position: relative;
@@ -130,6 +131,8 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
 .landing-statistics { position: relative; z-index: 2; min-height: 100svh; padding: clamp(40px, 9vw, 140px); background: var(--cue-blue); }
 .statistics-inner { max-width: 1120px; margin: 0 auto; }
 .statistics-inner > p { max-width: 50em; }
+.statistics-filter { display: grid; gap: 8px; width: min(100%, 620px); margin: 28px 0 18px; padding: 16px; border: 1px solid var(--cue-ink); background: rgba(255, 255, 255, 0.32); font-size: 0.9rem; font-weight: 600; }
+.statistics-filter select { width: 100%; min-height: 48px; padding: 10px 40px 10px 12px; border: 1px solid var(--cue-ink); border-radius: 0; background: var(--cue-paper); color: var(--cue-ink); font: inherit; font-weight: 400; }
 .statistics-summary { margin: 42px 0 0; padding-top: 28px; border-top: 1px solid var(--cue-line); }
 .statistics-summary h3 { margin: 0 0 8px; font-size: clamp(1.7rem, 3vw, 2.5rem); font-weight: 500; letter-spacing: -0.05em; }
 .statistics-summary h4 { margin: 32px 0 12px; font-size: 1.15rem; font-weight: 600; }
@@ -238,6 +241,8 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
 .app-modal label { margin: 18px 0; }
 .app-modal-note { max-width: 48em; margin: 10px 0 18px; font-size: 0.9rem; }
 .app-modal-status { margin: -8px 0 18px; font-weight: 600; }
+.app-modal .app-microphone-status { margin: -8px 0 0; font-size: 0.85rem; }
+.app-modal .app-buffer-status { margin: 10px 0 14px; }
 .app-download-options { margin-top: 24px; padding-top: 18px; border-top: 1px solid var(--cue-line); }
 .app-download-options summary { cursor: pointer; font-weight: 600; }
 .app-download-options p { margin: 12px 0; }
@@ -246,6 +251,10 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
 .app-shell.app-shell-centered a { text-decoration-thickness: 1px; text-underline-offset: 3px; }
 
 @media (max-width: 700px) {
+  /* Snap to the statistics start, then allow its long content to scroll freely. */
+  html:has(.landing-statistics.snap-section-entered) { scroll-snap-type: none; }
+  .landing-statistics { scroll-snap-align: none; }
+  .section-snap-anchor { position: absolute; top: 0; left: 0; display: block; width: 1px; height: 1px; scroll-snap-align: start; scroll-snap-stop: always; pointer-events: none; }
   .landing-hero {
     flex-direction: column;
     justify-content: flex-start;

@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bluetooth, Settings } from 'lucide-react';
+import { Bluetooth, Mic, Settings } from 'lucide-react';
 import { RollingAudio } from './services/audio';
 import { watch } from './services/watch';
 import { ASR_MODELS, type ASRModelSize } from './services/asrModels';
@@ -147,9 +147,15 @@ export default function App() {
   const watchConfirmationRef = useRef(false);
   const connectionDialogRef = useRef<HTMLDialogElement>(null);
   const settingsDialogRef = useRef<HTMLDialogElement>(null);
+  const microphoneDialogRef = useRef<HTMLDialogElement>(null);
   const pending = useRef(new Map<number, { stage: Stage; resolve: (reply: WorkerReply) => void; measurement?: RequestMeasurement; inferenceStartedAt?: number; inferenceModel?: string }>());
   const resolvingInteractions = useRef(new Set<string>());
   const activeRequest = useRef<RequestMeasurement>();
+
+  useEffect(() => {
+    const dialog = microphoneDialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+  }, []);
 
   const log = (message: string) => setLogs(old => [`${new Date().toLocaleTimeString()} ${message}`, ...old].slice(0, 30));
   const recordUsage = async (counter: string) => {
@@ -505,7 +511,7 @@ export default function App() {
       return;
     }
     if (response.kind === 'direct_answer') {
-      log('Dots 3 answered without using a tool');
+      log('OpenRouter answered without using a tool');
       updatePendingConfirmation(undefined);
       setPendingClarification(false);
       await saveConversationState(response.state);
@@ -517,15 +523,15 @@ export default function App() {
       }
       await showDocument(createDisplayDocument({
         id: 'cue-dots3-direct-answer',
-        title: 'Dots 3 response',
-        source: { app: 'openrouter', name: 'Dots3' },
+        title: 'OpenRouter response',
+        source: { app: 'openrouter', name: 'OpenRouter' },
         state: 'ready',
         message: response.text,
         elements: [{ type: 'text', text: response.text, role: 'body' }],
       }), false, response.text);
       return;
     }
-    if (response.kind !== 'tool' || !response.plan) throw new TypeError('Dots 3 returned an unsupported reasoning outcome.');
+    if (response.kind !== 'tool' || !response.plan) throw new TypeError('OpenRouter returned an unsupported reasoning outcome.');
     markMultiStep(activeRequest.current, response.plan.operations.length);
     for (const operation of response.plan.operations) {
       log(`Validated plan proposal: ${operation.toolId}; dependencies=${operation.dependsOn.length}; bindings=${operation.inputBindings.length}; fan-out=${Boolean(operation.forEach)}`);
@@ -617,7 +623,7 @@ export default function App() {
       state: 'success',
       message: 'All required operations completed or were safely skipped.',
     }));
-    log('Dots 3 plan completed under Cue validation and execution control');
+    log('OpenRouter plan completed under Cue validation and execution control');
   }
 
   async function processTranscript(text: string, continuePendingLocally = false, existingMeasurement?: RequestMeasurement) {
@@ -662,7 +668,7 @@ export default function App() {
     if (pendingAction?.externalPlan) {
       setTranscriptInput('');
       const pending = pendingAction.executionState?.pendingConfirmation;
-      const message = `This Dots 3 plan is awaiting confirmation with exact arguments${pending ? `: ${JSON.stringify(pending.arguments)}` : ''}. Confirm it as shown, or cancel it and submit a new request to make changes.`;
+      const message = `This OpenRouter plan is awaiting confirmation with exact arguments${pending ? `: ${JSON.stringify(pending.arguments)}` : ''}. Confirm it as shown, or cancel it and submit a new request to make changes.`;
       await showDocument(createDisplayDocument({
         id: 'cue-dots3-confirmation-unchanged',
         title: 'Confirmation unchanged',
@@ -685,7 +691,7 @@ export default function App() {
       const context = { now: requestNow, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn: 1 };
       const savedState = await getConversationState();
       if (aiModeRef.current === 'web_ai' && savedState?.pendingReasoning) {
-        const message = 'This request is awaiting hosted reasoning. Switch to Automatic or Always Dots 3 to continue, or cancel the pending request.';
+        const message = 'This request is awaiting hosted reasoning. Switch to Automatic or Always OpenRouter to continue, or cancel the pending request.';
         setPendingClarification(true);
         await showDocument(createDisplayDocument({
           id: 'cue-hosted-workflow-paused',
@@ -719,7 +725,7 @@ export default function App() {
         }
         setTranscriptInput('');
         const pending = savedState.executionState.pendingConfirmation;
-        const message = `This Dots 3 plan is awaiting confirmation with exact arguments: ${JSON.stringify(pending.arguments)}. Confirm it as shown, or cancel it and submit a new request to make changes.`;
+        const message = `This OpenRouter plan is awaiting confirmation with exact arguments: ${JSON.stringify(pending.arguments)}. Confirm it as shown, or cancel it and submit a new request to make changes.`;
         await showDocument(createDisplayDocument({
           id: 'cue-dots3-confirmation-unchanged',
           title: 'Confirmation unchanged',
@@ -758,12 +764,12 @@ export default function App() {
       if (!continuePendingLocally && aiModeRef.current === 'automatic'
         && (outcome.state?.status === 'awaiting_tool_choice' || outcome.kind === 'no_tool')) {
         log(rerankDiagnostics?.error
-          ? `Cross-encoder unavailable: ${rerankDiagnostics.error}; trying the configured Dots 3 fallback`
+          ? `Cross-encoder unavailable: ${rerankDiagnostics.error}; trying the configured OpenRouter fallback`
           : rerankDiagnostics?.candidates
-            ? 'Cross-encoder scores or margin below routing thresholds; trying the configured Dots 3 fallback'
+            ? 'Cross-encoder scores or margin below routing thresholds; trying the configured OpenRouter fallback'
             : outcome.kind === 'no_tool'
-              ? 'Local retrieval found no matching tool; trying the configured Dots 3 fallback'
-              : 'Tool choice remains uncertain; cross-encoder result unavailable for this outcome; trying the configured Dots 3 fallback');
+              ? 'Local retrieval found no matching tool; trying the configured OpenRouter fallback'
+              : 'Tool choice remains uncertain; cross-encoder result unavailable for this outcome; trying the configured OpenRouter fallback');
         await processDots3Request(clean, runtime, context, undefined, outcome.kind === 'no_tool');
         return;
       }
@@ -1269,13 +1275,22 @@ export default function App() {
         <span>Cue</span>
       </a>
       <nav className="app-header-actions" aria-label="App options">
+        <button className="app-icon-button" aria-label="Microphone controls" title="Microphone controls" onClick={() => {
+          if (connectionDialogRef.current?.open) connectionDialogRef.current.close();
+          if (settingsDialogRef.current?.open) settingsDialogRef.current.close();
+          if (microphoneDialogRef.current && !microphoneDialogRef.current.open) microphoneDialogRef.current.showModal();
+        }}>
+          <Mic size={22} strokeWidth={1.8} aria-hidden="true" />
+        </button>
         <button className="app-icon-button" aria-label="Watch connection options" title="Watch connection options" onClick={() => {
+          if (microphoneDialogRef.current?.open) microphoneDialogRef.current.close();
           if (settingsDialogRef.current?.open) settingsDialogRef.current.close();
           if (connectionDialogRef.current && !connectionDialogRef.current.open) connectionDialogRef.current.showModal();
         }}>
           <Bluetooth size={22} strokeWidth={1.8} aria-hidden="true" />
         </button>
         <button className="app-icon-button" aria-label="AI and transcription settings" title="AI and transcription settings" onClick={() => {
+          if (microphoneDialogRef.current?.open) microphoneDialogRef.current.close();
           if (connectionDialogRef.current?.open) connectionDialogRef.current.close();
           if (settingsDialogRef.current && !settingsDialogRef.current.open) settingsDialogRef.current.showModal();
         }}>
@@ -1290,34 +1305,6 @@ export default function App() {
           <h1 id="app-title">{pendingClarification ? 'One more detail.' : 'Say what you need.'}</h1>
           <p>Type a message or try a sample request. Connect a watch if you want to use the app through it.</p>
         </div>
-
-        <section className="app-microphone" aria-labelledby="microphone-title">
-          <div className="app-microphone-heading">
-            <h2 id="microphone-title" className="app-kicker">AUDIO INPUT</h2>
-            <div className={`app-microphone-status${recording ? ' is-recording' : ''}`} role="status">
-              <span className="app-recording-dot" aria-hidden="true" />
-              <span>{recording ? 'Recording' : 'Microphone off'}</span>
-            </div>
-          </div>
-          <p className="app-buffer-status">Rolling buffer: {buffer.toFixed(1)} / 10.0 seconds · {audio.sampleRate || '—'} Hz</p>
-          <div className="app-hold-capture">
-            <button onClick={() => void toggleMicrophone()}>{recording ? 'Stop microphone' : 'Start microphone'}</button>
-            <div className="app-capture-instructions">
-              <p><span className="app-click-label">Click</span><span className="app-tap-label">Tap</span> to transcribe the last 10 seconds, or hold to add more (up to 5 additional minutes).</p>
-            </div>
-            <button className="app-secondary-action" disabled={busy || !recording || buffer < 0.2} onPointerDown={event => {
-              if (!event.isPrimary || event.button !== 0) return;
-              event.currentTarget.setPointerCapture(event.pointerId);
-              void startHoldCapture();
-            }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()} onClick={event => { if (event.detail === 0) transcribeBuffer(); }}>
-              {holding ? 'Release to transcribe…' : 'Transcribe'}
-            </button>
-          </div>
-          <div className="app-microphone-actions">
-            <button disabled={!recording || buffer < 0.2} onClick={freezeBuffer}>Freeze last 10 seconds</button>
-            <button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button>
-          </div>
-        </section>
 
         <label className="app-message-label">{pendingClarification ? 'Your reply' : 'Your message'}
           <textarea className="app-message-input" value={transcriptInput} disabled={busy} onChange={event => { setTranscriptInput(event.target.value); setScenario(''); }} placeholder={pendingClarification ? 'Enter the missing details or a correction' : 'Ask Cue to find something, make a plan, or answer a question…'} />
@@ -1364,6 +1351,40 @@ export default function App() {
       </details>
     </div>
 
+    <dialog ref={microphoneDialogRef} className="app-modal" aria-labelledby="microphone-title" onKeyDown={event => {
+      if (event.key === 'Escape') { event.preventDefault(); event.currentTarget.close(); }
+    }} onClick={event => {
+      const bounds = event.currentTarget.getBoundingClientRect();
+      if (event.target === event.currentTarget && (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom)) event.currentTarget.close();
+    }}>
+      <div className="app-modal-heading">
+        <div><p className="app-kicker">AUDIO INPUT</p><h2 id="microphone-title">Microphone controls</h2></div>
+        <button autoFocus onClick={() => microphoneDialogRef.current?.close()}>Close</button>
+      </div>
+      <div className={`app-microphone-status${recording ? ' is-recording' : ''}`} role="status">
+        <span className="app-recording-dot" aria-hidden="true" />
+        <span>{recording ? 'Recording' : 'Microphone off'}</span>
+      </div>
+      <p className="app-buffer-status">Rolling buffer: {buffer.toFixed(1)} / 10.0 seconds · {audio.sampleRate || '—'} Hz</p>
+      <div className="app-hold-capture">
+        <button onClick={() => void toggleMicrophone()}>{recording ? 'Stop microphone' : 'Start microphone'}</button>
+        <div className="app-capture-instructions">
+          <p><span className="app-click-label">Click</span><span className="app-tap-label">Tap</span> to transcribe the last 10 seconds, or hold to add more (up to 5 additional minutes).</p>
+        </div>
+        <button className="app-secondary-action" disabled={busy || !recording || buffer < 0.2} onPointerDown={event => {
+          if (!event.isPrimary || event.button !== 0) return;
+          event.currentTarget.setPointerCapture(event.pointerId);
+          void startHoldCapture();
+        }} onPointerUp={() => void finishHoldCapture()} onPointerCancel={() => void finishHoldCapture()} onLostPointerCapture={() => void finishHoldCapture()} onClick={event => { if (event.detail === 0) transcribeBuffer(); }}>
+          {holding ? 'Release to transcribe…' : 'Transcribe'}
+        </button>
+      </div>
+      <div className="app-microphone-actions">
+        <button disabled={!recording || buffer < 0.2} onClick={freezeBuffer}>Freeze last 10 seconds</button>
+        <button disabled={!frozenAudio} onClick={() => void playFrozenRecording()}>{playbackActive ? 'Stop playback' : 'Play frozen recording'}</button>
+      </div>
+    </dialog>
+
     <dialog ref={connectionDialogRef} className="app-modal" aria-labelledby="connection-modal-title" onKeyDown={event => {
       if (event.key === 'Escape') { event.preventDefault(); event.currentTarget.close(); }
     }} onClick={event => {
@@ -1405,9 +1426,9 @@ export default function App() {
         }}>
           <option value="web_ai">Web AI</option>
           <option value="automatic">Automatic</option>
-          <option value="dots3_always">Always Dots 3</option>
+          <option value="dots3_always">Always OpenRouter</option>
         </select></label>
-        <p className="app-modal-note">Automatic keeps straightforward requests local and escalates complex or uncertain requests. Always Dots 3 sends the request and registered tool catalog through the configured backend. Avoid sensitive text in external modes.</p>
+        <p className="app-modal-note">Automatic keeps straightforward requests local and escalates complex or uncertain requests. Always OpenRouter sends the request and registered tool catalog through the configured backend. Avoid sensitive text in external modes.</p>
         <label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label>
         <p className="app-modal-note">Tool availability and demo data are stored locally in this browser.</p>
         <div className="app-modal-actions app-utility-actions">

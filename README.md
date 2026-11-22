@@ -8,7 +8,7 @@ Cue is a browser-first assistant demo for trusted, registered tools. Normal app 
 
 1. Install Node.js 20+ and run `npm ci`.
 2. Run `npm run dev`, then open the Vite URL in a supported Chromium browser. `/` opens `/landing`; choose **Continue without a watch** to open `/app`.
-3. Use a demo scenario or enter a request. In **Web AI** mode, discovery, MiniLM embeddings, argument resolution, and trusted provider execution remain in the browser. **Automatic** keeps straightforward requests local and can use OpenRouter for complex planning or eligible argument normalization. **Always Dots 3** sends the request and registered tool catalog to OpenRouter without initializing local retrieval models; switching to a local mode initializes retrieval when needed.
+3. Use a demo scenario or enter a request. In **Web AI** mode, discovery, MiniLM embeddings, argument resolution, and trusted provider execution remain in the browser. **Automatic** keeps straightforward requests local and can use OpenRouter for complex planning or eligible argument normalization. **Always OpenRouter** sends the request and registered tool catalog to OpenRouter without initializing local retrieval models; switching to a local mode initializes retrieval when needed.
 4. External AI uses the server-configured `OPENROUTER_API_KEY`; users do not enter or receive the key. Local Vite middleware reads the unprefixed key from `.env` on the server, while the deployed Netlify function reads it from the Netlify environment. External modes may send your request text and tool schemas to OpenRouter through the server; provider records and provider-data search evidence are not sent. Avoid sensitive request text.
 5. Use **Reset demo session** to restore the packaged synthetic providers, tools, and records. **Export local backup** downloads a JSON copy of local app data.
 
@@ -18,13 +18,15 @@ The watch shows a disconnected screen and disables its controls when its BLE con
 
 During a clarification, say “go back” to cancel the pending request, or “no, I meant” followed by a new request to start over with it. You can also choose **Start over** in the browser or on the watch. Earlier completed actions are not undone; if there were any, Cue asks you to state the new request separately. Reinstall the watch app to get the new control.
 
-Whisper prefers WebGPU and falls back to CPU via WebAssembly if WebGPU is unavailable or fails. The selected Whisper model is downloaded separately for each backend; CPU transcription can be slower, especially for larger models. Local MiniLM embeddings still require WebGPU. Always Dots 3 normally avoids local retrieval, but continuing some clarification choices locally initializes it.
+Whisper prefers WebGPU and falls back to CPU via WebAssembly if WebGPU is unavailable or fails. The selected Whisper model is downloaded separately for each backend; CPU transcription can be slower, especially for larger models. Local MiniLM embeddings still require WebGPU. Always OpenRouter normally avoids local retrieval, but continuing some clarification choices locally initializes it.
 
 Calendar requests for this week or next week use Monday as the start of the week.
 
 OpenRouter requests time out after 55 seconds at the proxy, with a 60-second browser limit. Hosting platforms may impose shorter limits. If requests continue timing out, retry or use **Web AI** mode.
 
-For Dots 3 Note Preview, Cue requests non-reasoning mode and asks for JSON planning responses to reduce latency. When no tool is needed, it uses the planner's conversational answer, or requests one separately if the planner returns no answer text. Actual latency and support for this setting depend on the OpenRouter provider; other configured models keep their default reasoning settings.
+Cue defaults to OpenRouter's `openrouter/free` router, which selects an available free model for each request. Set the server-side `OPENROUTER_MODEL` environment variable to override it; existing overrides must be updated or removed to use the router. Models and availability can vary between requests. Cue asks for JSON planning responses and, when no tool is needed, uses the planner's conversational answer or requests one separately. If Dots 3 Note Preview is explicitly configured, Cue requests non-reasoning mode; other models keep their default reasoning settings.
+
+Statistics for **Always OpenRouter** also include older requests made when that mode was called **Always Dots 3**; model breakdowns distinguish the models used.
 
 Python is not required for app operation. The browser seeds from version-controlled synthetic JSON fixtures; the old SQLite baseline and Python backend have been removed.
 
@@ -55,7 +57,7 @@ Without that function and database configuration, Cue continues to work and keep
 - `src/intelligence/openRouter.js` sends bounded prompts to the same-origin server proxy. The Netlify function or local Vite middleware adds the server-only key; plans are checked against the locally registered tool catalog and execution-plan contract before dispatch.
 - `src/display/schema/cue-display-v1.schema.json` defines Cue Display Document v1. The shared validator checks nested elements, actions, asset references, and registered-tool arguments before rendering.
 - `/landing` and `/app` are client-side routes. A shared Bangle connection manager keeps watch state alive across route changes; the watch is optional.
-- The browser negotiates a compact watch-only representation of Display Documents; older watch apps receive the original v1 document instead. Plain Dots 3 answers are sent as text to avoid duplicating them in the watch document. The watch shows thinking while a request runs, then loading while a response is transferred. Display transfers still have a 2,450-byte UTF-8 limit, and larger results are not yet streamed to the watch. Reinstall the watch app after updating it.
+- The browser negotiates a compact watch-only representation of Display Documents; older watch apps receive the original v1 document instead. Plain OpenRouter answers are sent as text to avoid duplicating them in the watch document. The watch shows thinking while a request runs, then loading while a response is transferred. Display transfers still have a 2,450-byte UTF-8 limit, and larger results are not yet streamed to the watch. Reinstall the watch app after updating it.
 
 ## Tests and limitations
 

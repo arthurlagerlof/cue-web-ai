@@ -479,6 +479,7 @@ test('server OpenRouter proxy uses its configured key and rejects client-supplie
     fetchImpl: async (url, options) => {
       upstream = { url, options, body: JSON.parse(options.body) };
       return new Response(JSON.stringify({
+        model: 'example/routed-free-model',
         choices: [{ finish_reason: 'stop', message: { content: '{"kind":"no_tool"}' } }],
         usage: { prompt_tokens: 99 },
       }), { status: 200 });
@@ -486,11 +487,14 @@ test('server OpenRouter proxy uses its configured key and rejects client-supplie
   });
   assert.equal(result.statusCode, 200);
   assert.equal(upstream.options.headers.Authorization, 'Bearer server-only-key');
-  assert.equal(upstream.body.model, 'dots-studio/dots-3-note-preview:free');
-  assert.deepEqual(upstream.body.reasoning, { enabled: false });
+  assert.equal(upstream.url, 'https://openrouter.ai/api/v1/chat/completions');
+  assert.equal(upstream.body.model, 'openrouter/free');
+  assert.deepEqual(upstream.body.response_format, { type: 'json_object' });
+  assert.equal(Object.hasOwn(upstream.body, 'reasoning'), false);
   assert.equal(upstream.body.messages[0].content, 'A private user request');
   assert.equal(result.headers['X-Cue-External-Call'], 'true');
-  assert.equal(result.headers['X-Cue-Model'], 'dots-studio/dots-3-note-preview:free');
+  assert.equal(result.headers['X-Cue-Model'], 'example/routed-free-model');
+  assert.equal(JSON.parse(result.body).model, 'example/routed-free-model');
   assert.match(result.body, /"prompt_tokens":99/);
   assert.doesNotMatch(result.body, /server-only-key|A private user request/);
 
@@ -521,6 +525,24 @@ test('non-Dots model overrides retain their own reasoning settings', async () =>
   });
   assert.equal(result.statusCode, 200);
   assert.equal(Object.hasOwn(upstreamBody, 'reasoning'), false);
+});
+
+test('Dots model overrides still disable reasoning', async () => {
+  const { handleOpenRouterRequest } = await import('../netlify/functions/openrouter.mjs');
+  let upstreamBody;
+  const result = await handleOpenRouterRequest({
+    method: 'POST',
+    body: JSON.stringify({ prompt: 'Test request', maxTokens: 10 }),
+    apiKey: 'test-key',
+    clientIp: 'dots-model-override-test',
+    model: 'dots-studio/dots-3-note-preview:free',
+    fetchImpl: async (_url, options) => {
+      upstreamBody = JSON.parse(options.body);
+      return new Response(JSON.stringify({ choices: [{ message: { content: '{}' } }] }), { status: 200 });
+    },
+  });
+  assert.equal(result.statusCode, 200);
+  assert.deepEqual(upstreamBody.reasoning, { enabled: false });
 });
 
 test('local proxy accepts a response after 30 seconds and reports an upstream timeout', async t => {

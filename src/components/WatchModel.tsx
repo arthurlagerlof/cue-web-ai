@@ -105,10 +105,6 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
     let introStart: number | undefined;
     let previousFrame: number | undefined;
     let hoverBlend = 0;
-    let demoExit = 1;
-    let demoExitFrom = 1;
-    let demoExitTarget = 1;
-    let demoAnimationStart = 0;
     let pointer: Vector2 | undefined;
     const hero = mode === 'hero' ? host.closest<HTMLElement>('.landing-hero') : null;
     const demo = mode === 'demo' ? host.closest<HTMLElement>('.landing-demo') : null;
@@ -191,6 +187,35 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
       renderer.domElement.addEventListener('pointerleave', onPointerLeave);
     }
 
+    const updateDemoScroll = () => {
+      const bounds = demo?.getBoundingClientRect();
+      // Map each snap interval independently so the demo's start snap is always a settled state.
+      const viewportHeight = window.innerHeight;
+      const progress = bounds
+        ? bounds.top > 0
+          ? Math.min(bounds.top / viewportHeight, 1)
+          : Math.min(-bounds.top / Math.max(bounds.height, 1), 1)
+        : 0;
+      const scroll = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        ? 0 : Math.max(0, progress);
+      const eased = scroll * scroll * (3 - 2 * scroll);
+      demoWatch?.style.setProperty('--demo-exit', String(eased));
+      return eased;
+    };
+    const onDemoScroll = () => {
+      const exit = updateDemoScroll();
+      if (model && window.matchMedia('(max-width: 700px)').matches) {
+        modelGroup.rotation.z = exit * Math.PI / 2;
+        renderer.render(scene, camera);
+      }
+    };
+    if (mode === 'demo') {
+      updateDemoScroll();
+      window.addEventListener('scroll', onDemoScroll, { passive: true });
+      window.addEventListener('scrollend', onDemoScroll);
+      window.addEventListener('resize', onDemoScroll);
+    }
+
     const renderFrame = (time: number) => {
       frame = window.requestAnimationFrame(renderFrame);
       if (model) {
@@ -233,18 +258,7 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
           }
           hoverBlend += ((hovering ? 1 : 0) - hoverBlend) * (1 - Math.exp(-7 * delta));
 
-          const bounds = demo?.getBoundingClientRect();
-          const target = reduceMotion || !bounds || (bounds.top < window.innerHeight && bounds.bottom > 0) ? 0 : 1;
-          if (target !== demoExitTarget) {
-            demoExitFrom = demoExit;
-            demoExitTarget = target;
-            demoAnimationStart = time;
-          }
-          const progress = reduceMotion ? 1 : Math.min((time - demoAnimationStart) / 700, 1);
-          const ease = progress * progress * (3 - 2 * progress);
-          demoExit = demoExitFrom + (demoExitTarget - demoExitFrom) * ease;
-          const exit = demoExit;
-          demoWatch?.style.setProperty('--demo-exit', String(exit));
+          const exit = updateDemoScroll();
 
           const idle = narrow || reduceMotion ? 0 : 1 - hoverBlend;
           modelGroup.rotation.x = -1.05 * (0.5 + 0.5 * Math.cos(time / 2200)) * idle;
@@ -341,6 +355,9 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
       renderer.domElement.removeEventListener('click', onCanvasClick);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerleave', onPointerLeave);
+      window.removeEventListener('scroll', onDemoScroll);
+      window.removeEventListener('scrollend', onDemoScroll);
+      window.removeEventListener('resize', onDemoScroll);
       demoWatch?.style.removeProperty('--demo-exit');
       if (displayTextureRef.current === screenTexture) {
         displayTextureRef.current = undefined;
