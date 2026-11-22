@@ -48,7 +48,7 @@ function addCalendarDays(parts, amount) {
   return { year: date.getUTCFullYear(), month: date.getUTCMonth() + 1, day: date.getUTCDate() };
 }
 
-function calendarDateRange(text, { now, timeZone, role, weekStartsOn = 1 }) {
+function calendarDateRange(text, { now, timeZone, role }) {
   const lower = text.toLocaleLowerCase();
   const localNow = zoneParts(now, timeZone);
   const today = { year: localNow.year, month: localNow.month, day: localNow.day };
@@ -57,12 +57,12 @@ function calendarDateRange(text, { now, timeZone, role, weekStartsOn = 1 }) {
   let originalText;
   if (/\bnext week\b/i.test(lower)) {
     const weekday = new Date(Date.UTC(today.year, today.month - 1, today.day)).getUTCDay();
-    start = addCalendarDays(today, ((weekStartsOn - weekday + 7) % 7) || 7);
+    start = addCalendarDays(today, ((1 - weekday + 7) % 7) || 7);
     end = addCalendarDays(start, 7);
     originalText = text.match(/\bnext week\b/i)?.[0];
   } else if (/\bthis week\b/i.test(lower)) {
     const weekday = new Date(Date.UTC(today.year, today.month - 1, today.day)).getUTCDay();
-    start = addCalendarDays(today, -((weekday - weekStartsOn + 7) % 7));
+    start = addCalendarDays(today, -((weekday - 1 + 7) % 7));
     end = addCalendarDays(start, 7);
     originalText = text.match(/\bthis week\b/i)?.[0];
   } else if (/\bnext month\b/i.test(lower)) {

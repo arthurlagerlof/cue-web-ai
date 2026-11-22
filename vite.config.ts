@@ -55,7 +55,8 @@ function globalStatsProxy(databaseUrl: string | undefined): Plugin {
       });
       req.on('end', () => {
         const body = size <= 4096 ? Buffer.concat(chunks).toString('utf8') : 'x'.repeat(4097);
-        void handleGlobalStats({ httpMethod: req.method, body }, databaseUrl)
+        const queryStringParameters = Object.fromEntries(new URL(req.url ?? '/', 'http://localhost').searchParams);
+        void handleGlobalStats({ httpMethod: req.method, body, queryStringParameters }, databaseUrl)
           .then(result => { res.writeHead(result.statusCode, result.headers); res.end(result.body); })
           .catch(next);
       });

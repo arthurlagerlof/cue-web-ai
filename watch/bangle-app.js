@@ -1,12 +1,13 @@
 // App state is private to this run and is released when Bangle.js removes the UI.
 (function () {
   var BM_HEADER = 9, BM_BUFFER = [], BM_MESSAGES = {}, BM_SEEN = {}, BM_TIMERS = [];
-  var BM_MANUAL_ID = 0, BM_STATE = 'home', BM_DOCUMENT, BM_TEXT = '';
+  var BM_MANUAL_ID = 0, BM_STATE = 'home', BM_DOCUMENT, BM_LOADING_ID;
   var BM_PAGE_LAYOUTS = [], BM_PAGE = 0, BM_SCROLL = 0;
-  var BM_CONTEXT = '', BM_PRESS, BM_PRESS_TIMER, BM_IGNORE_TOUCH_UNTIL = 0;
+  var BM_CONTEXT = '', BM_PRESS;
   var BM_ACTIONS = {}, BM_ACTION_ROWS = [];
-  var BM_CONFIRM_ACTION = '__cue_confirm', BM_CANCEL_ACTION = '__cue_cancel';
-  var BM_LONG_PRESS_MS = 450, BM_SCREEN_WIDTH = g.getWidth(), BM_SCREEN_HEIGHT = g.getHeight();
+  var BM_CONFIRM_ACTION = '__cue_confirm', BM_CANCEL_ACTION = '__cue_cancel', BM_RESTART_ACTION = '__cue_restart';
+  var BM_CONNECTED = false;
+  var BM_SCREEN_WIDTH = g.getWidth(), BM_SCREEN_HEIGHT = g.getHeight();
   var BM_STORAGE = require('Storage');
 
   function bmSchedule(callback, delay) {
@@ -25,10 +26,8 @@
     if (index >= 0) BM_TIMERS.splice(index, 1);
   }
   function bmSetState(state, context) {
-    if (BM_PRESS_TIMER !== undefined) bmCancel(BM_PRESS_TIMER);
-    BM_PRESS_TIMER = undefined;
     BM_PRESS = undefined;
-    if (state === 'home' || state === 'recording' || state === 'thinking') BM_DOCUMENT = undefined;
+    if (state === 'home' || state === 'thinking' || state === 'loading') BM_DOCUMENT = undefined;
     BM_STATE = state;
     BM_CONTEXT = context || '';
     BM_SCROLL = 0;
@@ -83,6 +82,13 @@
     return bytes;
   }
   function bmDecodeUtf8(bytes) {
+    if (typeof E !== 'undefined' && E.toString) {
+      var ascii = true;
+      for (var j = 0; j < bytes.length; j++) {
+        if (bytes[j] >= 128) { ascii = false; break; }
+      }
+      if (ascii) return E.toString(bytes);
+    }
     var result = '';
     for (var i = 0; i < bytes.length;) {
       var first = bytes[i++], code;
@@ -116,12 +122,11 @@
   }
   function bmSetDocument(text) {
     var parsed;
-    BM_TEXT = text;
     BM_DOCUMENT = undefined;
     BM_ACTIONS = {};
     BM_PAGE_LAYOUTS = [];
     try { parsed = JSON.parse(text); } catch (error) { parsed = undefined; }
-    if (parsed && parsed.schema === 'cue.display' && parsed.version === 1 && parsed.pages instanceof Array) {
+    if (parsed && (parsed.schema === 'cue.display' || parsed.schema === 'cue.watch.display') && parsed.version === 1 && parsed.pages instanceof Array) {
       BM_DOCUMENT = parsed;
       (parsed.actions || []).forEach(function (action) { BM_ACTIONS[action.id] = action; });
       BM_CONTEXT = parsed.message || parsed.title || '';
@@ -142,6 +147,10 @@
         bmAddElements(layout, page.elements || [], 0);
         BM_PAGE_LAYOUTS.push(layout);
       });
+    } else if ((parsed && (parsed.schema === 'cue.display' || parsed.schema === 'cue.watch.display'))
+      || /^\s*\{\s*"schema"\s*:\s*"cue\.(watch\.)?display"/.test(text)) {
+      bmSetState('error', 'Could not parse display document.');
+      return false;
     } else {
       BM_STATE = 'result';
       var layout = { rows: [], cursor: 0 };
@@ -152,6 +161,7 @@
     BM_PAGE = 0;
     BM_SCROLL = 0;
     bmDraw();
+    return true;
   }
   function bmSummary(elements) {
     var lines = [];
@@ -300,23 +310,9 @@
     g.setFontAlign(-1, -1);
     g.drawString('Cue.', 12, 10);
     g.fillCircle(BM_SCREEN_WIDTH / 2, 73, 7);
-    g.setFont('Vector', 9);
     g.setFontAlign(0, -1);
-    g.drawString('cue_logo.png', BM_SCREEN_WIDTH / 2, 86);
     g.setFont('Vector', 13);
     g.drawString('Tap for last 10 seconds', BM_SCREEN_WIDTH / 2, 111);
-    g.setFont('Vector', 12);
-    g.drawString('Hold for a longer', BM_SCREEN_WIDTH / 2, 130);
-    g.drawString('recording', BM_SCREEN_WIDTH / 2, 145);
-  }
-  function bmDrawRecording() {
-    bmLogo();
-    g.fillCircle(BM_SCREEN_WIDTH / 2, 66, 6);
-    g.setFont('Vector', 16);
-    g.setFontAlign(0, -1);
-    g.drawString('RECORDING', BM_SCREEN_WIDTH / 2, 84);
-    g.setFont('Vector', 12);
-    g.drawString('Release to finish', BM_SCREEN_WIDTH / 2, 109);
   }
   function bmDrawThinking() {
     bmLogo();
@@ -415,15 +411,18 @@
     g.clear(1);
     g.setColor(0, 0, 0);
     g.setFontAlign(-1, -1);
-    if (BM_STATE === 'home') bmDrawHome();
-    else if (BM_STATE === 'recording') bmDrawRecording();
+    if (!BM_CONNECTED) bmDrawState('DISCONNECTED', 'Connect Cue over Bluetooth.');
+    else if (BM_STATE === 'home') bmDrawHome();
     else if (BM_STATE === 'thinking') bmDrawThinking();
+    else if (BM_STATE === 'loading') bmDrawState('LOADING...', 'Response ready. Sending to watch.');
     else if (BM_STATE === 'confirmation') bmDrawConfirmation();
     else if (BM_STATE === 'clarification') {
       bmDrawResult();
       g.setFont('Vector', 9);
-      g.setFontAlign(0, -1);
-      g.drawString('Speak instead', BM_SCREEN_WIDTH / 2, BM_SCREEN_HEIGHT - 25);
+      g.setFontAlign(-1, -1);
+      g.drawString('Start over', 10, BM_SCREEN_HEIGHT - 25);
+      g.setFontAlign(1, -1);
+      g.drawString('Speak instead', BM_SCREEN_WIDTH - 10, BM_SCREEN_HEIGHT - 25);
     }
     else if (BM_STATE === 'empty') bmDrawState('NO RESULTS', BM_CONTEXT);
     else if (BM_STATE === 'error') bmDrawState('ERROR', BM_CONTEXT);
@@ -443,16 +442,31 @@
       if (BM_BUFFER.length < BM_HEADER + length) return;
       var frame = BM_BUFFER.splice(0, BM_HEADER + length), type = frame[3];
       var id = frame[4] | (frame[5] << 8), index = frame[6], count = frame[7], payload = frame.slice(BM_HEADER);
+      if (type === 5 && index === 0 && count === 1 && payload.length === 1 && payload[0] === 1) {
+        bmSetState('thinking');
+        continue;
+      }
+      if (type === 6 && index === 0 && count === 1 && payload.length === 1 && payload[0] === 1) {
+        bmFrame(6, id, 0, 1, [1]);
+        continue;
+      }
       if (type !== 2 || !count || count > 245 || index >= count) continue;
       if (BM_SEEN[id]) { bmFrame(3, id, 0, 1, [0]); continue; }
       var message = BM_MESSAGES[id];
       if (!message) {
         message = BM_MESSAGES[id] = { count: count, chunks: {}, received: 0, bytes: 0 };
+        if (count > 1) {
+          BM_LOADING_ID = id;
+          bmSetState('loading');
+        }
       }
       if (message.count !== count || message.chunks[index]) continue;
       bmCancel(message.timeout);
       (function (messageId, currentMessage) {
-        currentMessage.timeout = bmSchedule(function () { delete BM_MESSAGES[messageId]; }, 10000);
+        currentMessage.timeout = bmSchedule(function () {
+          delete BM_MESSAGES[messageId];
+          if (BM_STATE === 'loading' && BM_LOADING_ID === messageId) bmSetState('error', 'Transfer timed out. Retrying may help.');
+        }, 10000);
       })(id, message);
       message.bytes += payload.length;
       if (message.bytes > 2450) { bmCancel(message.timeout); delete BM_MESSAGES[id]; continue; }
@@ -461,13 +475,20 @@
       if (message.received === count) {
         bmCancel(message.timeout);
         delete BM_MESSAGES[id];
-        var bytes = [];
-        for (var chunk = 0; chunk < count; chunk++) bytes = bytes.concat(message.chunks[chunk]);
+        var bytes = new Uint8Array(message.bytes), offset = 0;
+        for (var chunk = 0; chunk < count; chunk++) {
+          bytes.set(message.chunks[chunk], offset);
+          offset += message.chunks[chunk].length;
+        }
+        message = undefined;
+        frame = undefined;
+        payload = undefined;
         var text;
         try { text = bmDecodeUtf8(bytes); }
         catch (error) { bmSetState('error', 'Received text could not be decoded.'); bmFrame(3, id, 0, 1, [1]); continue; }
+        bytes = undefined;
+        if (!bmSetDocument(text)) { bmFrame(3, id, 0, 1, [1]); continue; }
         BM_STORAGE.write('cue-memory.txt', text);
-        bmSetDocument(text);
         BM_SEEN[id] = true;
         (function (seenId) { bmSchedule(function () { delete BM_SEEN[seenId]; }, 60000); })(id);
         bmFrame(3, id, 0, 1, [0]);
@@ -475,15 +496,16 @@
     }
   }
   function bmSwipe(direction) {
+    if (!BM_CONNECTED) return;
     if (BM_STATE !== 'result' && BM_STATE !== 'confirmation' && BM_STATE !== 'clarification') return;
-    var next = direction > 0 ? BM_PAGE + 1 : BM_PAGE - 1;
+    var next = direction < 0 ? BM_PAGE + 1 : BM_PAGE - 1;
     if (next < 0 || next >= BM_PAGE_LAYOUTS.length) return;
     BM_PAGE = next;
     BM_SCROLL = 0;
     bmDraw();
   }
   function bmTap(button, xy) {
-    if (!xy || Date.now() < BM_IGNORE_TOUCH_UNTIL) return;
+    if (!BM_CONNECTED || !xy) return;
     if (BM_STATE !== 'home' && xy.x < 52 && xy.y < 28) {
       bmSetState('home');
       return;
@@ -500,6 +522,11 @@
       return;
     }
     if (BM_STATE === 'clarification') {
+      if (xy.y >= BM_SCREEN_HEIGHT - 34) {
+        if (xy.x < BM_SCREEN_WIDTH / 2) bmSendAction(BM_RESTART_ACTION);
+        else bmSendTrigger();
+        return;
+      }
       for (var optionIndex = 0; optionIndex < BM_ACTION_ROWS.length; optionIndex++) {
         var optionRow = BM_ACTION_ROWS[optionIndex];
         if (xy.x >= optionRow.x1 && xy.x <= optionRow.x2 && xy.y >= optionRow.y1 && xy.y <= optionRow.y2) {
@@ -520,27 +547,13 @@
     }
   }
   function bmDrag(event) {
+    if (!BM_CONNECTED) return;
     if (event.b && !BM_PRESS) {
-      BM_PRESS = { x: event.x, y: event.y, lastY: event.y, long: false, moved: false };
-      if (BM_STATE === 'home' && event.y >= 42 && event.y <= 144 && event.x >= 18 && event.x <= BM_SCREEN_WIDTH - 18) {
-        BM_PRESS_TIMER = bmSchedule(function () {
-          if (!BM_PRESS || BM_PRESS.moved) return;
-          BM_PRESS.long = true;
-          BM_STATE = 'recording';
-          BM_CONTEXT = '';
-          bmDraw();
-          Bangle.buzz(30);
-        }, BM_LONG_PRESS_MS);
-      }
+      BM_PRESS = { x: event.x, y: event.y, lastY: event.y };
       return;
     }
     if (event.b && BM_PRESS) {
       var dx = event.x - BM_PRESS.x, dy = event.y - BM_PRESS.y;
-      if (Math.abs(dx) + Math.abs(dy) > 16 && !BM_PRESS.long) {
-        BM_PRESS.moved = true;
-        if (BM_PRESS_TIMER !== undefined) bmCancel(BM_PRESS_TIMER);
-        BM_PRESS_TIMER = undefined;
-      }
       if ((BM_STATE === 'result' || BM_STATE === 'confirmation') && Math.abs(dy) >= Math.abs(dx)) {
         BM_SCROLL -= event.y - BM_PRESS.lastY;
         BM_PRESS.lastY = event.y;
@@ -548,23 +561,29 @@
       }
       return;
     }
-    if (!event.b && BM_PRESS) {
-      var press = BM_PRESS;
-      if (BM_PRESS_TIMER !== undefined) bmCancel(BM_PRESS_TIMER);
-      BM_PRESS_TIMER = undefined;
-      BM_PRESS = undefined;
-      if (press.long) {
-        BM_IGNORE_TOUCH_UNTIL = Date.now() + 500;
-        bmSendTrigger();
-      }
-    }
+    if (!event.b && BM_PRESS) BM_PRESS = undefined;
+  }
+  function bmConnected() {
+    BM_CONNECTED = true;
+    bmDraw();
+  }
+  function bmDisconnected() {
+    BM_CONNECTED = false;
+    BM_PRESS = undefined;
+    while (BM_TIMERS.length) clearTimeout(BM_TIMERS.pop());
+    BM_MESSAGES = {};
+    BM_SEEN = {};
+    BM_BUFFER = [];
+    if (BM_STATE === 'thinking' || BM_STATE === 'loading') bmSetState('home');
+    else bmDraw();
   }
   function bmCleanup() {
     Bluetooth.removeListener('data', bmReceive);
+    NRF.removeListener('connect', bmConnected);
+    NRF.removeListener('disconnect', bmDisconnected);
     Bangle.removeListener('drag', bmDrag);
     Bangle.removeListener('touch', bmTap);
     BM_PRESS = undefined;
-    BM_PRESS_TIMER = undefined;
     while (BM_TIMERS.length) clearTimeout(BM_TIMERS.pop());
     BM_MESSAGES = {};
     BM_SEEN = {};
@@ -576,6 +595,9 @@
   Bangle.on('drag', bmDrag);
   Bangle.on('touch', bmTap);
   Bluetooth.on('data', bmReceive);
+  NRF.on('connect', bmConnected);
+  NRF.on('disconnect', bmDisconnected);
+  BM_CONNECTED = NRF.getSecurityStatus().connected;
   bmDraw();
   Bluetooth.write('BM_BLE_READY\n');
 })();

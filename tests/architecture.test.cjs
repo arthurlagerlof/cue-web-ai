@@ -71,11 +71,12 @@ function fakeEmbed(text) {
 
 function localTestDatabase(registryData) {
   const embeddings = new Map();
+  const { EMBEDDING_CACHE_VERSION } = require('../src/intelligence/embeddingModel.js');
   return {
     async getRegistryData() { return registryData; },
     async getCachedEmbedding(text, model) { return embeddings.get(`${model}\0${text}`); },
     async cacheEmbedding(text, model, dimensions, vector) {
-      embeddings.set(`${model}\0${text}`, { model, dimensions, vector });
+      embeddings.set(`${model}\0${text}`, { model, version: EMBEDDING_CACHE_VERSION, dimensions, vector });
     },
     async getRecords(providerId, recordType) { return registryData.data?.[providerId]?.[recordType] ?? []; },
     async getRecord(providerId, recordType, recordId) {
@@ -222,7 +223,7 @@ test('database environment caches browser embeddings and searches local provider
   const runtime = await createDatabaseEnvironment({
     database,
     registryData,
-    embed: async () => ({ vector: Array(384).fill(1), dimensions: 384 }),
+    embed: async () => ({ vector: Array(384).fill(1 / Math.sqrt(384)), dimensions: 384 }),
   });
   const outcome = await runtime.intelligence.handle('Create a flashcard about photosynthesis');
   assert.equal(outcome.kind, 'clarification');
@@ -246,7 +247,7 @@ test('hosted planning can defer retrieval indexing until a local mode needs it',
     database: localTestDatabase(registryData),
     registryData,
     initializeRetrieval: false,
-    embed: async () => { embeddings++; return { vector: Array(384).fill(1), dimensions: 384 }; },
+    embed: async () => { embeddings++; return { vector: Array(384).fill(1 / Math.sqrt(384)), dimensions: 384 }; },
   });
   assert.ok(runtime.registry.get(tool.id));
   assert.equal(embeddings, 0);
@@ -386,7 +387,7 @@ test('configured cross-encoder thresholds select the decisive calendar result wi
   const runtime = await createDatabaseEnvironment({
     database,
     registryData,
-    embed: async () => ({ vector: Array(384).fill(1), dimensions: 384 }),
+    embed: async () => ({ vector: Array(384).fill(1 / Math.sqrt(384)), dimensions: 384 }),
     rerankTools: async () => ids.map((toolId, index) => ({ toolId, score: scores[index] })).reverse(),
     onRerankDecision: decision => decisions.push(decision),
   });
@@ -492,9 +493,11 @@ test('embedding worker loads the quantized model', async () => {
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const messages = [];
   let dtype;
+  let revision;
   const self = {};
   const pipeline = async (_task, _modelId, options) => {
     dtype = options.dtype;
+    revision = options.revision;
     return async () => ({ data: Float32Array.of(0.25), dims: [1, 1] });
   };
   const context = {
@@ -504,14 +507,94 @@ test('embedding worker loads the quantized model', async () => {
       if (name === '@huggingface/transformers') return { pipeline, env: {} };
       if (name === './asrModels') return { ASR_MODELS: {} };
       if (name.endsWith('crossEncoderScore.js')) return { crossEncoderScoreFromLogit };
-      if (name.endsWith('embeddingModel.js')) return { EMBEDDING_TOKENIZER: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2' };
+      if (name.endsWith('embeddingModel.js')) return { EMBEDDING_TOKENIZER: 'Xenova/paraphrase-multilingual-MiniLM-L12-v2', EMBEDDING_REVISION: 'pinned-revision' };
       throw new Error(`Unexpected import: ${name}`);
     },
   };
   vm.runInNewContext(compiled, context);
   await self.onmessage({ data: { id: 1, stage: 'embed', text: 'query' } });
   assert.equal(dtype, 'q8');
+  assert.equal(revision, 'pinned-revision');
   assert.deepEqual(Array.from(messages.find(message => message.status === 'complete').result.vector), [0.25]);
+});
+
+async function whisperWorker({ gpu = true, loadError = {}, inferenceError = {} } = {}) {
+  const vm = require('node:vm');
+  const ts = require('typescript');
+  const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', 'model.worker.ts'), 'utf8');
+  const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
+  const messages = [], loads = [], runs = [], disposals = [];
+  const self = {};
+  const pipeline = async (task, modelId, options) => {
+    loads.push({ task, modelId, device: options.device, dtype: options.dtype });
+    if (loadError[options.device]) throw new Error(loadError[options.device]);
+    const instance = async (audio, settings) => {
+      runs.push({ device: options.device, audio: Array.from(audio), settings });
+      if (inferenceError[options.device]) throw new Error(inferenceError[options.device]);
+      return { text: 'recognized speech' };
+    };
+    instance.dispose = async () => { disposals.push(options.device); };
+    return instance;
+  };
+  vm.runInNewContext(compiled, {
+    exports: {}, self, Error, Float32Array,
+    navigator: gpu ? { gpu: { requestAdapter: async () => ({}) } } : {},
+    postMessage: message => messages.push(message),
+    require: name => {
+      if (name === '@huggingface/transformers') return { pipeline, env: {} };
+      if (name === './asrModels') return { ASR_MODELS: { tiny: { modelId: 'whisper-tiny' }, base: { modelId: 'whisper-base' } } };
+      if (name.endsWith('crossEncoderScore.js')) return {};
+      if (name.endsWith('embeddingModel.js')) return {};
+      throw new Error(`Unexpected import: ${name}`);
+    },
+  });
+  const send = async (id = 1, asrModel = 'tiny') => self.onmessage({
+    data: { id, stage: 'transcribe', asrModel, audio: Float32Array.of(0.1, 0.2), sampleRate: 16000 },
+  });
+  return { send, messages, loads, runs, disposals };
+}
+
+test('Whisper uses WebGPU when available and reuses the loaded model', async () => {
+  const worker = await whisperWorker();
+  await worker.send();
+  await worker.send(2);
+  assert.deepEqual(worker.loads, [{ task: 'automatic-speech-recognition', modelId: 'whisper-tiny', device: 'webgpu', dtype: 'q4' }]);
+  assert.equal(worker.runs.length, 2);
+  assert.equal(worker.messages.filter(message => message.status === 'complete').length, 2);
+  assert.equal(worker.messages.find(message => message.status === 'complete').result, 'recognized speech');
+});
+
+test('Whisper falls back to CPU when WebGPU is unavailable or fails', async () => {
+  for (const [options, expectedLoads] of [
+    [{ gpu: false }, ['wasm']],
+    [{ loadError: { webgpu: 'GPU initialization failed' } }, ['webgpu', 'wasm']],
+    [{ inferenceError: { webgpu: 'GPU device lost' } }, ['webgpu', 'wasm']],
+  ]) {
+    const worker = await whisperWorker(options);
+    await worker.send();
+    await worker.send(2);
+    assert.deepEqual(worker.loads.map(load => load.device), expectedLoads);
+    assert.equal(worker.loads.at(-1).dtype, 'q8');
+    assert.equal(worker.messages.filter(message => message.status === 'complete').length, 2);
+    assert.ok(worker.messages.some(message => message.status === 'notice' && /WASM/.test(message.message)));
+    if (options.inferenceError) assert.deepEqual(worker.disposals, ['webgpu']);
+  }
+});
+
+test('Whisper preserves the selected model and surfaces CPU failures', async () => {
+  const worker = await whisperWorker({ gpu: false });
+  await worker.send();
+  await worker.send(2, 'base');
+  assert.deepEqual(worker.loads.map(load => load.modelId), ['whisper-tiny', 'whisper-base']);
+  for (const options of [
+    { gpu: false, loadError: { wasm: 'Failed to fetch model' } },
+    { gpu: false, inferenceError: { wasm: 'CPU inference failed' } },
+  ]) {
+    const failed = await whisperWorker(options);
+    await failed.send();
+    assert.match(failed.messages.find(message => message.status === 'error').error, /Whisper wasm .*Failed|Whisper wasm .*failed/);
+    assert.equal(failed.messages.some(message => message.status === 'complete'), false);
+  }
 });
 
 test('cross-encoder lazily loads q8 on WebGPU and reports progress and success', async () => {
@@ -595,6 +678,27 @@ test('request-level routing escalates multi-step, collection, and implicit-conte
   assert.equal(requiresExternalPlanning('Set an alarm before the garden work tomorrow'), 'implicit event context');
 });
 
+test('clarification restart recognizes explicit corrections without consuming normal replies', async () => {
+  const { clarificationRestart, clarificationHasCompletedSideEffects } = await import('../src/intelligence/toolIntelligence.js');
+  assert.equal(clarificationRestart('No, I meant search my Anki cards for plants'), 'search my Anki cards for plants');
+  assert.equal(clarificationRestart('go back'), '');
+  assert.equal(clarificationRestart('start over'), '');
+  assert.equal(clarificationRestart('no'), undefined);
+  assert.equal(clarificationRestart('No, the answer is plants'), undefined);
+  assert.equal(clarificationHasCompletedSideEffects({ seenSideEffects: ['done'] }), true);
+  assert.equal(clarificationHasCompletedSideEffects({ executionState: { executedSideEffects: ['done'] } }), true);
+  assert.equal(clarificationHasCompletedSideEffects({ completedOperations: [{}] }), false);
+
+  const runtime = await environment();
+  const first = await runtime.intelligence.handle('Create a flashcard about photosynthesis');
+  assert.equal(first.state.status, 'awaiting_argument');
+  runtime.intelligence.cancelPendingOperation();
+  const corrected = await runtime.intelligence.handle(clarificationRestart('No, I meant search my Anki cards about photosynthesis'));
+  assert.equal(corrected.kind, 'document');
+  assert.equal(corrected.results[0].toolId, 'anki.search_cards');
+  assert.notEqual(corrected.state.conversationId, first.state.conversationId);
+});
+
 test('clarification survives runtime reconstruction and short choices resume the original request', async () => {
   const toolChoiceRuntime = await environment({
     searchTools: async () => [
@@ -658,6 +762,23 @@ test('calendar search resolves full local date ranges and Stage 2 evidence canno
   assert.equal(result.retrieval.providerEvidence.hits[0].record.id, 'event-1');
 });
 
+test('calendar weeks start on Monday even if an old Sunday preference is supplied', async () => {
+  const [, , , , argumentResolution] = await modules;
+  const tool = manifests.find(item => item.id === 'calendar.find_events');
+  for (const [now, request, start, end] of [
+    ['2026-11-22T12:00:00Z', 'this week', '2026-11-16T00:00:00+02:00', '2026-11-23T00:00:00+02:00'],
+    ['2026-11-22T12:00:00Z', 'next week', '2026-11-23T00:00:00+02:00', '2026-11-30T00:00:00+02:00'],
+    ['2026-11-23T12:00:00Z', 'next week', '2026-11-30T00:00:00+02:00', '2026-12-07T00:00:00+02:00'],
+  ]) {
+    const result = argumentResolution.resolveArguments({
+      request: `What events do I have ${request}?`, tool,
+      context: { now: new Date(now), timeZone: 'Europe/Helsinki', locale: 'en-US', weekStartsOn: 0 },
+    });
+    assert.equal(result.arguments.start_datetime, start);
+    assert.equal(result.arguments.end_datetime, end);
+  }
+});
+
 test('argument normalization is conditional, schema-checked, retried once, and never selects tools', async () => {
   const [, , , , , , , normalization] = await modules;
   const tool = manifests.find(item => item.id === 'anki.create_card');
@@ -679,7 +800,11 @@ test('argument normalization is conditional, schema-checked, retried once, and n
     },
   });
   assert.equal(prompts.length, 2);
+  assert.match(prompts[0], /Minimize internal reasoning/);
+  assert.match(prompts[0], /Return the required JSON directly/);
   assert.match(prompts[0], /selected tool/);
+  assert.match(prompts[0], /generate concise front\/back content/);
+  assert.match(prompts[0], /Never invent user-specific facts/);
   assert.match(prompts[0], /anki\.create_card/);
   assert.match(prompts[0], /question_text/);
   assert.doesNotMatch(prompts[0], /acceptedSources/);
@@ -724,13 +849,29 @@ test('model-assisted argument normalization is invoked only for suitable Anki ge
   assert.equal(explicit.kind, 'confirmation_required');
   assert.equal(calls, 1);
 
+  const partialRuntime = await environment({
+    normalizeArguments: async () => {
+      calls++;
+      return JSON.stringify({
+        status: 'resolved',
+        arguments: { back: 'Plants convert light into chemical energy.' },
+        missing: [], ambiguous: [], provenance: { back: 'model_generated' },
+      });
+    },
+  });
+  const partial = await partialRuntime.intelligence.handle('Create an Anki card about plants and invent the answer. front: What is photosynthesis?');
+  assert.equal(partial.kind, 'confirmation_required', JSON.stringify(partial));
+  assert.equal(partial.pendingCall.arguments.front, 'What is photosynthesis?');
+  assert.equal(partial.pendingCall.arguments.back, 'Plants convert light into chemical energy.');
+  assert.equal(calls, 2);
+
   const disabledRuntime = await environment({
     argumentNormalizerEnabled: () => false,
     normalizeArguments: async () => { calls++; throw new Error('Disabled normalizer must not run'); },
   });
   const disabled = await disabledRuntime.intelligence.handle('Create a flashcard about photosynthesis');
   assert.equal(disabled.kind, 'clarification');
-  assert.equal(calls, 1);
+  assert.equal(calls, 2);
   assert.equal(disabled.normalizationError, undefined);
 });
 
@@ -1122,6 +1263,12 @@ test('execution plans validate bindings, deterministic transforms, conditions, a
   const invalid = structuredClone(valid);
   invalid.operations[1].inputBindings[0].sourceOperation = 'missing';
   assert.match(planModule.validateExecutionPlan(invalid, runtime.registry).errors.join(' '), /unknown operation/);
+  const missingCollectionPointer = structuredClone(valid);
+  missingCollectionPointer.operations[1].forEach = { sourceOperation: 'search', bindings: [] };
+  assert.match(planModule.validateExecutionPlan(missingCollectionPointer, runtime.registry).errors.join(' '), /requires a source operation, array JSON Pointer/);
+  const missingItemPointer = structuredClone(valid);
+  missingItemPointer.operations[1].forEach = { sourceOperation: 'search', sourcePointer: '/events', bindings: [{ targetArgument: 'time' }] };
+  assert.match(planModule.validateExecutionPlan(missingItemPointer, runtime.registry).errors.join(' '), /requires targetArgument and an item JSON Pointer/);
   assert.equal(planModule.applyBindingTransform('2026-11-14T10:00:00+02:00', { type: 'subtract_duration', duration: 'PT15M' }), '2026-11-14T07:45:00.000Z');
   assert.equal(planModule.applyBindingTransform('2026-11-14T10:00:00+02:00', { type: 'add_duration', duration: 'PT15M' }), '2026-11-14T08:15:00.000Z');
   assert.equal(planModule.applyBindingTransform([{ id: 'first' }], { type: 'select_first' }).id, 'first');

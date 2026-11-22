@@ -5,7 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const ts = require('typescript');
 
-function createConnection(onWrite, { connectGatt } = {}) {
+function createConnection(onWrite, { connectGatt, projectionSupport = true } = {}) {
   const source = fs.readFileSync(path.join(__dirname, '..', 'src', 'services', 'bluetooth.ts'), 'utf8');
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
   const timers = new Map();
@@ -27,6 +27,10 @@ function createConnection(onWrite, { connectGatt } = {}) {
     const bytes = Uint8Array.from([0x42, 0x4d, 1, 3, frame[4], frame[5], 0, 1, 1, status]);
     listener({ target: { value: new DataView(bytes.buffer) } });
   };
+  const notifyCapability = frame => {
+    const bytes = Uint8Array.from([0x42, 0x4d, 1, 6, frame[4], frame[5], 0, 1, 1, 1]);
+    listener({ target: { value: new DataView(bytes.buffer) } });
+  };
   const tx = {
     startNotifications: async () => tx,
     addEventListener: (type, callback) => { listener = callback; },
@@ -36,6 +40,10 @@ function createConnection(onWrite, { connectGatt } = {}) {
     writeValueWithoutResponse: async data => {
       const frame = Uint8Array.from(data);
       frames.push(frame);
+      if (frame[3] === 6) {
+        if (projectionSupport) notifyCapability(frame);
+        return;
+      }
       await onWrite(frame, { frames, notifyAck, clock });
     },
     writeValue: async () => {},
@@ -137,6 +145,55 @@ test('long transfers can be acknowledged after the original timeout', async () =
   assert.equal(harness.timers.size, 0);
 });
 
+test('watch documents retain display and action references without browser-only data', async () => {
+  const harness = createConnection(async (frame, { notifyAck }) => {
+    if (frame[6] === frame[7] - 1) notifyAck(frame);
+  });
+  await harness.connection.connect();
+  const document = {
+    schema: 'cue.display', version: 1, id: 'result', title: 'Result', state: 'ready',
+    source: { app: 'web', name: 'Web' }, metadata: { extra: 'unused' },
+    pages: [{ id: 'page', title: 'Page', elements: [
+      { type: 'text', text: 'Olá', style: { emphasis: 'strong' } },
+      { type: 'image', assetId: 'image' },
+      { type: 'action', actionId: 'open', label: 'Open' },
+    ] }],
+    actions: [{ id: 'open', label: 'Open', toolId: 'web.open', arguments: { id: 'one' } }],
+    assets: [{ id: 'image', alt: 'Illustration', mimeType: 'image/png', originalRef: 'image.png' }],
+  };
+  await harness.run(harness.connection.sendDisplayDocument(document));
+  const bytes = Buffer.concat(harness.frames.filter(frame => frame[3] === 2).map(frame => Buffer.from(frame.slice(9))));
+  assert.deepEqual(JSON.parse(bytes.toString('utf8')), {
+    schema: 'cue.watch.display', version: 1, title: 'Result', state: 'ready',
+    pages: [{ title: 'Page', elements: document.pages[0].elements }],
+    actions: [{ id: 'open', label: 'Open' }],
+    assets: [{ id: 'image', alt: 'Illustration' }],
+  });
+});
+
+test('older watch apps receive the original document after the capability probe times out', async () => {
+  const harness = createConnection(async (frame, { notifyAck }) => {
+    if (frame[6] === frame[7] - 1) notifyAck(frame);
+  }, { projectionSupport: false });
+  await harness.connection.connect();
+  const document = { schema: 'cue.display', version: 1, id: 'legacy', title: 'Legacy', state: 'ready',
+    source: { app: 'cue', name: 'Cue' }, pages: [], actions: [], assets: [] };
+  await harness.run(harness.connection.sendDisplayDocument(document));
+  const bytes = Buffer.concat(harness.frames.filter(frame => frame[3] === 2).map(frame => Buffer.from(frame.slice(9))));
+  assert.deepEqual(JSON.parse(bytes.toString('utf8')), document);
+  assert.equal(harness.timers.size, 0);
+});
+
+test('thinking status uses one unacknowledged frame', async () => {
+  const harness = createConnection(async () => {});
+  await harness.connection.connect();
+  await harness.connection.sendThinking();
+  assert.equal(harness.frames.length, 1);
+  assert.deepEqual(Array.from(harness.frames[0].slice(0, 4)), [0x42, 0x4d, 1, 5]);
+  assert.deepEqual(Array.from(harness.frames[0].slice(6)), [0, 1, 1, 1]);
+  assert.equal(harness.timers.size, 0);
+});
+
 test('late acknowledgement during a retry stops retransmission', async () => {
   const harness = createConnection(async (frame, { frames, notifyAck }) => {
     if (frames.length === 4) notifyAck(frame);
@@ -154,6 +211,16 @@ test('a delayed acknowledgement after the last chunk is accepted', async () => {
   await harness.connection.connect();
   await harness.run(harness.connection.sendDisplayText('hello'));
   assert.equal(harness.frames.length, 1);
+  assert.equal(harness.timers.size, 0);
+});
+
+test('large results allow more time for the watch to finish processing', async () => {
+  const harness = createConnection(async (frame, { notifyAck, clock }) => {
+    if (frame[6] === frame[7] - 1) clock.setTimeout(() => notifyAck(frame), 11000);
+  });
+  await harness.connection.connect();
+  await harness.run(harness.connection.sendDisplayText('x'.repeat(2348)));
+  assert.equal(harness.frames.length, 235);
   assert.equal(harness.timers.size, 0);
 });
 
