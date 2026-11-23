@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Bluetooth, Mic, Settings } from 'lucide-react';
 import { RollingAudio } from './services/audio';
+import { CLOUD_MODEL, transcribeInCloud } from './services/cloudTranscription.js';
+import { assessGpu } from './services/deviceDefaults.js';
 import { watch } from './services/watch';
 import { ASR_MODELS, type ASRModelSize } from './services/asrModels';
 import { createDisplayDocument, parseDisplayDocument, validateDisplayDocument } from './display/document.js';
@@ -31,6 +33,7 @@ import {
 } from './statistics';
 
 type Stage = 'transcribe' | 'embed' | 'rerank';
+type TranscriptionModel = ASRModelSize | 'cloud';
 type WorkerReply = { id: number; stage: Stage; status: string; model?: string; result?: any; error?: string; message?: string; statusOnly?: boolean };
 type RerankDecision = { topScore: number; secondScore: number | null; margin: number | null; minimumScore: number; minimumMargin: number; scorePassed: boolean; marginPassed: boolean; decision: 'selected' | 'ambiguous' };
 type AiMode = 'web_ai' | 'automatic' | 'dots3_always';
@@ -113,17 +116,24 @@ export default function App() {
   const [installStatus, setInstallStatus] = useState('');
   const [recording, setRecording] = useState(false);
   const [buffer, setBuffer] = useState(0);
-  const [asrModel, setAsrModel] = useState<ASRModelSize>('tiny');
-  const asrModelRef = useRef<ASRModelSize>('tiny');
+  const [asrModel, setAsrModel] = useState<TranscriptionModel>('cloud');
+  const asrModelRef = useRef(asrModel);
   const [status, setStatus] = useState<Record<Stage, string>>({ transcribe: 'Not started', embed: 'Not started', rerank: 'Not started' });
-  const [aiMode, setAiMode] = useState<AiMode>(() => {
+  const [savedAiMode] = useState<AiMode | undefined>(() => {
     try {
       const savedMode = window.localStorage.getItem('cue.ai.mode');
       if (savedMode === 'web_ai' || savedMode === 'automatic' || savedMode === 'dots3_always') return savedMode;
-      return 'automatic';
-    } catch { return 'automatic'; }
+    } catch (error) {
+      console.error('Could not read the saved AI mode:', error);
+    }
+    return undefined;
   });
+  const [aiMode, setAiMode] = useState<AiMode>(savedAiMode ?? 'dots3_always');
   const aiModeRef = useRef(aiMode);
+  const aiModeChosen = useRef(savedAiMode !== undefined);
+  const asrModelChosen = useRef(false);
+  const [checkingGpu, setCheckingGpu] = useState(true);
+  const checkingGpuRef = useRef(true);
   const [previousMessage, setPreviousMessage] = useState('');
   const [embedding, setEmbedding] = useState<any>();
   const [logs, setLogs] = useState<string[]>([]);
@@ -141,6 +151,7 @@ export default function App() {
   const holdTimer = useRef<number>();
   const sequence = useRef(0);
   const running = useRef(false);
+  const transcriptionAbort = useRef<AbortController>();
   const environment = useRef<any>();
   const displayDocumentRef = useRef<any>();
   const pendingConfirmationRef = useRef<any>();
@@ -151,6 +162,28 @@ export default function App() {
   const pending = useRef(new Map<number, { stage: Stage; resolve: (reply: WorkerReply) => void; measurement?: RequestMeasurement; inferenceStartedAt?: number; inferenceModel?: string }>());
   const resolvingInteractions = useRef(new Set<string>());
   const activeRequest = useRef<RequestMeasurement>();
+
+  useEffect(() => {
+    let active = true;
+    const gpu = (navigator as Navigator & { gpu?: Parameters<typeof assessGpu>[0] }).gpu;
+    void assessGpu(gpu).then(result => {
+      if (!active) return;
+      log(result.reason);
+      if (!aiModeChosen.current) {
+        const mode = result.preferLocal ? 'automatic' : 'dots3_always';
+        aiModeRef.current = mode;
+        setAiMode(mode);
+      }
+      if (!asrModelChosen.current) {
+        const model = result.preferLocal ? 'tiny' : 'cloud';
+        asrModelRef.current = model;
+        setAsrModel(model);
+      }
+      checkingGpuRef.current = false;
+      setCheckingGpu(false);
+    });
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     const dialog = microphoneDialogRef.current;
@@ -308,10 +341,11 @@ export default function App() {
       if (message === 'Watch disconnected') log(message);
     });
     watch.onDiagnostic = message => log(`BLE: ${message}`);
-    return () => { window.removeEventListener('online', retryTelemetry); audio.stop(); unsubscribe(); unsubscribeWatchStatus(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); watch.onTrigger = undefined; watch.onAction = undefined; watch.onDiagnostic = undefined; };
+    return () => { window.removeEventListener('online', retryTelemetry); transcriptionAbort.current?.abort(); audio.stop(); unsubscribe(); unsubscribeWatchStatus(); playbackRef.current?.stop(); workers.forEach(instance => instance.terminate()); workers.clear(); watch.onTrigger = undefined; watch.onAction = undefined; watch.onDiagnostic = undefined; };
   }, []);
 
   function setAiPreference(mode: AiMode) {
+    aiModeChosen.current = true;
     aiModeRef.current = mode;
     setAiMode(mode);
     try { window.localStorage.setItem('cue.ai.mode', mode); }
@@ -354,6 +388,8 @@ export default function App() {
         };
         instance.onerror = event => {
           const message = event.message || 'Model worker failed.';
+          instance!.terminate();
+          if (workers.get(stage) === instance) workers.delete(stage);
           setStatus(old => ({ ...old, [stage]: `Error — ${message}` }));
           pending.current.forEach((task, pendingId) => {
             if (task.stage === stage) {
@@ -429,8 +465,9 @@ export default function App() {
 
   function stopStage(stage: Stage) {
     const instance = workers.get(stage);
-    if (!instance) return;
-    instance.terminate(); workers.delete(stage);
+    if (!instance && !(stage === 'transcribe' && transcriptionAbort.current)) return;
+    if (stage === 'transcribe') transcriptionAbort.current?.abort();
+    if (instance) { instance.terminate(); workers.delete(stage); }
     pending.current.forEach((task, id) => {
       if (task.stage === stage) {
         if (task.inferenceStartedAt !== undefined) recordLocalInference(task.measurement, task.inferenceModel, performance.now() - task.inferenceStartedAt);
@@ -627,6 +664,7 @@ export default function App() {
   }
 
   async function processTranscript(text: string, continuePendingLocally = false, existingMeasurement?: RequestMeasurement) {
+    if (checkingGpuRef.current) throw new Error('GPU assessment is still running. Please wait.');
     let clean = text.trim();
     if (!clean) throw new Error('Enter transcript text first.');
     setPreviousMessage(clean);
@@ -1143,15 +1181,42 @@ export default function App() {
   }
 
   async function runPipeline(snapshot = audio.snapshot()) {
+    if (checkingGpuRef.current) { log('GPU assessment is still running. Please wait.'); return; }
     if (running.current) return;
     running.current = true;
     const measurement = beginRequestMeasurement(aiModeRef.current);
     activeRequest.current = measurement;
+    const controller = new AbortController();
+    transcriptionAbort.current = controller;
     setBusy(true);
     try {
       log(`Frozen ${snapshot.audio.length} samples at ${snapshot.sampleRate} Hz`);
-      const asr = await runModel('transcribe', { ...snapshot, asrModel: asrModelRef.current });
-      if (asr.status === 'error') throw new Error(asr.error);
+      const runCloud = async (): Promise<WorkerReply> => {
+        log('Sending audio to Cloudflare for transcription.');
+        setStatus(old => ({ ...old, transcribe: 'Transcribing in cloud (Cloudflare)…' }));
+        try {
+          const result = await transcribeInCloud(snapshot.audio, snapshot.sampleRate, controller.signal);
+          return { id: 0, stage: 'transcribe', status: 'complete', model: `Cloudflare ${CLOUD_MODEL}`, result };
+        } catch (cloudError) {
+          const message = cloudError instanceof Error ? cloudError.message : String(cloudError);
+          setStatus(old => ({ ...old, transcribe: `Error — ${message}` }));
+          throw cloudError;
+        }
+      };
+      let asr: WorkerReply;
+      const selectedModel = asrModelRef.current;
+      if (selectedModel === 'cloud') {
+        asr = await runCloud();
+      } else {
+        try {
+          asr = await runModel('transcribe', { ...snapshot, audio: snapshot.audio.slice(), asrModel: selectedModel });
+          if (asr.status === 'error') throw new Error(asr.error);
+        } catch (error) {
+          if (controller.signal.aborted) throw new Error('Stopped by user.');
+          log(`Local transcription unavailable: ${error instanceof Error ? error.message : String(error)}.`);
+          asr = await runCloud();
+        }
+      }
       const text = String(asr.result ?? '').trim(); setPreviousMessage(text);
       setStatus(old => ({ ...old, transcribe: `Complete — ${asr.model}` }));
       if (!text) throw new Error('No speech was detected.');
@@ -1180,7 +1245,7 @@ export default function App() {
         })).catch(displayError => log(`Could not display recording failure on watch: ${displayError instanceof Error ? displayError.message : String(displayError)}`));
       }
       if (!measurement.completed) await persistRequestMeasurement(measurement, 'failed');
-    } finally { running.current = false; setBusy(false); }
+    } finally { transcriptionAbort.current = undefined; running.current = false; setBusy(false); }
   }
 
   async function connectWatch() {
@@ -1318,7 +1383,7 @@ export default function App() {
               {DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}
             </select>
           </label>
-          <button className="app-primary-action" disabled={busy || !transcriptInput.trim()} onClick={() => void submitTranscript()}>
+          <button className="app-primary-action" disabled={busy || checkingGpu || !transcriptInput.trim()} onClick={() => void submitTranscript()}>
             {busy ? 'Processing…' : pendingClarification ? 'Send reply' : 'Process message'}
           </button>
         </div>
@@ -1327,6 +1392,7 @@ export default function App() {
           <strong>Previous message</strong>
           <p>{previousMessage || 'No messages yet.'}</p>
         </div>
+        {checkingGpu && <p role="status">Checking GPU performance to choose defaults…</p>}
 
         {(busy || Object.values(status).some(value => value !== 'Not started')) && <div className="app-stage-status" aria-live="polite">
           {(['transcribe', 'embed', 'rerank'] as Stage[]).map(stage => <p key={stage}>
@@ -1366,12 +1432,15 @@ export default function App() {
         <span>{recording ? 'Recording' : 'Microphone off'}</span>
       </div>
       <p className="app-buffer-status">Rolling buffer: {buffer.toFixed(1)} / 10.0 seconds · {audio.sampleRate || '—'} Hz</p>
+      {checkingGpu && <p role="status">Checking GPU performance to choose defaults…</p>}
+      <p className="app-modal-note">Local Whisper sends the recording to Cloudflare if it cannot run. Cloud only always sends the recording to Cloudflare.</p>
+      {status.transcribe !== 'Not started' && <p className="app-modal-status" role="status">{status.transcribe}</p>}
       <div className="app-hold-capture">
         <button onClick={() => void toggleMicrophone()}>{recording ? 'Stop microphone' : 'Start microphone'}</button>
         <div className="app-capture-instructions">
           <p><span className="app-click-label">Click</span><span className="app-tap-label">Tap</span> to transcribe the last 10 seconds, or hold to add more (up to 5 additional minutes).</p>
         </div>
-        <button className="app-secondary-action" disabled={busy || !recording || buffer < 0.2} onPointerDown={event => {
+        <button className="app-secondary-action" disabled={busy || checkingGpu || !recording || buffer < 0.2} onPointerDown={event => {
           if (!event.isPrimary || event.button !== 0) return;
           event.currentTarget.setPointerCapture(event.pointerId);
           void startHoldCapture();
@@ -1420,6 +1489,7 @@ export default function App() {
           <div><p className="app-kicker">PREFERENCES</p><h2 id="settings-modal-title">AI settings</h2></div>
           <button autoFocus onClick={() => settingsDialogRef.current?.close()}>Close</button>
         </div>
+        {checkingGpu && <p role="status">Checking GPU performance to choose defaults…</p>}
         <label>AI mode<select value={aiMode} disabled={busy} onChange={event => {
           const value = event.target.value;
           if (value === 'web_ai' || value === 'automatic' || value === 'dots3_always') setAiPreference(value);
@@ -1429,7 +1499,10 @@ export default function App() {
           <option value="dots3_always">Always OpenRouter</option>
         </select></label>
         <p className="app-modal-note">Automatic keeps straightforward requests local and escalates complex or uncertain requests. Always OpenRouter sends the request and registered tool catalog through the configured backend. Avoid sensitive text in external modes.</p>
-        <label>Whisper model<select value={asrModel} disabled={busy} onChange={event => { const value = event.target.value as ASRModelSize; setAsrModel(value); asrModelRef.current = value; }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}</select></label>
+        <label>Whisper model<select value={asrModel} disabled={busy} onChange={event => {
+          const value = event.target.value;
+          if (value === 'cloud' || value === 'tiny' || value === 'base' || value === 'small') { asrModelChosen.current = true; setAsrModel(value); asrModelRef.current = value; }
+        }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}<option value="cloud">Cloud only — Cloudflare Whisper</option></select></label>
         <p className="app-modal-note">Tool availability and demo data are stored locally in this browser.</p>
         <div className="app-modal-actions app-utility-actions">
           <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button>
