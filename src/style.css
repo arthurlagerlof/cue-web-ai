@@ -270,16 +270,18 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
   .hero-copy p { margin-top: 10px; font-size: clamp(1.1rem, 4.5vw, 2rem); }
   .landing-demo {
     grid-template-columns: 1fr;
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: auto auto;
     gap: 8px;
     min-height: 100svh;
     padding: 28px 20px 20px;
+    overflow-x: clip;
+    overflow-y: visible;
   }
   .demo-copy h2 { margin-bottom: 10px; font-size: clamp(2.6rem, 12vw, 4rem); }
   .demo-copy > p { margin: 8px 0; }
   .demo-copy .no-watch { margin-top: 16px; padding-top: 10px; }
   .demo-copy .no-watch p { margin: 2px 0 8px; }
-  .demo-watch { min-height: 0; height: 40svh; }
+  .demo-watch { min-height: 360px; height: 40svh; }
   .demo-watch .watch-model { min-height: 0; }
   .landing-statistics { min-height: 100svh; padding: 54px 22px; }
   .statistics-highlights { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 20px; margin: 24px 0 12px; }

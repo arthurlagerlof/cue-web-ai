@@ -157,9 +157,16 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
       if (fitSize) {
         const halfFovTangent = Math.tan((camera.fov * Math.PI) / 360);
         const narrowHero = mode === 'hero' && window.matchMedia('(max-width: 700px)').matches;
-        const distanceForHeight = fitSize.y / (2 * halfFovTangent * (mode === 'hero' ? (narrowHero ? 0.6 : 0.76) : 1));
-        const distanceForWidth = fitSize.x / (2 * halfFovTangent * camera.aspect * (mode === 'hero' ? (narrowHero ? 0.8 : 0.5) : 1));
-        camera.position.z = Math.max(distanceForHeight, distanceForWidth) * 1.12 + fitSize.z / 2;
+        if (mode === 'demo') {
+          const halfVerticalFov = Math.atan(halfFovTangent);
+          const halfHorizontalFov = Math.atan(halfFovTangent * camera.aspect);
+          const halfFov = Math.min(halfVerticalFov, halfHorizontalFov);
+          camera.position.z = (fitSize.length() / 2 / Math.sin(halfFov)) * 1.12;
+        } else {
+          const distanceForHeight = fitSize.y / (2 * halfFovTangent * (narrowHero ? 0.6 : 0.76));
+          const distanceForWidth = fitSize.x / (2 * halfFovTangent * camera.aspect * (narrowHero ? 0.8 : 0.5));
+          camera.position.z = Math.max(distanceForHeight, distanceForWidth) * 1.12 + fitSize.z / 2;
+        }
         camera.lookAt(0, 0, 0);
       }
     };
