@@ -193,21 +193,26 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
 .app-shell.app-shell-centered label { display: block; margin: 0; font-weight: 600; }
 .app-shell.app-shell-centered select,
 .app-shell.app-shell-centered textarea { display: block; width: 100%; max-width: none; min-height: 44px; margin-top: 6px; padding: 10px 12px; border: 1px solid var(--cue-ink); border-radius: 0; background: var(--cue-paper); color: var(--cue-ink); }
-.app-intro { max-width: 720px; margin-bottom: 30px; }
 .app-kicker { margin: 0 0 12px; }
-.app-intro h1 { margin: 0; font-size: clamp(2.8rem, 7vw, 5.75rem); font-weight: 500; letter-spacing: -0.075em; line-height: 0.98; }
-.app-intro > p:last-child { max-width: 38em; margin: 18px 0 0; font-size: clamp(1rem, 1.5vw, 1.2rem); }
+.app-chat-log { display: flex; flex-direction: column; gap: 16px; min-height: 200px; max-height: min(55svh, 620px); margin-bottom: 24px; overflow-y: auto; overscroll-behavior: contain; }
+.app-chat-empty { margin: auto; max-width: 30em; color: #555; text-align: center; }
+.app-chat-message { max-width: min(88%, 680px); padding: 14px 18px; border: 1px solid var(--cue-ink); overflow-wrap: anywhere; }
+.app-chat-message > strong { display: block; margin-bottom: 6px; font-size: 0.72rem; letter-spacing: 0.1em; text-transform: uppercase; }
+.app-chat-message p { margin: 0; white-space: pre-wrap; }
+.app-chat-user { align-self: flex-end; background: var(--cue-blue); }
+.app-chat-assistant { align-self: flex-start; background: #f7f6f0; }
+.app-chat-assistant article h2 { margin: 0; font-size: 1.15rem; line-height: 1.3; }
+.app-chat-assistant article small { display: block; margin: 3px 0 8px; color: #555; }
+.app-chat-assistant article section { margin-top: 8px; }
+.app-chat-assistant button { margin-top: 10px !important; }
 .app-message-label { font-size: 0.95rem; }
-.app-shell.app-shell-centered .app-message-input { min-height: 170px; padding: 16px; border-width: 2px; font-size: 1.15rem; line-height: 1.5; resize: vertical; }
+.app-shell.app-shell-centered .app-message-input { min-height: 96px; padding: 14px; border-width: 2px; font-size: 1rem; line-height: 1.5; resize: vertical; }
 .app-shell.app-shell-centered .app-message-input:disabled { background: #f3f1e9; opacity: 0.8; }
 .app-compose-actions { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: end; margin-top: 16px; }
 .app-scenario-select { max-width: 400px; font-size: 0.88rem; }
 .app-primary-action { min-height: 48px; padding-inline: 24px; background: var(--cue-ink); color: var(--cue-paper); }
 .app-primary-action:hover:not(:disabled) { background: transparent; color: var(--cue-ink); }
 .app-clarification { margin: 14px 0 0; font-size: 0.92rem; }
-.app-previous-message { margin-top: 26px; padding-top: 16px; border-top: 1px solid var(--cue-line); }
-.app-previous-message strong { font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.08em; }
-.app-previous-message p { margin: 6px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 .app-microphone { margin-top: 34px; padding: 22px 0 0; border-top: 2px solid var(--cue-ink); }
 .app-microphone-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 .app-microphone-heading .app-kicker { margin-bottom: 4px; }
@@ -227,7 +232,6 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
 .app-stage-status p { display: grid; grid-template-columns: minmax(100px, 0.4fr) minmax(0, 1fr) auto; gap: 12px; align-items: center; margin: 6px 0; font-size: 0.88rem; }
 .app-stage-status p > span:first-child { font-weight: 600; text-transform: capitalize; }
 .app-stage-status button { min-height: 36px; padding: 6px 10px; font-size: 0.8rem; }
-.app-result { margin-top: 24px; }
 .app-embedding-status { margin: 22px 0 0; color: #444; font-size: 0.8rem; }
 .app-status-log { margin: 28px 0 0; }
 .app-status-log summary { width: fit-content; cursor: pointer; font-weight: 600; }
@@ -286,10 +290,11 @@ html:has(.landing) { scroll-snap-type: y mandatory; }
   .app-brand { gap: 8px; }
   .app-brand > span { font-size: 2.5rem; }
   .app-header-actions { gap: 6px; }
+  .app-header-actions .app-icon-button { width: 42px; min-height: 42px; padding: 8px; }
   .app-content { padding: 36px 0; }
   .app-shell.app-shell-centered > .app-content > .app-panel { padding: 22px 18px; --app-shadow-offset: 7px; }
-  .app-intro { margin-bottom: 24px; }
-  .app-intro h1 { font-size: clamp(2.7rem, 12vw, 4rem); }
+  .app-chat-log { min-height: 160px; max-height: 50svh; }
+  .app-chat-message { max-width: 94%; padding: 12px 14px; }
   .app-compose-actions { grid-template-columns: 1fr; }
   .app-scenario-select { max-width: none; }
   .app-compose-actions .app-primary-action { width: 100%; }

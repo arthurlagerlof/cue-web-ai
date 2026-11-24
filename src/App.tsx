@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
-import { Bluetooth, Mic, Settings } from 'lucide-react';
+import { Bluetooth, Mic, RotateCcw, Settings } from 'lucide-react';
 import { RollingAudio } from './services/audio';
 import { CLOUD_MODEL, transcribeInCloud } from './services/cloudTranscription.js';
 import { assessGpu } from './services/deviceDefaults.js';
@@ -11,6 +11,7 @@ import { createDatabaseEnvironment } from './demo/databaseEnvironment.js';
 import { DEMO_SCENARIOS } from './demo/demoScenarios.js';
 import { openBrowserDatabase } from './storage/userDatabase';
 import { answerWithOpenRouter, normalizeWithOpenRouter, planWithOpenRouter } from './intelligence/openRouter.js';
+import { isLocalWorkflowContinuation, shouldUseCloudWhileLoading } from './intelligence/localModelRouting.js';
 import { clarificationHasCompletedSideEffects, clarificationRestart } from './intelligence/toolIntelligence.js';
 import { navigateTo } from './navigation';
 import watchAppSource from '../watch/bangle-app.js?raw';
@@ -35,6 +36,7 @@ import {
 type Stage = 'transcribe' | 'embed' | 'rerank';
 type TranscriptionModel = ASRModelSize | 'cloud';
 type WorkerReply = { id: number; stage: Stage; status: string; model?: string; result?: any; error?: string; message?: string; statusOnly?: boolean };
+type ChatMessage = { id: string; role: 'user'; text: string } | { id: string; role: 'assistant'; document: any };
 type RerankDecision = { topScore: number; secondScore: number | null; margin: number | null; minimumScore: number; minimumMargin: number; scorePassed: boolean; marginPassed: boolean; decision: 'selected' | 'ambiguous' };
 type AiMode = 'web_ai' | 'automatic' | 'dots3_always';
 type PlanExecutionState = {
@@ -134,7 +136,7 @@ export default function App() {
   const asrModelChosen = useRef(false);
   const [checkingGpu, setCheckingGpu] = useState(true);
   const checkingGpuRef = useRef(true);
-  const [previousMessage, setPreviousMessage] = useState('');
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [embedding, setEmbedding] = useState<any>();
   const [logs, setLogs] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
@@ -160,8 +162,13 @@ export default function App() {
   const settingsDialogRef = useRef<HTMLDialogElement>(null);
   const microphoneDialogRef = useRef<HTMLDialogElement>(null);
   const pending = useRef(new Map<number, { stage: Stage; resolve: (reply: WorkerReply) => void; measurement?: RequestMeasurement; inferenceStartedAt?: number; inferenceModel?: string }>());
+  const readyModels = useRef(new Set<Stage>());
+  const modelWarmups = useRef<Partial<Record<'embed' | 'rerank', Promise<WorkerReply>>>>({});
+  const localContinuation = useRef(false);
   const resolvingInteractions = useRef(new Set<string>());
   const activeRequest = useRef<RequestMeasurement>();
+  const chatLogRef = useRef<HTMLDivElement>(null);
+  const chatStickToBottom = useRef(true);
 
   useEffect(() => {
     let active = true;
@@ -190,7 +197,16 @@ export default function App() {
     if (dialog && !dialog.open) dialog.showModal();
   }, []);
 
+  useEffect(() => {
+    const element = chatLogRef.current;
+    if (element && chatStickToBottom.current) element.scrollTop = element.scrollHeight;
+  }, [chatMessages, displayDocument, busy]);
+
   const log = (message: string) => setLogs(old => [`${new Date().toLocaleTimeString()} ${message}`, ...old].slice(0, 30));
+  const appendUserMessage = (text: string) => {
+    chatStickToBottom.current = true;
+    setChatMessages(old => [...old, { id: crypto.randomUUID(), role: 'user', text }]);
+  };
   const recordUsage = async (counter: string) => {
     try { await (await openBrowserDatabase()).recordUsage(counter); }
     catch (error) { log(`Could not save local usage statistics: ${error instanceof Error ? error.message : String(error)}`); }
@@ -312,7 +328,10 @@ export default function App() {
       }
       if (actionId === '__cue_confirm' && watchConfirmationRef.current) {
         watchConfirmationRef.current = false;
-        if (pendingConfirmationRef.current) void confirmPendingAction(pendingConfirmationRef.current, true);
+        if (pendingConfirmationRef.current) {
+          appendUserMessage('Confirm');
+          void confirmPendingAction(pendingConfirmationRef.current, true);
+        }
         else log('Ignored watch confirmation without a pending action');
         return;
       }
@@ -322,14 +341,14 @@ export default function App() {
           log('Ignored watch cancellation without a pending action');
           return;
         }
-        void cancelPendingOperation().catch(error => log(`Could not cancel pending operation: ${error instanceof Error ? error.message : String(error)}`));
-        void watch.sendDisplayDocument(createDisplayDocument({
+        appendUserMessage('Cancel');
+        void cancelPendingOperation().then(() => showDocument(createDisplayDocument({
           id: 'cue-watch-cancelled',
           title: 'Cancelled',
           source: { app: 'cue', name: 'Cue' },
           state: 'success',
           message: 'The pending action was cancelled.',
-        })).catch(error => log(`Could not update watch after cancellation: ${error instanceof Error ? error.message : String(error)}`));
+        }))).catch(error => log(`Could not cancel pending operation: ${error instanceof Error ? error.message : String(error)}`));
         return;
       }
       const action = displayDocumentRef.current?.actions?.find((item: any) => item.id === actionId);
@@ -375,6 +394,8 @@ export default function App() {
           }
           setStatus(old => ({ ...old, [stage]: reply.status === 'error' ? `Error — ${reply.error}` : `Complete — ${reply.model ?? 'done'}` }));
           if (task) {
+            if (reply.status === 'complete') readyModels.current.add(stage);
+            else readyModels.current.delete(stage);
             const durationMs = task.inferenceStartedAt === undefined ? undefined : performance.now() - task.inferenceStartedAt;
             if (durationMs !== undefined) recordLocalInference(task.measurement, reply.model ?? task.inferenceModel, durationMs);
             const model = reply.model ?? task.inferenceModel ?? 'unknown model';
@@ -390,6 +411,7 @@ export default function App() {
           const message = event.message || 'Model worker failed.';
           instance!.terminate();
           if (workers.get(stage) === instance) workers.delete(stage);
+          readyModels.current.delete(stage);
           setStatus(old => ({ ...old, [stage]: `Error — ${message}` }));
           pending.current.forEach((task, pendingId) => {
             if (task.stage === stage) {
@@ -404,9 +426,22 @@ export default function App() {
     return new Promise(resolve => { pending.current.set(id, { stage, resolve, measurement: measureRequest ? activeRequest.current : undefined }); instance!.postMessage({ id, stage, ...data }, data.audio ? [data.audio.buffer] : []); });
   }
 
-  async function getEnvironment(forceRetrieval = false) {
+  function warmModel(stage: 'embed' | 'rerank', data: { text: string; candidates?: Array<{ toolId: string; text: string }> }) {
+    if (readyModels.current.has(stage) || modelWarmups.current[stage]) return;
+    const warmup = Promise.resolve().then(() => runModel(stage, data, false)).catch(error => ({
+      id: 0, stage, status: 'error', error: error instanceof Error ? error.message : String(error),
+    }));
+    modelWarmups.current[stage] = warmup;
+    void warmup.then(reply => {
+      if (reply.status === 'error') log(`Could not prepare local ${stage} model: ${reply.error ?? 'Unknown error'}`);
+    }).finally(() => {
+      if (modelWarmups.current[stage] === warmup) delete modelWarmups.current[stage];
+    });
+  }
+
+  async function getEnvironment(forceRetrieval = false, skipRetrieval = false) {
     if (environment.current) {
-      if (forceRetrieval || aiModeRef.current !== 'dots3_always') await environment.current.ensureRetrieval();
+      if (!skipRetrieval && (forceRetrieval || aiModeRef.current !== 'dots3_always')) await environment.current.ensureRetrieval();
       return environment.current;
     }
     const loadingMeasurement = activeRequest.current;
@@ -422,12 +457,18 @@ export default function App() {
       }
     })();
     const embed = async (text: string, options?: { purpose?: string }) => {
+      await modelWarmups.current.embed;
       const reply = await runModel('embed', { text }, options?.purpose !== 'index');
       if (reply.status === 'error') throw new Error(reply.error);
       setEmbedding({ ...reply.result, model: reply.model });
       return reply.result;
     };
     const rerankTools = async (text: string, candidates: Array<{ toolId: string; text: string }>) => {
+      if (shouldUseCloudWhileLoading(aiModeRef.current, readyModels.current.has('rerank'), localContinuation.current)) {
+        warmModel('rerank', { text, candidates });
+        throw new Error('Local cross-encoder is still loading');
+      }
+      await modelWarmups.current.rerank;
       const reply = await runModel('rerank', { text, candidates });
       if (reply.status === 'error') throw new Error(reply.error);
       return reply.result;
@@ -437,7 +478,7 @@ export default function App() {
       database,
       registryData,
       embed,
-      initializeRetrieval: forceRetrieval || aiModeRef.current !== 'dots3_always',
+      initializeRetrieval: !skipRetrieval && (forceRetrieval || aiModeRef.current !== 'dots3_always'),
       onToolExecution: (durationMs: number, success: boolean) => recordToolExecution(activeRequest.current, durationMs, success),
       onIndexStart: () => {
         const measurement = activeRequest.current;
@@ -468,6 +509,7 @@ export default function App() {
     if (!instance && !(stage === 'transcribe' && transcriptionAbort.current)) return;
     if (stage === 'transcribe') transcriptionAbort.current?.abort();
     if (instance) { instance.terminate(); workers.delete(stage); }
+    readyModels.current.delete(stage);
     pending.current.forEach((task, id) => {
       if (task.stage === stage) {
         if (task.inferenceStartedAt !== undefined) recordLocalInference(task.measurement, task.inferenceModel, performance.now() - task.inferenceStartedAt);
@@ -489,6 +531,9 @@ export default function App() {
     if (!validation.valid) throw new TypeError(`Invalid display document: ${validation.errors.join('; ')}`);
     displayDocumentRef.current = document;
     setDisplayDocument(document);
+    if (document.state !== 'loading') {
+      setChatMessages(old => [...old, { id: crypto.randomUUID(), role: 'assistant', document }]);
+    }
     if (watch.connected) {
       watchConfirmationRef.current = document.state === 'confirmation_required';
       if (lightweightLoading && document.state === 'loading') await watch.sendThinking();
@@ -663,11 +708,11 @@ export default function App() {
     log('OpenRouter plan completed under Cue validation and execution control');
   }
 
-  async function processTranscript(text: string, continuePendingLocally = false, existingMeasurement?: RequestMeasurement) {
+  async function processTranscript(text: string, continuePendingLocally = false, existingMeasurement?: RequestMeasurement, displayText?: string) {
     if (checkingGpuRef.current) throw new Error('GPU assessment is still running. Please wait.');
     let clean = text.trim();
     if (!clean) throw new Error('Enter transcript text first.');
-    setPreviousMessage(clean);
+    appendUserMessage(displayText ?? clean);
     const restart = clarificationRestart(clean);
     if (restart !== undefined) {
       try {
@@ -724,10 +769,13 @@ export default function App() {
     setBusy(true);
     try {
       await showDocument(createDisplayDocument({ id: 'cue-loading', title: 'Working', source: { app: 'cue', name: 'Cue' }, state: 'loading', message: 'Discovering provider tools and preparing a local response.', elements: [{ type: 'text', text: clean, role: 'body' }] }), true);
-      const runtime = await getEnvironment(continuePendingLocally);
+      const savedState = await getConversationState();
+      const continuingLocal = isLocalWorkflowContinuation(savedState, continuePendingLocally);
+      const coldAutomatic = shouldUseCloudWhileLoading(aiModeRef.current, readyModels.current.has('embed'), continuingLocal);
+      if (coldAutomatic) warmModel('embed', { text: 'Prepare the local embedding model.' });
+      const runtime = await getEnvironment(continuePendingLocally, coldAutomatic);
       const requestNow = clockForRuntime(runtime);
       const context = { now: requestNow, timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone, locale: navigator.language, weekStartsOn: 1 };
-      const savedState = await getConversationState();
       if (aiModeRef.current === 'web_ai' && savedState?.pendingReasoning) {
         const message = 'This request is awaiting hosted reasoning. Switch to Automatic or Always OpenRouter to continue, or cancel the pending request.';
         setPendingClarification(true);
@@ -780,6 +828,11 @@ export default function App() {
         await processDots3Request(clean, runtime, context);
         return;
       }
+      if (coldAutomatic) {
+        log('Automatic mode is using OpenRouter while the local embedding model loads');
+        await processDots3Request(clean, runtime, context);
+        return;
+      }
       const escalationReason = aiModeRef.current === 'automatic' ? runtime.intelligence.requiresExternalPlanning(clean) : undefined;
       if (!continuePendingLocally && escalationReason) {
         log(`Automatic mode escalated: ${escalationReason}`);
@@ -789,7 +842,13 @@ export default function App() {
       log('Local-first request routing accepted');
       await recordUsage('localCalls');
       recordLocalProcessing(activeRequest.current);
-      const outcome = await runtime.intelligence.handle(clean, { context: { ...context, now: requestNow } });
+      localContinuation.current = continuingLocal;
+      let outcome;
+      try {
+        outcome = await runtime.intelligence.handle(clean, { context: { ...context, now: requestNow } });
+      } finally {
+        localContinuation.current = false;
+      }
       markMultiStep(activeRequest.current, outcome.operations?.length ?? outcome.plan?.operations?.length ?? 0);
       if (outcome.state) await saveConversationState(outcome.state);
       if (outcome.kind === 'clarification' || ['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(outcome.state?.status)) {
@@ -897,6 +956,7 @@ export default function App() {
       if (watch.connected) watchConfirmationRef.current = true;
       return;
     }
+    if (!confirmedOnWatch) appendUserMessage('Confirm');
     setBusy(true);
     if (watch.connected) {
       try {
@@ -1057,6 +1117,7 @@ export default function App() {
     if (!state || !['awaiting_tool_choice', 'awaiting_argument', 'awaiting_entity_choice'].includes(state.status)) {
       throw new Error('There is no pending clarification to restart.');
     }
+    appendUserMessage('Start over');
     await cancelPendingOperation();
     setTranscriptInput('');
     await showRestartedDocument(clarificationHasCompletedSideEffects(state));
@@ -1071,6 +1132,9 @@ export default function App() {
       environment.current = undefined;
       displayDocumentRef.current = undefined;
       setDisplayDocument(undefined);
+      setChatMessages([]);
+      setTranscriptInput('');
+      setScenario('');
       updatePendingConfirmation(undefined);
       watchConfirmationRef.current = false;
       setPendingClarification(false);
@@ -1109,7 +1173,7 @@ export default function App() {
               ? (state.pendingEntityOptions ?? []).map((option: any) => option.id)
               : [];
           if (!options.includes(action.optionId)) throw new Error('This clarification choice is not valid for the pending interaction.');
-          await processTranscript(action.optionId, true);
+          await processTranscript(action.optionId, true, undefined, typeof action.label === 'string' ? action.label : action.optionId);
           setTranscriptInput('');
         } finally {
           resolvingInteractions.current.delete(key);
@@ -1217,7 +1281,7 @@ export default function App() {
           asr = await runCloud();
         }
       }
-      const text = String(asr.result ?? '').trim(); setPreviousMessage(text);
+      const text = String(asr.result ?? '').trim();
       setStatus(old => ({ ...old, transcribe: `Complete — ${asr.model}` }));
       if (!text) throw new Error('No speech was detected.');
       await processTranscript(text, false, measurement);
@@ -1340,6 +1404,9 @@ export default function App() {
         <span>Cue</span>
       </a>
       <nav className="app-header-actions" aria-label="App options">
+        <button className="app-icon-button" aria-label="Reset demo session" title="Reset demo session" disabled={busy} onClick={() => void resetDemoData()}>
+          <RotateCcw size={22} strokeWidth={1.8} aria-hidden="true" />
+        </button>
         <button className="app-icon-button" aria-label="Microphone controls" title="Microphone controls" onClick={() => {
           if (connectionDialogRef.current?.open) connectionDialogRef.current.close();
           if (settingsDialogRef.current?.open) settingsDialogRef.current.close();
@@ -1365,10 +1432,20 @@ export default function App() {
     </header>
 
     <div className="app-content">
-      <section className="app-panel" aria-labelledby="app-title">
-        <div className="app-intro">
-          <h1 id="app-title">{pendingClarification ? 'One more detail.' : 'Say what you need.'}</h1>
-          <p>Type a message or try a sample request. Connect a watch if you want to use the app through it.</p>
+      <section className="app-panel" aria-label="Cue chat">
+        <div className="app-chat-log" role="log" aria-label="Current session" aria-live="polite" ref={chatLogRef} onScroll={event => {
+          const element = event.currentTarget;
+          chatStickToBottom.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+        }}>
+          {chatMessages.map(entry => entry.role === 'user'
+            ? <div className="app-chat-message app-chat-user" key={entry.id}><strong>You</strong><p>{entry.text}</p></div>
+            : <div className="app-chat-message app-chat-assistant" key={entry.id}>
+              <strong>Cue</strong>
+              <DisplayDocumentView document={entry.document} onAction={!busy && entry.document === displayDocument ? action => void dispatchDocumentAction(action) : undefined} />
+              {entry.document === displayDocument && pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}
+              {entry.document === displayDocument && pendingClarification && <button disabled={busy} onClick={() => void restartClarification().catch(error => log(`Could not restart pending request: ${error instanceof Error ? error.message : String(error)}`))}>Start over</button>}
+            </div>)}
+          {displayDocument?.state === 'loading' && <div className="app-chat-message app-chat-assistant"><strong>Cue</strong><p>Working…</p></div>}
         </div>
 
         <label className="app-message-label">{pendingClarification ? 'Your reply' : 'Your message'}
@@ -1383,15 +1460,11 @@ export default function App() {
               {DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}
             </select>
           </label>
-          <button className="app-primary-action" disabled={busy || checkingGpu || !transcriptInput.trim()} onClick={() => void submitTranscript()}>
-            {busy ? 'Processing…' : pendingClarification ? 'Send reply' : 'Process message'}
+          <button className="app-primary-action" disabled={busy || checkingGpu || (!transcriptInput.trim() && (!recording || buffer < 0.2))} onClick={() => transcriptInput.trim() ? void submitTranscript() : transcribeBuffer()}>
+            {busy ? 'Processing…' : transcriptInput.trim() ? pendingClarification ? 'Send reply' : 'Process message' : 'Transcribe'}
           </button>
         </div>
 
-        <div className="app-previous-message">
-          <strong>Previous message</strong>
-          <p>{previousMessage || 'No messages yet.'}</p>
-        </div>
         {checkingGpu && <p role="status">Checking GPU performance to choose defaults…</p>}
 
         {(busy || Object.values(status).some(value => value !== 'Not started')) && <div className="app-stage-status" aria-live="polite">
@@ -1400,12 +1473,6 @@ export default function App() {
             <span>{status[stage]}</span>
             {busy && <button onClick={() => stopStage(stage)}>Stop</button>}
           </p>)}
-        </div>}
-
-        {displayDocument && <div className="app-result">
-          <DisplayDocumentView document={displayDocument} onAction={action => void dispatchDocumentAction(action)} />
-          {pendingConfirmation && <button disabled={busy} onClick={() => void confirmPendingAction()}>Confirm local mock action</button>}
-          {pendingClarification && <button disabled={busy} onClick={() => void restartClarification().catch(error => log(`Could not restart pending request: ${error instanceof Error ? error.message : String(error)}`))}>Start over</button>}
         </div>}
 
         <p className="app-embedding-status">Embedding: {embedding ? `${embedding.dimensions} dimensions (${embedding.model ?? 'MiniLM'})` : 'Prepared on first request in the browser'}</p>
@@ -1498,14 +1565,13 @@ export default function App() {
           <option value="automatic">Automatic</option>
           <option value="dots3_always">Always OpenRouter</option>
         </select></label>
-        <p className="app-modal-note">Automatic keeps straightforward requests local and escalates complex or uncertain requests. Always OpenRouter sends the request and registered tool catalog through the configured backend. Avoid sensitive text in external modes.</p>
+        <p className="app-modal-note">Automatic keeps straightforward requests local when its models are ready, and uses OpenRouter while they load or for complex or uncertain requests. Always OpenRouter sends the request and registered tool catalog through the configured backend. Avoid sensitive text in external modes.</p>
         <label>Whisper model<select value={asrModel} disabled={busy} onChange={event => {
           const value = event.target.value;
           if (value === 'cloud' || value === 'tiny' || value === 'base' || value === 'small') { asrModelChosen.current = true; setAsrModel(value); asrModelRef.current = value; }
         }}>{Object.entries(ASR_MODELS).map(([size, model]) => <option key={size} value={size}>{model.label}</option>)}<option value="cloud">Cloud only — Cloudflare Whisper</option></select></label>
         <p className="app-modal-note">Tool availability and demo data are stored locally in this browser.</p>
         <div className="app-modal-actions app-utility-actions">
-          <button disabled={busy} onClick={() => void resetDemoData()}>Reset demo session</button>
           <button disabled={busy} onClick={() => void exportLocalBackup()}>Export local backup</button>
         </div>
     </dialog>

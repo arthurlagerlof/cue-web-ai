@@ -26,11 +26,11 @@ function renderElement(element: any, key: string, actions: Map<string, any>, onA
       const style: CSSProperties = { display: 'flex', flexDirection: element.layout === 'row' ? 'row' : 'column', gap: '0.5rem', ...(element.layout === 'grid' ? { display: 'grid', gridTemplateColumns: `repeat(${element.columns ?? 2}, minmax(0, 1fr))` } : {}) };
       return <div key={key} style={style}>{element.children.map((child: any, index: number) => renderElement(child, `${key}-${index}`, actions, onAction))}</div>;
     }
-    case 'list': return <ul key={key}>{element.items.map((item: any) => <li key={item.id}>{item.title}{item.description ? <small> — {item.description}</small> : null}{item.actionId && actions.has(item.actionId) ? <button onClick={() => onAction?.(actions.get(item.actionId))}>{actions.get(item.actionId).label ?? 'Open'}</button> : null}</li>)}</ul>;
+    case 'list': return <ul key={key}>{element.items.map((item: any) => <li key={item.id}>{item.title}{item.description ? <small> — {item.description}</small> : null}{item.actionId && actions.has(item.actionId) ? <button disabled={!onAction} onClick={() => onAction?.(actions.get(item.actionId))}>{actions.get(item.actionId).label ?? 'Open'}</button> : null}</li>)}</ul>;
     case 'divider': return <hr key={key} />;
     case 'action': {
       const action = actions.get(element.actionId);
-      return action ? <button key={key} onClick={() => onAction?.(action)}>{element.label}</button> : null;
+      return action ? <button key={key} disabled={!onAction} onClick={() => onAction?.(action)}>{element.label}</button> : null;
     }
     default: return null;
   }

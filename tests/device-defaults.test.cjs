@@ -30,7 +30,7 @@ test('GPU benchmark uses the measured threshold and cleans up the device', async
     if (original) Object.defineProperty(global, 'GPUBufferUsage', original);
     else delete global.GPUBufferUsage;
   });
-  for (const [milliseconds, preferLocal] of [[250, true], [251, false]]) {
+  for (const [milliseconds, preferLocal] of [[60, true], [61, false]]) {
     const fake = fakeGpu();
     const times = [1000, 1000 + milliseconds];
     const result = await assessGpu(fake.gpu, () => times.shift());

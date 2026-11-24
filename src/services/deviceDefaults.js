@@ -1,4 +1,4 @@
-const MAX_GPU_TIME_MS = 250;
+const MAX_GPU_TIME_MS = 60;
 const GPU_CHECK_TIMEOUT_MS = 5000;
 const MATRIX_SIZE = 256;
 const DISPATCHES = 8;
