@@ -5,3 +5,7 @@ functions = "netlify/functions"
 
 [functions]
 node_bundler = "esbuild"
+
+[[edge_functions]]
+path = "/api/transcribe"
+function = "transcribe"

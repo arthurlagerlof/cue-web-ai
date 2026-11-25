@@ -64,7 +64,7 @@ function formatPercent(value: number | null) {
   return value === null ? '—' : `${value.toFixed(1)}%`;
 }
 
-const modeLabels = { web_ai: 'Local only', automatic: 'Automatic', dots3_always: 'Always Dots 3' } as const;
+const modeLabels = { web_ai: 'Local only', automatic: 'Automatic', dots3_always: 'Always OpenRouter' } as const;
 const comparisonMetrics: Array<{
   label: string;
   field: keyof ModeStatistics;
@@ -147,6 +147,7 @@ function StatisticsSummaryView({ title, stats, local = false, filtered = false }
 
 export default function Landing() {
   const heroRef = useRef<HTMLElement>(null);
+  const statisticsRef = useRef<HTMLElement>(null);
   const heroProgressRef = useRef(0);
   const [watchStatus, setWatchStatus] = useState(watch.status);
   const [connecting, setConnecting] = useState(false);
@@ -218,6 +219,22 @@ export default function Landing() {
       const progress = Math.min(1, Math.max(0, -bounds.top / bounds.height));
       heroProgressRef.current = progress;
       hero.style.setProperty('--hero-progress', String(progress));
+    };
+    update();
+    window.addEventListener('scroll', update, { passive: true });
+    window.addEventListener('resize', update);
+    return () => {
+      window.removeEventListener('scroll', update);
+      window.removeEventListener('resize', update);
+    };
+  }, []);
+
+  useEffect(() => {
+    const section = statisticsRef.current;
+    if (!section) return;
+    const update = () => {
+      const bounds = section.getBoundingClientRect();
+      section.classList.toggle('snap-section-entered', bounds.top <= 1 && bounds.bottom > 0);
     };
     update();
     window.addEventListener('scroll', update, { passive: true });
@@ -391,11 +408,12 @@ export default function Landing() {
       </section>
     </div>
 
-    <section className="landing-statistics" aria-labelledby="statistics-title">
+    <section className="landing-statistics" ref={statisticsRef} aria-labelledby="statistics-title">
+      <span className="section-snap-anchor" aria-hidden="true" />
       <div className="statistics-inner">
         <h2 id="statistics-title">Statistics</h2>
         <p>Request averages are shown with sample size and period. Public statistics show aggregates; opted-in request records are also stored on the server.</p>
-        <label>Filter by demo request
+        <label className="statistics-filter">Filter by demo request
           <select value={selectedRequest} onChange={event => setSelectedRequest(event.target.value)}>
             <option value="">All requests</option>
             {DEMO_SCENARIOS.map(request => <option key={request} value={request}>{request}</option>)}

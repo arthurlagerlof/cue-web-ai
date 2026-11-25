@@ -1,12 +1,33 @@
 import { defineConfig, loadEnv, type Plugin, type PreviewServer, type ViteDevServer } from 'vite';
+import { Readable } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { handleOpenRouterRequest } from './netlify/functions/openrouter.mjs';
 import { handleGlobalStats } from './netlify/functions/global-stats.mjs';
+import transcribe from './netlify/edge-functions/transcribe.js';
 
 const csp = "default-src 'self'; script-src 'self' https://cdn.jsdelivr.net blob: 'wasm-unsafe-eval'; worker-src 'self' blob:; connect-src 'self' https://huggingface.co https://cdn-lfs.huggingface.co https://*.hf.co https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 const isolationHeaders = {
   'Cross-Origin-Opener-Policy': 'same-origin',
   'Cross-Origin-Embedder-Policy': 'require-corp',
 };
+
+function transcriptionProxy(): Plugin {
+  const middleware = (server: ViteDevServer | PreviewServer) => {
+    server.middlewares.use('/api/transcribe', (req, res, next) => {
+      const request = new Request('http://localhost/api/transcribe', {
+        method: req.method,
+        headers: { 'Content-Type': req.headers['content-type'] ?? '' },
+        ...(req.method === 'POST' ? { body: Readable.toWeb(req) as ReadableStream, duplex: 'half' } : {}),
+      } as RequestInit);
+      void transcribe(request).then(async response => {
+        res.writeHead(response.status, Object.fromEntries(response.headers));
+        if (response.body) await pipeline(Readable.fromWeb(response.body as import('node:stream/web').ReadableStream), res);
+        else res.end();
+      }).catch(next);
+    });
+  };
+  return { name: 'transcription-proxy', configureServer: middleware, configurePreviewServer: middleware };
+}
 
 function openRouterProxy(apiKey: string | undefined, model: string | undefined): Plugin {
   const middleware = (server: ViteDevServer | PreviewServer) => {
@@ -85,7 +106,7 @@ function securityHeaders(): Plugin {
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   return {
-    plugins: [securityHeaders(), openRouterProxy(env.OPENROUTER_API_KEY, env.OPENROUTER_MODEL), globalStatsProxy(env.DATABASE_URL)],
+    plugins: [securityHeaders(), transcriptionProxy(), openRouterProxy(env.OPENROUTER_API_KEY, env.OPENROUTER_MODEL), globalStatsProxy(env.DATABASE_URL)],
     optimizeDeps: { exclude: ['@sqlite.org/sqlite-wasm'] },
     worker: { format: 'es' },
     server: { host: '127.0.0.1', port: 5173, strictPort: true },

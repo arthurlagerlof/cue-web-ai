@@ -157,9 +157,16 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
       if (fitSize) {
         const halfFovTangent = Math.tan((camera.fov * Math.PI) / 360);
         const narrowHero = mode === 'hero' && window.matchMedia('(max-width: 700px)').matches;
-        const distanceForHeight = fitSize.y / (2 * halfFovTangent * (mode === 'hero' ? (narrowHero ? 0.6 : 0.76) : 1));
-        const distanceForWidth = fitSize.x / (2 * halfFovTangent * camera.aspect * (mode === 'hero' ? (narrowHero ? 0.8 : 0.5) : 1));
-        camera.position.z = Math.max(distanceForHeight, distanceForWidth) * 1.12 + fitSize.z / 2;
+        if (mode === 'demo') {
+          const halfVerticalFov = Math.atan(halfFovTangent);
+          const halfHorizontalFov = Math.atan(halfFovTangent * camera.aspect);
+          const halfFov = Math.min(halfVerticalFov, halfHorizontalFov);
+          camera.position.z = (fitSize.length() / 2 / Math.sin(halfFov)) * 1.12;
+        } else {
+          const distanceForHeight = fitSize.y / (2 * halfFovTangent * (narrowHero ? 0.6 : 0.76));
+          const distanceForWidth = fitSize.x / (2 * halfFovTangent * camera.aspect * (narrowHero ? 0.8 : 0.5));
+          camera.position.z = Math.max(distanceForHeight, distanceForWidth) * 1.12 + fitSize.z / 2;
+        }
         camera.lookAt(0, 0, 0);
       }
     };
@@ -185,6 +192,35 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
     if (mode === 'demo') {
       renderer.domElement.addEventListener('pointermove', onPointerMove);
       renderer.domElement.addEventListener('pointerleave', onPointerLeave);
+    }
+
+    const updateDemoScroll = () => {
+      const bounds = demo?.getBoundingClientRect();
+      // Map each snap interval independently so the demo's start snap is always a settled state.
+      const viewportHeight = window.innerHeight;
+      const progress = bounds
+        ? bounds.top > 0
+          ? Math.min(bounds.top / viewportHeight, 1)
+          : Math.min(-bounds.top / Math.max(bounds.height, 1), 1)
+        : 0;
+      const scroll = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+        ? 0 : Math.max(0, progress);
+      const eased = scroll * scroll * (3 - 2 * scroll);
+      demoWatch?.style.setProperty('--demo-exit', String(eased));
+      return eased;
+    };
+    const onDemoScroll = () => {
+      const exit = updateDemoScroll();
+      if (model && window.matchMedia('(max-width: 700px)').matches) {
+        modelGroup.rotation.z = exit * Math.PI / 2;
+        renderer.render(scene, camera);
+      }
+    };
+    if (mode === 'demo') {
+      updateDemoScroll();
+      window.addEventListener('scroll', onDemoScroll, { passive: true });
+      window.addEventListener('scrollend', onDemoScroll);
+      window.addEventListener('resize', onDemoScroll);
     }
 
     const renderFrame = (time: number) => {
@@ -229,11 +265,7 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
           }
           hoverBlend += ((hovering ? 1 : 0) - hoverBlend) * (1 - Math.exp(-7 * delta));
 
-          const bounds = demo?.getBoundingClientRect();
-          const distance = bounds ? Math.max(0, bounds.top, window.innerHeight - bounds.bottom) : 0;
-          const scroll = reduceMotion ? 0 : Math.min(distance / window.innerHeight, 1);
-          const exit = scroll * scroll * (3 - 2 * scroll);
-          demoWatch?.style.setProperty('--demo-exit', String(exit));
+          const exit = updateDemoScroll();
 
           const idle = narrow || reduceMotion ? 0 : 1 - hoverBlend;
           modelGroup.rotation.x = -1.05 * (0.5 + 0.5 * Math.cos(time / 2200)) * idle;
@@ -330,6 +362,9 @@ export default function WatchModel({ mode, title, message, action, onScreenActio
       renderer.domElement.removeEventListener('click', onCanvasClick);
       renderer.domElement.removeEventListener('pointermove', onPointerMove);
       renderer.domElement.removeEventListener('pointerleave', onPointerLeave);
+      window.removeEventListener('scroll', onDemoScroll);
+      window.removeEventListener('scrollend', onDemoScroll);
+      window.removeEventListener('resize', onDemoScroll);
       demoWatch?.style.removeProperty('--demo-exit');
       if (displayTextureRef.current === screenTexture) {
         displayTextureRef.current = undefined;
